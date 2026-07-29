@@ -34,8 +34,9 @@ with a short note in the release runbook.
 - On a fresh profile and on an upgrade from settings without permission
   fields, confirm each visible provider prompts before any credential read,
   credential watch, or quota request. The prompt must name the provider and
-  exact source, default to No, and persist either decision without prompting
-  again at the next launch.
+  exact source, appear only after an app surface is visible, default to No,
+  minimize and restore without granting access, and persist either decision
+  without prompting again at the next launch.
 - Grant one provider under Provider access and confirm only that provider
   polls. Rotate its original file or Credential Manager entry and confirm the
   new credential is picked up without Gengchou storing a token. Revoke access,

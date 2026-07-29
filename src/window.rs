@@ -23,6 +23,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+use windows::Win32::UI::Controls::{
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS,
+    TDCBF_NO_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED,
+};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
@@ -2563,6 +2567,22 @@ fn provider_credential_source(kind: tray_icon::TrayIconKind) -> &'static str {
     }
 }
 
+fn credential_consent_fallback_message_box_style() -> MESSAGEBOX_STYLE {
+    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND
+}
+
+fn credential_consent_task_dialog_flags() -> TASKDIALOG_FLAGS {
+    TDF_ALLOW_DIALOG_CANCELLATION | TDF_CAN_BE_MINIMIZED
+}
+
+fn credential_consent_task_dialog_buttons() -> TASKDIALOG_COMMON_BUTTON_FLAGS {
+    TDCBF_YES_BUTTON | TDCBF_NO_BUTTON
+}
+
+fn credential_consent_default_button() -> i32 {
+    IDNO.0
+}
+
 fn provider_has_credential_access(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
     match kind {
         tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
@@ -2714,16 +2734,45 @@ fn show_credential_consent_prompt(
         .replace("{provider}", provider)
         .replace("{source}", provider_credential_source(kind));
 
-    unsafe {
+    diagnose::log(format!("showing {provider} credential access prompt"));
+    let allowed = unsafe {
         let title_wide = native_interop::wide_str(&title);
         let message_wide = native_interop::wide_str(&message);
-        MessageBoxW(
-            hwnd,
-            PCWSTR::from_raw(message_wide.as_ptr()),
-            PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-        ) == IDYES
-    }
+        let config = TASKDIALOGCONFIG {
+            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            // A parent would make the task dialog modal and suppress its
+            // minimize button. Keep the consent surface unowned so the user
+            // can defer the decision without granting access.
+            hwndParent: HWND::default(),
+            dwFlags: credential_consent_task_dialog_flags(),
+            dwCommonButtons: credential_consent_task_dialog_buttons(),
+            pszWindowTitle: PCWSTR::from_raw(title_wide.as_ptr()),
+            pszMainInstruction: PCWSTR::from_raw(title_wide.as_ptr()),
+            pszContent: PCWSTR::from_raw(message_wide.as_ptr()),
+            nDefaultButton: credential_consent_default_button(),
+            ..Default::default()
+        };
+        let mut selected_button = credential_consent_default_button();
+        match TaskDialogIndirect(&config, Some(&mut selected_button), None, None) {
+            Ok(()) => selected_button == IDYES.0,
+            Err(error) => {
+                diagnose::log(format!(
+                    "credential task dialog unavailable ({error}); using message box fallback"
+                ));
+                MessageBoxW(
+                    hwnd,
+                    PCWSTR::from_raw(message_wide.as_ptr()),
+                    PCWSTR::from_raw(title_wide.as_ptr()),
+                    credential_consent_fallback_message_box_style(),
+                ) == IDYES
+            }
+        }
+    };
+    diagnose::log(format!(
+        "{provider} credential access prompt answered: {}",
+        if allowed { "allow" } else { "deny" }
+    ));
+    allowed
 }
 
 fn request_provider_credential_access(hwnd: HWND, kind: tray_icon::TrayIconKind) -> bool {
@@ -8192,11 +8241,6 @@ pub fn run(_instance_guard: InstanceGuard) {
             });
         }
 
-        // No credential-backed operation may run until the user has made a
-        // provider-specific choice. Older settings intentionally deserialize
-        // these permissions as false and pass through this migration prompt.
-        prompt_for_initial_provider_access(hwnd);
-
         // Broadcast helper: receives the top-level-only broadcast messages,
         // second-instance activation requests, and revival ready signals for
         // the process lifetime.
@@ -8273,6 +8317,14 @@ pub fn run(_instance_guard: InstanceGuard) {
         } else {
             "taskbar widget hidden pending shell recovery"
         });
+
+        // Show the provider-specific migration prompts only after the compact
+        // surface and tray icons exist. This remains before credential
+        // watches, provider timers, or the initial poll, so no credential-
+        // backed operation can run before the user decides. Older settings
+        // intentionally deserialize these permissions as false.
+        prompt_for_initial_provider_access(hwnd);
+
         schedule_countdown_timer();
 
         // Provider polling belongs to the process-level helper so it survives
@@ -10788,6 +10840,21 @@ mod reset_notification_tests {
         assert!(!should_prompt_provider_access(false, false, false));
         assert!(!should_prompt_provider_access(true, true, false));
         assert!(!should_prompt_provider_access(true, false, true));
+    }
+
+    #[test]
+    fn credential_consent_dialog_is_minimizable_and_defaults_to_no() {
+        let flags = credential_consent_task_dialog_flags();
+        let buttons = credential_consent_task_dialog_buttons();
+        let fallback_style = credential_consent_fallback_message_box_style();
+
+        assert_ne!(flags.0 & TDF_CAN_BE_MINIMIZED.0, 0);
+        assert_ne!(flags.0 & TDF_ALLOW_DIALOG_CANCELLATION.0, 0);
+        assert_ne!(buttons.0 & TDCBF_YES_BUTTON.0, 0);
+        assert_ne!(buttons.0 & TDCBF_NO_BUTTON.0, 0);
+        assert_eq!(credential_consent_default_button(), IDNO.0);
+        assert_ne!(fallback_style.0 & MB_DEFBUTTON2.0, 0);
+        assert_ne!(fallback_style.0 & MB_SETFOREGROUND.0, 0);
     }
 
     #[test]
