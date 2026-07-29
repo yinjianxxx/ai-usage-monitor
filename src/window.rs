@@ -116,6 +116,12 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    allow_claude_credentials: bool,
+    allow_codex_credentials: bool,
+    allow_antigravity_credentials: bool,
+    claude_credential_access_decided: bool,
+    codex_credential_access_decided: bool,
+    antigravity_credential_access_decided: bool,
     provider_order: Vec<tray_icon::TrayIconKind>,
     pending_provider_order: Option<Vec<tray_icon::TrayIconKind>>,
     pending_provider_order_samples: u8,
@@ -212,6 +218,9 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_ACCESS_CLAUDE_CODE: u16 = 63;
+const IDM_ACCESS_CODEX: u16 = 64;
+const IDM_ACCESS_ANTIGRAVITY: u16 = 65;
 const IDM_NOTIFY_SESSION_RESET: u16 = 80;
 const IDM_NOTIFY_WEEKLY_RESET: u16 = 81;
 
@@ -362,7 +371,6 @@ impl PollCoordinator {
         self.generation.load(Ordering::Acquire) == generation
     }
 
-    #[cfg(test)]
     fn invalidate_pending(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.pending.store(false, Ordering::Release);
@@ -1297,6 +1305,12 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            allow_claude_credentials: s.allow_claude_credentials,
+            allow_codex_credentials: s.allow_codex_credentials,
+            allow_antigravity_credentials: s.allow_antigravity_credentials,
+            claude_credential_access_decided: s.claude_credential_access_decided,
+            codex_credential_access_decided: s.codex_credential_access_decided,
+            antigravity_credential_access_decided: s.antigravity_credential_access_decided,
             provider_order: s.provider_order.clone(),
             notify_session_reset: s.notify_session_reset,
             notify_weekly_reset: s.notify_weekly_reset,
@@ -2524,6 +2538,246 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
             PCWSTR::from_raw(title_wide.as_ptr()),
             MB_OK | MB_ICONINFORMATION,
         );
+    }
+}
+
+fn provider_display_name(strings: Strings, kind: tray_icon::TrayIconKind) -> &'static str {
+    match kind {
+        tray_icon::TrayIconKind::Claude => strings.claude_code_model,
+        tray_icon::TrayIconKind::Codex => strings.codex_model,
+        tray_icon::TrayIconKind::Antigravity => strings.antigravity_model,
+    }
+}
+
+fn provider_credential_source(kind: tray_icon::TrayIconKind) -> &'static str {
+    match kind {
+        tray_icon::TrayIconKind::Claude => {
+            r#""%USERPROFILE%\.claude\.credentials.json" or the matching Claude credential file in WSL"#
+        }
+        tray_icon::TrayIconKind::Codex => {
+            r#""%CODEX_HOME%\auth.json" (normally "%USERPROFILE%\.codex\auth.json") or the Codex entry in Windows Credential Manager"#
+        }
+        tray_icon::TrayIconKind::Antigravity => {
+            r#""gemini:antigravity" in Windows Credential Manager"#
+        }
+    }
+}
+
+fn provider_has_credential_access(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
+        tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
+        tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
+    }
+}
+
+fn provider_credential_access_decided(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.claude_credential_access_decided,
+        tray_icon::TrayIconKind::Codex => state.codex_credential_access_decided,
+        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_decided,
+    }
+}
+
+fn should_prompt_provider_access(shown: bool, allowed: bool, decided: bool) -> bool {
+    shown && !allowed && !decided
+}
+
+fn credential_poll_selection(
+    shown: (bool, bool, bool),
+    allowed: (bool, bool, bool),
+) -> (bool, bool, bool) {
+    (
+        shown.0 && allowed.0,
+        shown.1 && allowed.1,
+        shown.2 && allowed.2,
+    )
+}
+
+fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool) {
+    credential_poll_selection(
+        (
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        (
+            state.allow_claude_credentials,
+            state.allow_codex_credentials,
+            state.allow_antigravity_credentials,
+        ),
+    )
+}
+
+fn clear_provider_usage(state: &mut AppState, kind: tray_icon::TrayIconKind) {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.provider_request_failures.claude_code = 0,
+        tray_icon::TrayIconKind::Codex => state.provider_request_failures.codex = 0,
+        tray_icon::TrayIconKind::Antigravity => state.provider_request_failures.antigravity = 0,
+    }
+    if let Some(data) = state.data.as_mut() {
+        match kind {
+            tray_icon::TrayIconKind::Claude => {
+                data.claude_code = None;
+                data.claude_code_updated_unix = None;
+                data.claude_code_error = None;
+            }
+            tray_icon::TrayIconKind::Codex => {
+                data.codex = None;
+                data.codex_updated_unix = None;
+                data.codex_error = None;
+            }
+            tray_icon::TrayIconKind::Antigravity => {
+                data.antigravity = None;
+                data.antigravity_updated_unix = None;
+                data.antigravity_error = None;
+            }
+        }
+    }
+}
+
+fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) {
+    let cache_snapshot = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| {
+            match kind {
+                tray_icon::TrayIconKind::Claude => {
+                    s.allow_claude_credentials = allowed;
+                    s.claude_credential_access_decided = true;
+                    if allowed {
+                        s.show_claude_code = true;
+                    }
+                }
+                tray_icon::TrayIconKind::Codex => {
+                    s.allow_codex_credentials = allowed;
+                    s.codex_credential_access_decided = true;
+                    if allowed {
+                        s.show_codex = true;
+                    }
+                }
+                tray_icon::TrayIconKind::Antigravity => {
+                    s.allow_antigravity_credentials = allowed;
+                    s.antigravity_credential_access_decided = true;
+                    if allowed {
+                        s.show_antigravity = true;
+                    }
+                }
+            }
+            if !allowed {
+                clear_provider_usage(s, kind);
+            }
+            s.auth_watch_active = false;
+            s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
+            s.auth_watch_snapshot.clear();
+            set_widget_placeholders(s, "...");
+            if s.last_poll_ok {
+                refresh_usage_texts(s);
+            }
+            // Keep this generation bump under the same state lock that the
+            // poll worker uses before committing. A revoked provider can
+            // therefore never win the gap between changing permission and
+            // invalidating an in-flight result.
+            POLL_COORDINATOR.invalidate_pending();
+            s.data.clone()
+        })
+    };
+
+    unsafe {
+        let _ = KillTimer(poll_controller_hwnd(), TIMER_AUTH_WATCH);
+    }
+    save_state_settings();
+    if let Some(snapshot) = cache_snapshot.as_ref() {
+        save_usage_cache(snapshot);
+    }
+    diagnose::log(format!(
+        "{} credential access {}",
+        match kind {
+            tray_icon::TrayIconKind::Claude => "Claude Code",
+            tray_icon::TrayIconKind::Codex => "Codex",
+            tray_icon::TrayIconKind::Antigravity => "Antigravity",
+        },
+        if allowed { "granted" } else { "revoked" }
+    ));
+}
+
+fn show_credential_consent_prompt(
+    hwnd: HWND,
+    language: LanguageId,
+    kind: tray_icon::TrayIconKind,
+) -> bool {
+    let strings = language.strings();
+    let copy = localization::credential_consent_copy(language);
+    let provider = provider_display_name(strings, kind);
+    let title = copy.title.replace("{provider}", provider);
+    let message = copy
+        .body
+        .replace("{provider}", provider)
+        .replace("{source}", provider_credential_source(kind));
+
+    unsafe {
+        let title_wide = native_interop::wide_str(&title);
+        let message_wide = native_interop::wide_str(&message);
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+fn request_provider_credential_access(hwnd: HWND, kind: tray_icon::TrayIconKind) -> bool {
+    let language = {
+        let state = lock_state();
+        let Some(state) = state.as_ref() else {
+            return false;
+        };
+        if provider_has_credential_access(state, kind) {
+            return true;
+        }
+        state.language
+    };
+
+    let allowed = show_credential_consent_prompt(hwnd, language, kind);
+    if allowed {
+        set_provider_credential_access(kind, true);
+    } else {
+        set_provider_credential_access(kind, false);
+        diagnose::log(format!(
+            "{} credential access declined",
+            provider_display_name(language.strings(), kind)
+        ));
+    }
+    allowed
+}
+
+fn prompt_for_initial_provider_access(hwnd: HWND) {
+    let pending = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| {
+                [
+                    (tray_icon::TrayIconKind::Claude, s.show_claude_code),
+                    (tray_icon::TrayIconKind::Codex, s.show_codex),
+                    (tray_icon::TrayIconKind::Antigravity, s.show_antigravity),
+                ]
+                .into_iter()
+                .filter_map(|(kind, shown)| {
+                    should_prompt_provider_access(
+                        shown,
+                        provider_has_credential_access(s, kind),
+                        provider_credential_access_decided(s, kind),
+                    )
+                    .then_some(kind)
+                })
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    for kind in pending {
+        let _ = request_provider_credential_access(hwnd, kind);
     }
 }
 
@@ -7888,6 +8142,13 @@ pub fn run(_instance_guard: InstanceGuard) {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                allow_claude_credentials: settings.allow_claude_credentials,
+                allow_codex_credentials: settings.allow_codex_credentials,
+                allow_antigravity_credentials: settings.allow_antigravity_credentials,
+                claude_credential_access_decided: settings.claude_credential_access_decided,
+                codex_credential_access_decided: settings.codex_credential_access_decided,
+                antigravity_credential_access_decided: settings
+                    .antigravity_credential_access_decided,
                 provider_order: settings.provider_order.clone(),
                 pending_provider_order: None,
                 pending_provider_order_samples: 0,
@@ -7931,6 +8192,11 @@ pub fn run(_instance_guard: InstanceGuard) {
             });
         }
 
+        // No credential-backed operation may run until the user has made a
+        // provider-specific choice. Older settings intentionally deserialize
+        // these permissions as false and pass through this migration prompt.
+        prompt_for_initial_provider_access(hwnd);
+
         // Broadcast helper: receives the top-level-only broadcast messages,
         // second-instance activation requests, and revival ready signals for
         // the process lifetime.
@@ -7945,13 +8211,28 @@ pub fn run(_instance_guard: InstanceGuard) {
         // Show the previous run's usage numbers immediately (marked as cached
         // in the detail popup) instead of "--" until the first poll lands.
         if let Some((cached_data, saved_unix)) = load_usage_cache() {
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                s.data = Some(cached_data);
-                s.data_is_cached = true;
-                s.last_poll_ok = true;
-                s.last_success_unix = Some(saved_unix);
-                refresh_usage_texts(s);
+            let filtered_cache = {
+                let mut state = lock_state();
+                state.as_mut().and_then(|s| {
+                    s.data = Some(cached_data);
+                    if !s.allow_claude_credentials {
+                        clear_provider_usage(s, tray_icon::TrayIconKind::Claude);
+                    }
+                    if !s.allow_codex_credentials {
+                        clear_provider_usage(s, tray_icon::TrayIconKind::Codex);
+                    }
+                    if !s.allow_antigravity_credentials {
+                        clear_provider_usage(s, tray_icon::TrayIconKind::Antigravity);
+                    }
+                    s.data_is_cached = true;
+                    s.last_poll_ok = true;
+                    s.last_success_unix = Some(saved_unix);
+                    refresh_usage_texts(s);
+                    s.data.clone()
+                })
+            };
+            if let Some(snapshot) = filtered_cache.as_ref() {
+                save_usage_cache(snapshot);
             }
             diagnose::log("loaded usage snapshot from previous run");
         }
@@ -8238,10 +8519,26 @@ fn request_poll_with(force_claude_refresh: bool) {
     // Synchronize the generation bump with `do_poll` applying a result under
     // the same state lock. Once a worker verifies its generation while holding
     // this lock, no newer request can make that result stale mid-commit.
-    let should_start_worker = {
-        let _state = lock_state();
-        POLL_COORDINATOR.request(force_claude_refresh)
+    let (should_start_worker, has_allowed_provider) = {
+        let state = lock_state();
+        let has_allowed_provider = state
+            .as_ref()
+            .map(state_credential_poll_selection)
+            .is_some_and(|selection| selection.0 || selection.1 || selection.2);
+        if has_allowed_provider {
+            (
+                POLL_COORDINATOR.request(force_claude_refresh),
+                has_allowed_provider,
+            )
+        } else {
+            POLL_COORDINATOR.invalidate_pending();
+            (false, has_allowed_provider)
+        }
     };
+    if !has_allowed_provider {
+        diagnose::log("poll skipped; no shown provider has credential access");
+        return;
+    }
     if should_start_worker {
         std::thread::spawn(poll_worker);
     }
@@ -8265,9 +8562,13 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or((true, false, false))
+            .map(state_credential_poll_selection)
+            .unwrap_or((false, false, false))
     };
+    if !show_claude_code && !show_codex && !show_antigravity {
+        diagnose::log("poll worker stopped before credential access");
+        return;
+    }
 
     // Sample the credentials the poll is about to use. A refresh landing
     // while the poll is in flight would otherwise be invisible: the result
@@ -9406,9 +9707,20 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     SetTimer(poll_controller_hwnd(), TIMER_POLL, new_interval, None);
                 }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
-                    {
+                    let kind = match id {
+                        IDM_MODEL_CLAUDE_CODE => tray_icon::TrayIconKind::Claude,
+                        IDM_MODEL_CODEX => tray_icon::TrayIconKind::Codex,
+                        IDM_MODEL_ANTIGRAVITY => tray_icon::TrayIconKind::Antigravity,
+                        _ => unreachable!(),
+                    };
+                    let needs_access_prompt = {
                         let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
+                        state.as_mut().is_some_and(|s| {
+                            let was_shown = match kind {
+                                tray_icon::TrayIconKind::Claude => s.show_claude_code,
+                                tray_icon::TrayIconKind::Codex => s.show_codex,
+                                tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
+                            };
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
                                     if s.show_codex || s.show_antigravity || !s.show_claude_code {
@@ -9430,9 +9742,43 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             set_widget_placeholders(s, "...");
                             s.pending_provider_order = None;
                             s.pending_provider_order_samples = 0;
-                        }
+                            let is_shown = match kind {
+                                tray_icon::TrayIconKind::Claude => s.show_claude_code,
+                                tray_icon::TrayIconKind::Codex => s.show_codex,
+                                tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
+                            };
+                            !was_shown && is_shown && !provider_has_credential_access(s, kind)
+                        })
+                    };
+                    if needs_access_prompt {
+                        let _ = request_provider_credential_access(hwnd, kind);
                     }
                     save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                    refresh_floating_monitor(false);
+                    sync_tray_icons(hwnd);
+                    refresh_provider_order_from_tray(hwnd);
+                    request_poll();
+                }
+                IDM_ACCESS_CLAUDE_CODE | IDM_ACCESS_CODEX | IDM_ACCESS_ANTIGRAVITY => {
+                    let kind = match id {
+                        IDM_ACCESS_CLAUDE_CODE => tray_icon::TrayIconKind::Claude,
+                        IDM_ACCESS_CODEX => tray_icon::TrayIconKind::Codex,
+                        IDM_ACCESS_ANTIGRAVITY => tray_icon::TrayIconKind::Antigravity,
+                        _ => unreachable!(),
+                    };
+                    let currently_allowed = {
+                        let state = lock_state();
+                        state
+                            .as_ref()
+                            .is_some_and(|s| provider_has_credential_access(s, kind))
+                    };
+                    if currently_allowed {
+                        set_provider_credential_access(kind, false);
+                    } else {
+                        let _ = request_provider_credential_access(hwnd, kind);
+                    }
                     position_at_taskbar();
                     render_layered();
                     refresh_floating_monitor(false);
@@ -9598,6 +9944,9 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            allow_claude_credentials,
+            allow_codex_credentials,
+            allow_antigravity_credentials,
             notify_session_reset,
             notify_weekly_reset,
         ) = {
@@ -9616,6 +9965,9 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.allow_claude_credentials,
+                    s.allow_codex_credentials,
+                    s.allow_antigravity_credentials,
                     s.notify_session_reset,
                     s.notify_weekly_reset,
                 ),
@@ -9630,6 +9982,9 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     true,
                     true,
+                    false,
+                    false,
+                    false,
                     false,
                     false,
                     false,
@@ -9741,6 +10096,54 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        // Credential access is independent from visibility. A provider can
+        // stay visible with no permission, leaving a safe route to re-enable
+        // access after the user revokes or declines it.
+        let Ok(access_menu) = CreatePopupMenu() else {
+            diagnose::log("CreatePopupMenu failed; skipping context menu");
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        for (id, label, allowed) in [
+            (
+                IDM_ACCESS_CLAUDE_CODE,
+                strings.claude_code_model,
+                allow_claude_credentials,
+            ),
+            (
+                IDM_ACCESS_CODEX,
+                strings.codex_model,
+                allow_codex_credentials,
+            ),
+            (
+                IDM_ACCESS_ANTIGRAVITY,
+                strings.antigravity_model,
+                allow_antigravity_credentials,
+            ),
+        ] {
+            let label = native_interop::wide_str(label);
+            let flags = if allowed {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                access_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let access_label = native_interop::wide_str(
+            localization::credential_consent_copy(language).provider_access,
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            access_menu.0 as usize,
+            PCWSTR::from_raw(access_label.as_ptr()),
         );
 
         // Settings submenu
@@ -10361,6 +10764,30 @@ mod reset_notification_tests {
         assert!(!coordinator.finish_pass());
 
         assert!(coordinator.request(false));
+    }
+
+    #[test]
+    fn credential_poll_selection_requires_visibility_and_explicit_consent() {
+        assert_eq!(
+            credential_poll_selection((true, true, true), (false, false, false)),
+            (false, false, false)
+        );
+        assert_eq!(
+            credential_poll_selection((false, false, false), (true, true, true)),
+            (false, false, false)
+        );
+        assert_eq!(
+            credential_poll_selection((true, false, true), (true, true, false)),
+            (true, false, false)
+        );
+    }
+
+    #[test]
+    fn provider_access_prompt_runs_only_before_the_first_decision() {
+        assert!(should_prompt_provider_access(true, false, false));
+        assert!(!should_prompt_provider_access(false, false, false));
+        assert!(!should_prompt_provider_access(true, true, false));
+        assert!(!should_prompt_provider_access(true, false, true));
     }
 
     #[test]

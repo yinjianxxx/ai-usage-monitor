@@ -110,11 +110,13 @@ cargo build --release --locked
 - **Codex**：已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持的本地会话，无需另外安装 CLI
 - **Antigravity**：已登录的 Antigravity 会话
 
+读取某个服务商的本地凭据来源或启动轮询前，更筹会按服务商单独请求授权，并明确显示将读取的来源；默认选项为**不允许**。授权后，更筹仍会按需重新读取原文件或 Windows 凭据管理器条目，因此服务商自动刷新令牌的机制可以继续工作，而令牌不会被复制到更筹中。你可以随时在右键菜单的**服务商访问权限**中分别授权或撤销。
+
 ## 数据与隐私
 
 | 内容 | 位置 |
 | --- | --- |
-| 设置 | `%APPDATA%\Gengchou\settings.json` |
+| 设置——包括各服务商授权标志，绝不含令牌 | `%APPDATA%\Gengchou\settings.json` |
 | 用量缓存——仅百分比、配额窗口元数据和重置时间，绝不含令牌 | `%APPDATA%\Gengchou\usage-cache.json` |
 | 诊断日志（只追加、自动轮换） | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
@@ -122,7 +124,7 @@ v2.3.0 只读写上表中的更筹路径。仍低于 v2.2.4 的安装必须先�
 
 卸载前，如已启用**开机启动**，请先在菜单中关闭，然后删除可执行文件、`%APPDATA%\Gengchou` 和 `%LOCALAPPDATA%\Gengchou` 两个目录。
 
-网络请求会直接发往已启用的服务商（Anthropic、ChatGPT/Codex、Google）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
+网络请求会直接发往已启用且获得明确授权的服务商（Anthropic、ChatGPT/Codex、Google）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
 
 - 收集分析或遥测数据，或上传任何文件；
 - 将凭据发送给签发者以外的任何一方；

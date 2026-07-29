@@ -158,11 +158,19 @@ each provider's own account rules:
   not required when Desktop has already saved a supported local session
 - **Antigravity** — a signed-in Antigravity session
 
+Before it reads a provider's local credential source or starts polling,
+Gengchou asks for provider-specific permission and identifies the source it
+will read. Permission defaults to **No**. After permission is granted, Gengchou
+re-reads the original file or Windows Credential Manager entry as needed, so
+provider-side token refresh continues to work without copying the token into
+Gengchou. Use **Provider access** in the context menu to grant or revoke each
+permission at any time.
+
 ## Data & privacy
 
 | What | Where |
 | --- | --- |
-| Settings | `%APPDATA%\Gengchou\settings.json` |
+| Settings — including provider permission flags; never tokens | `%APPDATA%\Gengchou\settings.json` |
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
 | Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
@@ -173,7 +181,7 @@ verification before moving to v2.3.0 or later.
 To uninstall: disable **Start with Windows** if you enabled it, then delete
 the executable, `%APPDATA%\Gengchou`, and `%LOCALAPPDATA%\Gengchou`.
 
-Network traffic goes directly to the enabled providers (Anthropic,
+Network traffic goes directly to the enabled and explicitly authorized providers (Anthropic,
 ChatGPT/Codex, Google) for read-only usage queries, plus GitHub for update
 checks and user-approved update downloads. The app never:
 

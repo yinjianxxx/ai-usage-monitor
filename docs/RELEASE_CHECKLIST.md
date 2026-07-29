@@ -15,6 +15,9 @@ with a short note in the release runbook.
 - `cargo build --release --locked`
 - `tools\check-portable-runtime.ps1` rejects external MSVC/UCRT runtime DLLs
   so the portable executable starts without a separate redistributable.
+- Confirm tests cover settings that predate provider permissions, the
+  default-deny permission state, and the hard poll gate that requires both
+  visibility and explicit provider permission.
 - Confirm the built file is `target/release/gengchou.exe`; inspect PE properties
   for ProductName `Gengchou`, version/tag agreement, retained upstream
   copyright/Comments, and the unchanged v2.1.0 application icon.
@@ -28,6 +31,16 @@ with a short note in the release runbook.
   popup opens without a second resident process.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
+- On a fresh profile and on an upgrade from settings without permission
+  fields, confirm each visible provider prompts before any credential read,
+  credential watch, or quota request. The prompt must name the provider and
+  exact source, default to No, and persist either decision without prompting
+  again at the next launch.
+- Grant one provider under Provider access and confirm only that provider
+  polls. Rotate its original file or Credential Manager entry and confirm the
+  new credential is picked up without Gengchou storing a token. Revoke access,
+  confirm pending results are discarded and future reads/polls stop, then
+  confirm settings, usage cache, and diagnostics contain no token.
 - Confirm Refresh is one submenu whose first item is Now, followed by a
   separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
   minutes); exercise Now and each interval once.
