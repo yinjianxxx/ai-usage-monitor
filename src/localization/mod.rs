@@ -141,6 +141,78 @@ impl LanguageId {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct CredentialConsentCopy {
+    pub provider_access: &'static str,
+    pub title: &'static str,
+    pub body: &'static str,
+}
+
+pub fn credential_consent_copy(language: LanguageId) -> CredentialConsentCopy {
+    let (provider_access, title, body) = match language {
+        LanguageId::English => (
+            "Provider access",
+            "Allow access to {provider}?",
+            "Before reading {source}, Gengchou needs your permission. If allowed, it re-reads that source as needed and sends the session only to {provider} for read-only quota requests.\n\nGengchou never stores the token. You can revoke access from the Provider access menu at any time.\n\nAllow access?",
+        ),
+        LanguageId::Dutch => (
+            "Providertoegang",
+            "Toegang tot {provider} toestaan?",
+            "Gengchou heeft uw toestemming nodig voordat {source} wordt gelezen. Na toestemming leest Gengchou deze bron opnieuw wanneer dat nodig is en stuurt de sessie alleen naar {provider} voor alleen-lezen quota-aanvragen.\n\nGengchou slaat het token nooit op. U kunt de toegang op elk moment intrekken via het menu Providertoegang.\n\nToegang toestaan?",
+        ),
+        LanguageId::Spanish => (
+            "Acceso a proveedores",
+            "¿Permitir el acceso a {provider}?",
+            "Gengchou necesita su permiso antes de leer {source}. Si lo permite, vuelve a leer esa fuente cuando sea necesario y envía la sesión únicamente a {provider} para consultar la cuota en modo de solo lectura.\n\nGengchou nunca guarda el token. Puede revocar el acceso en cualquier momento desde el menú Acceso a proveedores.\n\n¿Permitir el acceso?",
+        ),
+        LanguageId::French => (
+            "Accès aux fournisseurs",
+            "Autoriser l'accès à {provider} ?",
+            "Gengchou a besoin de votre autorisation avant de lire {source}. Une fois autorisé, il relit cette source lorsque nécessaire et envoie la session uniquement à {provider} pour des requêtes de quota en lecture seule.\n\nGengchou ne stocke jamais le jeton. Vous pouvez révoquer l'accès à tout moment depuis le menu Accès aux fournisseurs.\n\nAutoriser l'accès ?",
+        ),
+        LanguageId::German => (
+            "Anbieterzugriff",
+            "Zugriff auf {provider} erlauben?",
+            "Gengchou benötigt Ihre Zustimmung, bevor {source} gelesen wird. Nach der Zustimmung liest Gengchou diese Quelle bei Bedarf erneut und sendet die Sitzung nur für schreibgeschützte Kontingentabfragen an {provider}.\n\nGengchou speichert das Token niemals. Sie können den Zugriff jederzeit im Menü Anbieterzugriff widerrufen.\n\nZugriff erlauben?",
+        ),
+        LanguageId::Japanese => (
+            "プロバイダーへのアクセス",
+            "{provider} へのアクセスを許可しますか？",
+            "{source} を読み取る前に、Gengchou は許可を必要とします。許可すると、必要に応じてこのソースを再度読み取り、読み取り専用のクォータ照会のためだけにセッションを {provider} へ送信します。\n\nGengchou はトークンを保存しません。プロバイダーへのアクセス メニューからいつでも許可を取り消せます。\n\nアクセスを許可しますか？",
+        ),
+        LanguageId::Korean => (
+            "공급자 액세스",
+            "{provider} 액세스를 허용하시겠습니까?",
+            "{source}을(를) 읽기 전에 Gengchou에 사용자의 허가가 필요합니다. 허용하면 필요할 때 이 원본을 다시 읽고 읽기 전용 할당량 요청을 위해서만 세션을 {provider}에 보냅니다.\n\nGengchou는 토큰을 저장하지 않습니다. 공급자 액세스 메뉴에서 언제든지 권한을 철회할 수 있습니다.\n\n액세스를 허용하시겠습니까?",
+        ),
+        LanguageId::SimplifiedChinese => (
+            "服务商访问权限",
+            "允许访问 {provider}？",
+            "读取 {source} 前，Gengchou 需要获得你的明确授权。授权后，Gengchou 会按需重新读取该来源，并且只把会话用于向 {provider} 发起只读的额度查询。\n\nGengchou 不会保存令牌。你可以随时在“服务商访问权限”菜单中撤销授权。\n\n是否允许访问？",
+        ),
+        LanguageId::TraditionalChinese => (
+            "服務商存取權限",
+            "允許存取 {provider}？",
+            "讀取 {source} 前，Gengchou 需要取得你的明確授權。授權後，Gengchou 會按需重新讀取該來源，並且只把工作階段用於向 {provider} 發起唯讀的配額查詢。\n\nGengchou 不會儲存權杖。你可以隨時在「服務商存取權限」選單中撤銷授權。\n\n是否允許存取？",
+        ),
+        LanguageId::Russian => (
+            "Доступ к провайдерам",
+            "Разрешить доступ к {provider}?",
+            "Перед чтением {source} Gengchou требуется ваше разрешение. После разрешения источник перечитывается по мере необходимости, а сеанс отправляется только в {provider} для запросов квоты без изменения данных.\n\nGengchou никогда не сохраняет токен. Доступ можно отозвать в любое время в меню доступа к провайдерам.\n\nРазрешить доступ?",
+        ),
+        LanguageId::PortugueseBrazil => (
+            "Acesso aos provedores",
+            "Permitir acesso ao {provider}?",
+            "O Gengchou precisa da sua permissão antes de ler {source}. Se permitido, ele relê essa fonte quando necessário e envia a sessão somente ao {provider} para consultas de cota somente leitura.\n\nO Gengchou nunca armazena o token. Você pode revogar o acesso a qualquer momento no menu Acesso aos provedores.\n\nPermitir acesso?",
+        ),
+    };
+    CredentialConsentCopy {
+        provider_access,
+        title,
+        body,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Strings {
     pub window_title: &'static str,
     pub refresh: &'static str,

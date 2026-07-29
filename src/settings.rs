@@ -54,6 +54,18 @@ pub(crate) struct SettingsFile {
     pub show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     pub show_antigravity: bool,
+    #[serde(default)]
+    pub allow_claude_credentials: bool,
+    #[serde(default)]
+    pub allow_codex_credentials: bool,
+    #[serde(default)]
+    pub allow_antigravity_credentials: bool,
+    #[serde(default)]
+    pub claude_credential_access_decided: bool,
+    #[serde(default)]
+    pub codex_credential_access_decided: bool,
+    #[serde(default)]
+    pub antigravity_credential_access_decided: bool,
     #[serde(default = "default_provider_order")]
     pub provider_order: Vec<TrayIconKind>,
     #[serde(default)]
@@ -78,6 +90,12 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
+            allow_claude_credentials: false,
+            allow_codex_credentials: false,
+            allow_antigravity_credentials: false,
+            claude_credential_access_decided: false,
+            codex_credential_access_decided: false,
+            antigravity_credential_access_decided: false,
             provider_order: default_provider_order(),
             notify_session_reset: false,
             notify_weekly_reset: false,
@@ -321,6 +339,18 @@ mod tests {
     }
 
     #[test]
+    fn credentials_require_explicit_consent_by_default() {
+        let settings = SettingsFile::default();
+
+        assert!(!settings.allow_claude_credentials);
+        assert!(!settings.allow_codex_credentials);
+        assert!(!settings.allow_antigravity_credentials);
+        assert!(!settings.claude_credential_access_decided);
+        assert!(!settings.codex_credential_access_decided);
+        assert!(!settings.antigravity_credential_access_decided);
+    }
+
+    #[test]
     fn all_refresh_menu_intervals_are_preserved() {
         for poll_interval_ms in SUPPORTED_POLL_INTERVALS {
             let mut settings = SettingsFile {
@@ -366,6 +396,36 @@ mod tests {
         assert!(settings.detailed_tray_icons);
         assert_eq!(settings.floating_x, None);
         assert_eq!(settings.floating_y, None);
+        assert!(!settings.allow_claude_credentials);
+        assert!(!settings.allow_codex_credentials);
+        assert!(!settings.allow_antigravity_credentials);
+        assert!(!settings.claude_credential_access_decided);
+        assert!(!settings.codex_credential_access_decided);
+        assert!(!settings.antigravity_credential_access_decided);
+    }
+
+    #[test]
+    fn credential_consent_round_trips() {
+        let settings = SettingsFile {
+            allow_claude_credentials: true,
+            allow_codex_credentials: false,
+            allow_antigravity_credentials: true,
+            claude_credential_access_decided: true,
+            codex_credential_access_decided: true,
+            antigravity_credential_access_decided: true,
+            ..SettingsFile::default()
+        };
+
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let decoded: SettingsFile =
+            serde_json::from_str(&json).expect("settings should deserialize");
+
+        assert!(decoded.allow_claude_credentials);
+        assert!(!decoded.allow_codex_credentials);
+        assert!(decoded.allow_antigravity_credentials);
+        assert!(decoded.claude_credential_access_decided);
+        assert!(decoded.codex_credential_access_decided);
+        assert!(decoded.antigravity_credential_access_decided);
     }
 
     #[test]
