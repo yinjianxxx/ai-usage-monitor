@@ -59,13 +59,13 @@
 
 2. **独立 EXE。** 如需单文件下载，可从同一 Release 获取 `gengchou.exe`，放在任意可写目录直接运行。
 
-3. **WinGet（上架后可用）。** 软件包使用以下标识：
+3. **WinGet。** 软件包已使用以下标识上架：
 
    ```powershell
    winget install --id ynjmxn.Gengchou --exact
    ```
 
-   如果 WinGet 暂时找不到该软件包，请改用 ZIP 或 EXE。
+   WinGet 从 v2.3.4 开始提供；需要便携安装或手动替换时，仍可使用 ZIP 或 EXE。
 
 可执行文件目前未做代码签名。每个 Release 都提供 `SHA256SUMS`，应用内更新也会核对校验值。从 v2.1.0 起，发布资产还带有 GitHub artifact attestation，可用于核验构建来源，但不能替代 Authenticode 签名。
 

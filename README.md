@@ -92,13 +92,14 @@ Installation options, in recommended order:
 2. **Standalone EXE.** For a single-file download, get `gengchou.exe` from
    the same release and run it from any writable folder.
 
-3. **WinGet (when available).** The package uses this identifier:
+3. **WinGet.** The package is available under this identifier:
 
    ```powershell
    winget install --id ynjmxn.Gengchou --exact
    ```
 
-   If WinGet cannot find it yet, use the ZIP or EXE instead.
+   WinGet distribution starts with v2.3.4. The ZIP and EXE remain available
+   for portable or manual installations.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
 download verification, and self-updates check it automatically. Starting with
