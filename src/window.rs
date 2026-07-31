@@ -230,6 +230,9 @@ struct AppState {
     notify_session_reset: bool,
     notify_weekly_reset: bool,
     update_status: UpdateStatus,
+    /// Survives restarts so the version menu entry can state what the last
+    /// check found instead of resetting to a generic "check for updates".
+    last_update_outcome: Option<settings::LastUpdateOutcome>,
     last_update_check_unix: Option<u64>,
     details_hwnd: Option<HWND>,
     details_monitor: Option<MonitorIdentity>,
@@ -268,6 +271,29 @@ enum UpdateStatus {
     Applying,
     UpToDate,
     Available(ReleaseDescriptor),
+    /// Restored from the previous run, so only the version is known.
+    ///
+    /// Enough to label the menu entry, not enough to install: the release's
+    /// download URL was not kept because a stored one goes stale. Acting on
+    /// this runs a fresh check, which then offers the update as usual.
+    AvailableRemembered { version: String },
+}
+
+/// Rebuild the display state from what the previous run's last check found.
+///
+/// Without this the menu entry falls back to "check for updates" on every
+/// launch, as though the app had never looked - even though it checked
+/// yesterday and the answer has not been forgotten, only left in memory.
+fn remembered_update_status(outcome: Option<&settings::LastUpdateOutcome>) -> UpdateStatus {
+    match outcome {
+        Some(settings::LastUpdateOutcome::UpToDate) => UpdateStatus::UpToDate,
+        Some(settings::LastUpdateOutcome::Available { version }) => {
+            UpdateStatus::AvailableRemembered {
+                version: version.clone(),
+            }
+        }
+        None => UpdateStatus::Idle,
+    }
 }
 
 fn update_status_is_busy(status: &UpdateStatus) -> bool {
@@ -1530,6 +1556,7 @@ fn save_state_settings() {
                 .language_override
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
+            last_update_outcome: s.last_update_outcome.clone(),
             widget_visible: s.widget_visible,
             floating_visible: s.floating_visible,
             detailed_tray_icons: s.detailed_tray_icons,
@@ -9106,19 +9133,35 @@ fn version_action_label(
         UpdateStatus::Prompting => format!("v{current} - {}", strings.update_in_progress),
         UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
         UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
-        UpdateStatus::Available(release) => match install_channel {
-            InstallChannel::Portable => {
-                format!(
-                    "v{current} - {} v{}",
-                    strings.update_to, release.latest_version
-                )
-            }
-            InstallChannel::Winget => format!(
-                "v{current} - {} v{}",
-                localization::update_via_winget(language),
-                release.latest_version
-            ),
-        },
+        // A remembered update reads exactly like a freshly found one: from the
+        // user's side the situation is the same, and the difference (no stored
+        // download URL) only shows up as an extra check after they click.
+        UpdateStatus::Available(release) => available_version_label(
+            strings,
+            language,
+            install_channel,
+            current,
+            &release.latest_version,
+        ),
+        UpdateStatus::AvailableRemembered { version } => {
+            available_version_label(strings, language, install_channel, current, version)
+        }
+    }
+}
+
+fn available_version_label(
+    strings: Strings,
+    language: LanguageId,
+    install_channel: InstallChannel,
+    current: &str,
+    latest: &str,
+) -> String {
+    match install_channel {
+        InstallChannel::Portable => format!("v{current} - {} v{latest}", strings.update_to),
+        InstallChannel::Winget => format!(
+            "v{current} - {} v{latest}",
+            localization::update_via_winget(language)
+        ),
     }
 }
 
@@ -9157,6 +9200,7 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::UpToDate;
+                        s.last_update_outcome = Some(settings::LastUpdateOutcome::UpToDate);
                         s.last_update_check_unix = Some(checked_at);
                     }
                 }
@@ -9173,6 +9217,9 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::Available(release.clone());
+                        s.last_update_outcome = Some(settings::LastUpdateOutcome::Available {
+                            version: release.latest_version.clone(),
+                        });
                         s.last_update_check_unix = Some(checked_at);
                     }
                 }
@@ -9209,6 +9256,10 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::Idle;
+                        // The check failed, so the previous answer is no
+                        // longer something to stand behind - forget it rather
+                        // than keep showing a stale claim.
+                        s.last_update_outcome = None;
                         s.last_update_check_unix = Some(checked_at);
                     }
                 }
@@ -11240,7 +11291,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 last_success_unix: None,
                 notify_session_reset: settings.notify_session_reset,
                 notify_weekly_reset: settings.notify_weekly_reset,
-                update_status: UpdateStatus::Idle,
+                update_status: remembered_update_status(settings.last_update_outcome.as_ref()),
+                last_update_outcome: settings.last_update_outcome.clone(),
                 last_update_check_unix: settings.last_update_check_unix,
                 details_hwnd: None,
                 details_monitor: None,
@@ -14492,6 +14544,55 @@ mod reset_notification_tests {
             credential_poll_selection((true, false, true), (true, true, false)),
             (true, false, false)
         );
+    }
+
+    /// The version entry should state what is known, not offer a chore. Before
+    /// the last result was persisted it reset to "check for updates" on every
+    /// launch, even though the answer from yesterday was still valid.
+    #[test]
+    fn the_last_update_result_survives_a_restart() {
+        assert!(matches!(
+            remembered_update_status(None),
+            UpdateStatus::Idle
+        ));
+        assert!(matches!(
+            remembered_update_status(Some(&settings::LastUpdateOutcome::UpToDate)),
+            UpdateStatus::UpToDate
+        ));
+        let remembered = remembered_update_status(Some(&settings::LastUpdateOutcome::Available {
+            version: "9.9.9".to_string(),
+        }));
+        match &remembered {
+            UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
+            other => panic!("expected a remembered update, got {other:?}"),
+        }
+    }
+
+    /// A remembered update must be indistinguishable from a freshly found one
+    /// in the menu; only the click path differs.
+    #[test]
+    fn a_remembered_update_is_labelled_like_a_fresh_one() {
+        let strings = LanguageId::English.strings();
+        let remembered = version_action_label(
+            strings,
+            LanguageId::English,
+            InstallChannel::Portable,
+            &UpdateStatus::AvailableRemembered {
+                version: "9.9.9".to_string(),
+            },
+        );
+
+        if updater::update_channel_configured() {
+            assert!(remembered.contains("9.9.9"), "{remembered}");
+            assert!(remembered.contains(strings.update_to), "{remembered}");
+            assert!(
+                !remembered.contains(strings.check_for_updates),
+                "a known update must not read as an unanswered question: {remembered}"
+            );
+        } else {
+            // Without a release channel the entry is only ever the version.
+            assert_eq!(remembered, format!("v{}", env!("CARGO_PKG_VERSION")));
+        }
     }
 
     /// Declining the one-time prompt must read nothing, no matter what the
