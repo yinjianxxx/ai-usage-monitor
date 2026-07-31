@@ -46,7 +46,6 @@ pub(super) const STRINGS: Strings = Strings {
     notifications: "Notifications",
     notify_session_reset: "短期額度重置時通知",
     notify_weekly_reset: "長期額度重置時通知",
-    notify_claude_cli_update: "Claude Code 更新時通知",
     claude_cli_updated_title: "Claude Code 已更新",
     claude_cli_updated_body: "已從 {before} 更新到 {after}，認證已自動恢復。",
     reset_notification_title: "用量區間已重設",

@@ -46,7 +46,6 @@ pub(super) const STRINGS: Strings = Strings {
     notifications: "Notifications",
     notify_session_reset: "Notificar ao redefinir limite curto",
     notify_weekly_reset: "Notificar ao redefinir limite longo",
-    notify_claude_cli_update: "Notificar quando o Claude Code for atualizado",
     claude_cli_updated_title: "Claude Code atualizado",
     claude_cli_updated_body: "Atualizado de {before} para {after}; autenticação recuperada.",
     reset_notification_title: "Período de uso redefinido",

@@ -48,7 +48,6 @@ pub(super) const STRINGS: Strings = Strings {
     notifications: "Notifications",
     notify_session_reset: "Notifier la réinitialisation de limite courte",
     notify_weekly_reset: "Notifier la réinitialisation de limite longue",
-    notify_claude_cli_update: "Notifier lors de la mise à jour de Claude Code",
     claude_cli_updated_title: "Claude Code mis à jour",
     claude_cli_updated_body: "Mise à jour de {before} vers {after} ; authentification restaurée.",
     reset_notification_title: "Fenêtre d’utilisation réinitialisée",

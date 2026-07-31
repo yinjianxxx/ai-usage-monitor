@@ -200,8 +200,6 @@ pub(crate) struct SettingsFile {
     pub notify_session_reset: bool,
     #[serde(default)]
     pub notify_weekly_reset: bool,
-    #[serde(default = "default_enabled")]
-    pub notify_claude_cli_update: bool,
 }
 
 impl Default for SettingsFile {
@@ -238,7 +236,6 @@ impl Default for SettingsFile {
             provider_order: default_provider_order(),
             notify_session_reset: false,
             notify_weekly_reset: false,
-            notify_claude_cli_update: true,
         }
     }
 }
@@ -264,10 +261,6 @@ fn default_poll_interval() -> u32 {
 }
 
 fn default_widget_visible() -> bool {
-    true
-}
-
-fn default_enabled() -> bool {
     true
 }
 
@@ -1029,7 +1022,6 @@ mod tests {
         assert!(!settings.floating_visible);
         assert!(settings.detailed_tray_icons);
         assert!(!settings.detail_pinned);
-        assert!(settings.notify_claude_cli_update);
         assert_eq!(settings.floating_x, None);
         assert_eq!(settings.floating_y, None);
         assert!(!settings.allow_claude_credentials);
@@ -1058,19 +1050,23 @@ mod tests {
         );
     }
 
+    /// Retired settings must not break older files. `notify_claude_cli_update`
+    /// joined them once the CLI-update balloon became a disclosure rather than
+    /// a preference: it reports that Gengchou changed the user's CLI, so it is
+    /// no longer something to switch off.
     #[test]
-    fn retired_claude_recovery_setting_is_ignored_and_not_reserialized() {
+    fn retired_settings_are_ignored_and_not_reserialized() {
         let settings: SettingsFile = serde_json::from_str(
             r#"{
                 "claude_auto_recovery": false,
-                "notify_claude_cli_update": true
+                "notify_claude_cli_update": false
             }"#,
         )
         .expect("retired settings fields should remain readable");
 
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("claude_auto_recovery"));
-        assert!(settings.notify_claude_cli_update);
+        assert!(!serialized.contains("notify_claude_cli_update"));
     }
 
     #[test]

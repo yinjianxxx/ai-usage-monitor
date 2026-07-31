@@ -212,11 +212,13 @@ variable. Claude Code and Claude Desktop can be signed into different accounts;
 usable CLI credentials take precedence, so disable Desktop access if that
 fallback is not wanted.
 
-Only a CLI version change produces an optional notification (enabled by
-default). Credential-only recovery and Desktop session selection stay silent.
-If no usable session remains, missing, non-renewable, and server-rejected
-credentials all appear as **Authentication failed** and ask the user to sign in
-to Claude again. In Claude Desktop, send a message first to let the normal
+Only a CLI version change produces a notification, and it is not optional:
+because Gengchou changed something on your machine, it always says so. The
+switch that matters is `DISABLE_UPDATES=1`, which stops the update itself.
+Credential-only recovery and Desktop session selection stay silent. If no
+usable session remains, non-renewable and server-rejected credentials appear as
+**Authentication failed** and ask the user to sign in to Claude again; a
+provider with no credential at all reports **Not detected** instead. In Claude Desktop, send a message first to let the normal
 session flow refresh its credentials; if monitoring still does not recover,
 sign out and back in. In Claude Code CLI, run `claude auth login`. Credential
 watching resumes monitoring automatically after sign-in.
