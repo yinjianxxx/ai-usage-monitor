@@ -125,6 +125,19 @@ pub(crate) enum FloatingDefaultPosition {
     PrimaryBottomRight,
 }
 
+/// What the last completed update check found.
+///
+/// Persisted so the version menu entry can state the current situation right
+/// after a restart instead of falling back to a generic "check for updates"
+/// prompt. Display only: the stored download URL of a release goes stale, so
+/// acting on a remembered update re-checks first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub(crate) enum LastUpdateOutcome {
+    UpToDate,
+    Available { version: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SettingsFile {
     #[serde(default)]
@@ -145,6 +158,8 @@ pub(crate) struct SettingsFile {
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update_check_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_outcome: Option<LastUpdateOutcome>,
     #[serde(default = "default_widget_visible")]
     pub widget_visible: bool,
     #[serde(default)]
@@ -214,6 +229,7 @@ impl Default for SettingsFile {
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
+            last_update_outcome: None,
             widget_visible: true,
             floating_visible: false,
             detailed_tray_icons: true,
@@ -1048,6 +1064,33 @@ mod tests {
                 TrayIconKind::Antigravity,
             ]
         );
+    }
+
+    /// Older files have no recorded outcome, and a file that does must round
+    /// trip - the version menu entry reads from it on every launch.
+    #[test]
+    fn the_last_update_outcome_round_trips_and_defaults_to_unknown() {
+        let older: SettingsFile =
+            serde_json::from_str(r#"{"last_update_check_unix": 1}"#).expect("readable");
+        assert_eq!(older.last_update_outcome, None);
+        assert!(!serde_json::to_string(&older)
+            .unwrap()
+            .contains("last_update_outcome"));
+
+        for outcome in [
+            LastUpdateOutcome::UpToDate,
+            LastUpdateOutcome::Available {
+                version: "9.9.9".to_string(),
+            },
+        ] {
+            let settings = SettingsFile {
+                last_update_outcome: Some(outcome.clone()),
+                ..SettingsFile::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.last_update_outcome, Some(outcome));
+        }
     }
 
     /// Retired settings must not break older files. `notify_claude_cli_update`
