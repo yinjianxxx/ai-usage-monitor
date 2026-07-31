@@ -16,13 +16,13 @@
 [![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/readme/detail-popup-zh-dark.png" alt="深色主题详情弹窗：Claude Code 的 7 天窗口达 92% 被标记接近上限并高亮重置时间；Codex 51% 正常；Antigravity 空闲" width="400"> <img src=".github/readme/detail-popup-zh-light.png" alt="同一详情弹窗的浅色主题" width="400">
+<img src=".github/readme/detail-popup-zh-dark.png" alt="深色主题详情弹窗：Claude 的 7 天窗口达 92% 被标记接近上限并高亮重置时间；Codex 51% 正常；Antigravity 空闲" width="400"> <img src=".github/readme/detail-popup-zh-light.png" alt="同一详情弹窗的浅色主题" width="400">
 
 <sub>详情弹窗的深色和浅色主题，图中还展示了接近上限时的警示样式。</sub>
 
 </div>
 
-更筹 Gengchou（读作 `gēng chóu`）把服务商实际返回的配额窗口、已用比例和重置时间直接放到 Windows 任务栏。Claude Code、Codex 和 Antigravity 都能实时显示；你可以选择完整的详情卡片，也可以只保留托盘数字，不必再打开各家的控制台查看配额。
+更筹 Gengchou（读作 `gēng chóu`）把服务商实际返回的配额窗口、已用比例和重置时间直接放到 Windows 任务栏。Claude、Codex 和 Antigravity 都能实时显示；你可以选择完整的详情卡片，也可以只保留托盘数字，不必再打开各家的控制台查看配额。
 
 > 烧香知夜漏，刻烛验更筹。
 >
@@ -48,7 +48,7 @@
 任何配额窗口达到 90% 时，对应服务商的徽章会变红，并显示该窗口的重置倒计时：
 
 <div align="center">
-<img src=".github/readme/widget-badges-warn-dark.png" alt="警示状态的任务栏小组件：Claude Code 的 7 天窗口达 92%，红色徽章接管并显示重置倒计时">
+<img src=".github/readme/widget-badges-warn-dark.png" alt="警示状态的任务栏小组件：Claude 的 7 天窗口达 92%，红色徽章接管并显示重置倒计时">
 </div>
 
 ## 安装
@@ -97,20 +97,23 @@ cargo build --release --locked
 ## 视图之外
 
 - 配额数据来自各服务商实际返回的窗口和重置时间，不做猜测或外推
-- Claude Code、Codex、Google Antigravity 可任意组合启用
+- 新安装默认只显示 Codex；Claude、Codex、Google Antigravity 可任意组合启用
 - 高对比度模式下使用 Windows 系统颜色
 - 可选的重置通知（默认关闭）
 - 在 `explorer.exe` 重启和 RDP/锁屏切换后自动恢复；锁屏期间仍按既定间隔轮询，恢复时只重建本地界面，不额外发送请求
 - 支持多显示器、多任务栏
-- 11 种语言 · 无遥测 · 单个约 1 MB 的便携可执行文件
+- 11 种语言 · 无遥测 · 单个便携可执行文件
+- 软件界面在简体中文下显示**更筹**，繁体中文下显示**更籌**，其他语言统一显示 **Gengchou**
 
 ## 服务商要求
 
 本应用只读取本机已有的登录会话，不会创建账户或绕过服务商身份验证。可显示的内容取决于各服务商的账户规则：
 
-- **Claude Code**：已登录 Windows 或 WSL 中的 Claude Code，或者已登录 Windows Claude Desktop；Desktop 存在受支持的本地会话时无需安装 CLI。Claude Code 凭据会同时检查 Windows 和所有已知可用 WSL 发行版。Windows 默认读取 `%USERPROFILE%\.claude\.credentials.json`，设置 `CLAUDE_CONFIG_DIR` 后改读该目录下的 `.credentials.json`；每个 WSL 发行版按其自身的 `CLAUDE_CONFIG_DIR` 或 `$HOME/.claude` 解析
-- **Codex**：已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持的本地会话，无需另外安装 CLI
-- **Antigravity**：已登录的 Antigravity 会话
+- **Claude**：已登录 Windows 或 WSL 中的 Claude Code，或者已登录 Windows Claude Desktop；Desktop 存在受支持的本地会话时无需安装 CLI。Claude Code 凭据会同时检查 Windows 和所有已知可用 WSL 发行版。Windows 默认读取 `%USERPROFILE%\.claude\.credentials.json`，设置 `CLAUDE_CONFIG_DIR` 后改读该目录下的 `.credentials.json`；每个 WSL 发行版按其自身的 `CLAUDE_CONFIG_DIR` 或 `$HOME/.claude` 解析
+- **Codex**：已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持的本地会话，无需另外安装 CLI。Windows 侧读取 `%CODEX_HOME%\auth.json`（默认 `%USERPROFILE%\.codex\auth.json`）或 Windows 凭据管理器中的 Codex 条目；如均不可用，再读取**正在运行的** WSL 发行版中的 `$CODEX_HOME/auth.json`（默认 `$HOME/.codex/auth.json`）
+- **Antigravity**：已登录的 Antigravity 会话（IDE 与 CLI 共用同一条凭据）。Windows 侧读取凭据管理器中的 `gemini:antigravity`；如不可用，再读取**正在运行的** WSL 发行版中的 `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`
+
+Codex 与 Antigravity 的 WSL 凭据只在发行版**已经在运行**时读取。读取停止的发行版会启动它的虚拟机，而这项检查是按计划执行的，因此更筹不会为此唤醒 WSL。需要时可先启动发行版，再从右键菜单的**服务商访问权限 → 重新探测服务商**触发一次检查。
 
 更筹会自动寻找可用的 Claude 会话。Anthropic 用量接口确认 Windows 侧 Claude Code 凭据失效后，更筹可在隐藏的后台进程中运行已安装 CLI 的 `claude update`（60 秒超时），确认本地凭据确实变化，再重试用量接口。如果没有可用的 CLI 凭据或根本没有安装 CLI，则改用 Windows 当前用户 Claude Desktop 会话中符合条件且尚未过期的访问令牌。两条路径均默认启用，不提供设置菜单项；WSL 凭据不会调用 Windows CLI，网络错误和限流也不会触发凭据来源切换。
 
@@ -122,7 +125,11 @@ cargo build --release --locked
 
 需要排查时，可在终端运行 `gengchou.exe --claude-auth-diagnostics`。该命令只在用户主动调用时执行非模型命令 `claude auth status`，输出解析到的配置路径、文件状态、到期时间、CLI 版本和内部原因码，并附上可复制的 `claude auth login`；不会输出 token、账户标识或 CLI 原始响应。安全报告也会写入更筹诊断日志。
 
-读取某个服务商的本地凭据来源或启动轮询前，更筹会按服务商单独请求授权，并明确显示将读取的来源；默认选项为**不允许**。授权后，更筹仍会按需重新读取原文件或 Windows 凭据管理器条目，因此服务商自动刷新令牌的机制可以继续工作，而令牌不会被复制到更筹中。你可以随时在右键菜单的**服务商访问权限**中分别授权或撤销。
+首次启动时，更筹会请求一次授权，说明访问仅用于查询用量、不会消耗模型额度、也不会保存登录信息；默认选项为**不允许**，未获授权前不会读取任何凭据。授权后更筹会检查本机有哪些服务商已登录，并只显示检查到的那些。授权是一次性的、覆盖全部服务商，但撤销仍然是按服务商的：可随时在右键菜单的**服务商访问权限**中单独关闭某一个。授权后，更筹仍会按需重新读取原文件或 Windows 凭据管理器条目，因此服务商自动刷新令牌的机制可以继续工作，而登录信息不会保存到更筹中。
+
+从旧版本升级时不会再次弹出授权框，现有的服务商选择与授权状态原样保留；如需让更筹检查新装的服务商，请使用**服务商访问权限 → 重新探测服务商**。此后更筹也会定期检查，发现新的已登录服务商时只弹一次通知，不会自行改变显示内容。
+
+如果一个服务商本机没有任何登录凭据，详情弹窗会显示**未检测到**并提示登录后自动识别，不会弹出通知——从未登录过的服务商没有需要「重新登录」的东西。**认证失败**只用于确实存在但已失效或被拒绝的凭据。
 
 ## 数据与隐私
 

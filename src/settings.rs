@@ -8,6 +8,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
 
 use crate::diagnose;
+use crate::poller::DetectedProviders;
 use crate::tray_icon::TrayIconKind;
 
 pub const APP_DIR_NAME: &str = "Gengchou";
@@ -28,6 +29,9 @@ const SUPPORTED_POLL_INTERVALS: [u32; 6] = [
 ];
 
 pub(crate) const PLACEMENT_SCHEMA_VERSION: u8 = 2;
+/// Version 1 introduced the one-time, all-provider access prompt that
+/// replaced the per-provider prompts.
+pub(crate) const CONSENT_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MonitorKey {
@@ -155,9 +159,9 @@ pub(crate) struct SettingsFile {
     pub floating_y: Option<i32>,
     #[serde(default)]
     pub floating_default_position: FloatingDefaultPosition,
-    #[serde(default = "default_show_claude_code")]
+    #[serde(default = "legacy_show_claude_code")]
     pub show_claude_code: bool,
-    #[serde(default = "default_show_codex")]
+    #[serde(default = "legacy_show_codex")]
     pub show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     pub show_antigravity: bool,
@@ -167,13 +171,30 @@ pub(crate) struct SettingsFile {
     pub allow_codex_credentials: bool,
     #[serde(default)]
     pub allow_antigravity_credentials: bool,
+    /// Whether the user has answered the one-time access prompt, and what
+    /// they answered. The prompt covers every provider at once; the
+    /// `allow_*_credentials` switches above stay per-provider so access can
+    /// still be revoked one at a time.
+    #[serde(default)]
+    pub credential_consent_granted: bool,
+    #[serde(default)]
+    pub credential_consent_decided: bool,
+    /// Bumped when the consent model changes so existing installs can be
+    /// migrated exactly once. Absent (0) means the file predates the
+    /// one-time prompt.
+    #[serde(default)]
+    pub consent_schema_version: u8,
+    /// Whether the user has already been told this provider exists - either
+    /// by it being enabled for them at first run, by a detection balloon, or
+    /// by them toggling it themselves. Detection never announces the same
+    /// provider twice.
     #[serde(default)]
     pub claude_credential_access_decided: bool,
     #[serde(default)]
     pub codex_credential_access_decided: bool,
     #[serde(default)]
     pub antigravity_credential_access_decided: bool,
-    #[serde(default = "default_provider_order")]
+    #[serde(default = "legacy_provider_order")]
     pub provider_order: Vec<TrayIconKind>,
     #[serde(default)]
     pub notify_session_reset: bool,
@@ -202,12 +223,15 @@ impl Default for SettingsFile {
             floating_x: None,
             floating_y: None,
             floating_default_position: FloatingDefaultPosition::default(),
-            show_claude_code: true,
-            show_codex: false,
+            show_claude_code: false,
+            show_codex: true,
             show_antigravity: false,
             allow_claude_credentials: false,
             allow_codex_credentials: false,
             allow_antigravity_credentials: false,
+            credential_consent_granted: false,
+            credential_consent_decided: false,
+            consent_schema_version: CONSENT_SCHEMA_VERSION,
             claude_credential_access_decided: false,
             codex_credential_access_decided: false,
             antigravity_credential_access_decided: false,
@@ -220,6 +244,14 @@ impl Default for SettingsFile {
 }
 
 pub fn default_provider_order() -> Vec<TrayIconKind> {
+    vec![
+        TrayIconKind::Codex,
+        TrayIconKind::Claude,
+        TrayIconKind::Antigravity,
+    ]
+}
+
+fn legacy_provider_order() -> Vec<TrayIconKind> {
     vec![
         TrayIconKind::Claude,
         TrayIconKind::Codex,
@@ -243,16 +275,126 @@ fn default_detailed_tray_icons() -> bool {
     true
 }
 
-fn default_show_claude_code() -> bool {
+fn legacy_show_claude_code() -> bool {
     true
 }
 
-fn default_show_codex() -> bool {
+fn legacy_show_codex() -> bool {
     false
 }
 
 fn default_show_antigravity() -> bool {
     false
+}
+
+/// The provider-visibility slice of the settings, lifted out so detection can
+/// be decided as a pure function and applied to either the persisted file or
+/// the live application state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderVisibility {
+    pub show_claude_code: bool,
+    pub show_codex: bool,
+    pub show_antigravity: bool,
+    pub allow_claude_credentials: bool,
+    pub allow_codex_credentials: bool,
+    pub allow_antigravity_credentials: bool,
+    /// Whether the user has already been told this provider exists.
+    pub claude_announced: bool,
+    pub codex_announced: bool,
+    pub antigravity_announced: bool,
+}
+
+/// Turn on exactly the providers detected right after the user granted
+/// access.
+///
+/// Assignment rather than a merge: the default `show_codex` is only a
+/// placeholder for machines where nothing is found, so a machine with just
+/// Claude must not also show an empty Codex row.
+///
+/// When nothing is detected the placeholder stays visible *and polled*. That
+/// costs one local credential read per pass and nothing on the network - the
+/// poll reports "not signed in", which parks polling and arms the existing
+/// credential watch, so the first sign-in is picked up without any extra
+/// machinery.
+pub(crate) fn apply_first_run_detection(
+    visibility: &mut ProviderVisibility,
+    detected: DetectedProviders,
+) {
+    visibility.show_claude_code = detected.claude;
+    visibility.show_codex = detected.codex;
+    visibility.show_antigravity = detected.antigravity;
+    visibility.allow_claude_credentials = detected.claude;
+    visibility.allow_codex_credentials = detected.codex;
+    visibility.allow_antigravity_credentials = detected.antigravity;
+    // Enabling a provider is itself the announcement, so it is never also
+    // announced by a balloon later.
+    visibility.claude_announced |= detected.claude;
+    visibility.codex_announced |= detected.codex;
+    visibility.antigravity_announced |= detected.antigravity;
+    if !detected.any() {
+        visibility.show_codex = true;
+        visibility.allow_codex_credentials = true;
+    }
+}
+
+/// Turn on everything detected, without turning anything off.
+///
+/// For the explicit "detect providers again" menu action. Additive rather
+/// than assigning, because the user asked for a sweep, not a reset - a
+/// provider they deliberately keep visible stays visible even if its
+/// credential is currently unreadable. Unlike the periodic sweep this does
+/// change what is shown: the user asked for it, so it is not a surprise.
+pub(crate) fn apply_manual_detection(
+    visibility: &mut ProviderVisibility,
+    detected: DetectedProviders,
+) {
+    visibility.show_claude_code |= detected.claude;
+    visibility.show_codex |= detected.codex;
+    visibility.show_antigravity |= detected.antigravity;
+    visibility.allow_claude_credentials |= detected.claude;
+    visibility.allow_codex_credentials |= detected.codex;
+    visibility.allow_antigravity_credentials |= detected.antigravity;
+    visibility.claude_announced |= detected.claude;
+    visibility.codex_announced |= detected.codex;
+    visibility.antigravity_announced |= detected.antigravity;
+}
+
+/// Providers that appeared after first run and have never been announced.
+///
+/// Deliberately does not enable anything: a later discovery only earns one
+/// balloon, because changing what the widget shows while the user is not
+/// looking is worse than making them click once.
+pub(crate) fn take_detection_announcements(
+    visibility: &mut ProviderVisibility,
+    detected: DetectedProviders,
+) -> Vec<TrayIconKind> {
+    let mut announcements = Vec::new();
+    for (kind, detected, shown, announced) in [
+        (
+            TrayIconKind::Claude,
+            detected.claude,
+            visibility.show_claude_code,
+            &mut visibility.claude_announced,
+        ),
+        (
+            TrayIconKind::Codex,
+            detected.codex,
+            visibility.show_codex,
+            &mut visibility.codex_announced,
+        ),
+        (
+            TrayIconKind::Antigravity,
+            detected.antigravity,
+            visibility.show_antigravity,
+            &mut visibility.antigravity_announced,
+        ),
+    ] {
+        if detected && !shown && !*announced {
+            *announced = true;
+            announcements.push(kind);
+        }
+    }
+    announcements
 }
 
 fn normalize_provider_order(configured: &[TrayIconKind]) -> Vec<TrayIconKind> {
@@ -300,8 +442,24 @@ pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
         repaired.push("poll_interval_ms");
     }
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_claude_code = true;
+        settings.show_codex = true;
         repaired.push("enabled_providers");
+    }
+    // Existing installs already made their choices under the per-provider
+    // prompts. Carry those choices forward untouched and mark every provider
+    // as already announced, so the new one-time prompt and the detector never
+    // second-guess a decision the user already made. Runs exactly once: the
+    // schema bump below closes the door behind it.
+    if settings.consent_schema_version < CONSENT_SCHEMA_VERSION {
+        settings.credential_consent_granted = settings.allow_claude_credentials
+            || settings.allow_codex_credentials
+            || settings.allow_antigravity_credentials;
+        settings.credential_consent_decided = true;
+        settings.claude_credential_access_decided = true;
+        settings.codex_credential_access_decided = true;
+        settings.antigravity_credential_access_decided = true;
+        settings.consent_schema_version = CONSENT_SCHEMA_VERSION;
+        repaired.push("credential_consent");
     }
     let provider_order = normalize_provider_order(&settings.provider_order);
     if provider_order != settings.provider_order {
@@ -526,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn new_install_starts_with_only_codex_shown() {
+        let settings = SettingsFile::default();
+
+        assert!(!settings.show_claude_code);
+        assert!(settings.show_codex);
+        assert!(!settings.show_antigravity);
+        assert_eq!(
+            settings.provider_order,
+            vec![
+                TrayIconKind::Codex,
+                TrayIconKind::Claude,
+                TrayIconKind::Antigravity,
+            ]
+        );
+    }
+
+    #[test]
     fn unsafe_or_unsupported_values_are_repaired() {
         let mut settings = SettingsFile {
             tray_offset: -1,
@@ -543,13 +718,13 @@ mod tests {
         assert_eq!(settings.tray_offset, 0);
         assert_eq!(settings.poll_interval_ms, POLL_5_MIN);
         assert_eq!(settings.language, None);
-        assert!(settings.show_claude_code);
+        assert!(settings.show_codex);
         assert_eq!(
             settings.provider_order,
             vec![
                 TrayIconKind::Antigravity,
-                TrayIconKind::Claude,
                 TrayIconKind::Codex,
+                TrayIconKind::Claude,
             ]
         );
         assert_eq!(repaired.len(), 5);
@@ -631,6 +806,215 @@ mod tests {
         assert!(resolve_app_data_dir("Gengchou", None, None, None).is_err());
     }
 
+    /// Settings written before the one-time prompt existed must keep the
+    /// provider choices their owner made and never see the prompt. Their
+    /// `*_credential_access_decided` fields deserialize as false, so keying
+    /// the migration on those would misread them as a fresh install and let
+    /// detection re-enable providers the user had turned off.
+    #[test]
+    fn settings_predating_the_one_time_prompt_keep_their_choices() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "show_claude_code": true,
+                "show_codex": false,
+                "allow_claude_credentials": true
+            }"#,
+        )
+        .expect("older settings should remain readable");
+        assert_eq!(settings.consent_schema_version, 0);
+
+        let repaired = normalize(&mut settings);
+
+        assert!(repaired.contains(&"credential_consent"));
+        assert!(settings.credential_consent_decided);
+        assert!(settings.credential_consent_granted);
+        assert!(settings.show_claude_code);
+        assert!(!settings.show_codex);
+        // Every provider counts as already announced, so the detector stays
+        // quiet about choices this user already made.
+        assert!(settings.claude_credential_access_decided);
+        assert!(settings.codex_credential_access_decided);
+        assert!(settings.antigravity_credential_access_decided);
+    }
+
+    /// An install whose owner declined every provider must not be re-prompted
+    /// either, and must not silently gain access.
+    #[test]
+    fn settings_that_declined_every_provider_migrate_to_a_declined_consent() {
+        let mut settings: SettingsFile = serde_json::from_str(r#"{"show_codex": true}"#)
+            .expect("older settings should remain readable");
+
+        normalize(&mut settings);
+
+        assert!(settings.credential_consent_decided);
+        assert!(!settings.credential_consent_granted);
+    }
+
+    /// `load` runs `normalize` unconditionally and rewrites the file whenever
+    /// anything was repaired, so a second pass must be a no-op.
+    #[test]
+    fn consent_migration_runs_exactly_once() {
+        let mut settings: SettingsFile =
+            serde_json::from_str(r#"{"allow_codex_credentials": true}"#).expect("readable");
+
+        normalize(&mut settings);
+        let after_first = settings.clone();
+        let repaired = normalize(&mut settings);
+
+        assert!(!repaired.contains(&"credential_consent"));
+        assert_eq!(settings, after_first);
+    }
+
+    /// A fresh install must reach the prompt, so the default carries the
+    /// current schema and an unanswered consent.
+    #[test]
+    fn fresh_settings_are_not_migrated_and_still_need_an_answer() {
+        let mut settings = SettingsFile::default();
+        assert_eq!(settings.consent_schema_version, CONSENT_SCHEMA_VERSION);
+        assert!(!settings.credential_consent_decided);
+
+        let repaired = normalize(&mut settings);
+
+        assert!(!repaired.contains(&"credential_consent"));
+        assert!(!settings.credential_consent_decided);
+    }
+
+    #[test]
+    fn first_run_detection_enables_exactly_what_was_found() {
+        let mut visibility = ProviderVisibility::default();
+        apply_first_run_detection(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: false,
+                antigravity: true,
+            },
+        );
+
+        assert!(visibility.show_claude_code && visibility.allow_claude_credentials);
+        assert!(visibility.show_antigravity && visibility.allow_antigravity_credentials);
+        // The default Codex placeholder must not survive on a machine that
+        // has no Codex - it would be an empty row the user cannot explain.
+        assert!(!visibility.show_codex && !visibility.allow_codex_credentials);
+        assert!(visibility.claude_announced && visibility.antigravity_announced);
+        assert!(!visibility.codex_announced);
+    }
+
+    /// With nothing installed the widget still needs one row, and that row
+    /// has to be polled so the credential watch notices the first sign-in.
+    #[test]
+    fn first_run_detection_keeps_a_polled_placeholder_when_nothing_is_found() {
+        let mut visibility = ProviderVisibility::default();
+        apply_first_run_detection(&mut visibility, DetectedProviders::default());
+
+        assert!(visibility.show_codex);
+        assert!(visibility.allow_codex_credentials);
+        assert!(!visibility.show_claude_code);
+        assert!(!visibility.show_antigravity);
+        // Nothing was found, so nothing has been announced.
+        assert!(!visibility.codex_announced);
+    }
+
+    /// The periodic sweep may notify, but must never change what is on screen
+    /// while the user is not looking.
+    #[test]
+    fn periodic_detection_announces_without_changing_visibility() {
+        let mut visibility = ProviderVisibility {
+            show_codex: true,
+            allow_codex_credentials: true,
+            codex_announced: true,
+            ..Default::default()
+        };
+        let before = visibility;
+
+        let announced = take_detection_announcements(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: true,
+                antigravity: false,
+            },
+        );
+
+        assert_eq!(announced, vec![TrayIconKind::Claude]);
+        assert!(!visibility.show_claude_code);
+        assert!(!visibility.allow_claude_credentials);
+        assert_eq!(
+            ProviderVisibility {
+                claude_announced: before.claude_announced,
+                ..visibility
+            },
+            ProviderVisibility {
+                claude_announced: before.claude_announced,
+                ..before
+            }
+        );
+    }
+
+    #[test]
+    fn periodic_detection_announces_each_provider_only_once() {
+        let mut visibility = ProviderVisibility::default();
+        let detected = DetectedProviders {
+            claude: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            take_detection_announcements(&mut visibility, detected),
+            vec![TrayIconKind::Claude]
+        );
+        assert!(take_detection_announcements(&mut visibility, detected).is_empty());
+    }
+
+    /// A provider the user hid by hand counts as announced, so the sweep
+    /// leaves it alone instead of nagging.
+    #[test]
+    fn periodic_detection_stays_quiet_about_providers_the_user_turned_off() {
+        let mut visibility = ProviderVisibility {
+            claude_announced: true,
+            ..Default::default()
+        };
+
+        let announced = take_detection_announcements(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(announced.is_empty());
+    }
+
+    /// The menu action exists for installs the sweep will never announce to
+    /// (migrated ones mark every provider as announced), so it has to enable
+    /// rather than notify - and must not undo a deliberate choice.
+    #[test]
+    fn manual_detection_enables_findings_without_hiding_anything() {
+        let mut visibility = ProviderVisibility {
+            show_antigravity: true,
+            allow_antigravity_credentials: true,
+            claude_announced: true,
+            codex_announced: true,
+            antigravity_announced: true,
+            ..Default::default()
+        };
+
+        apply_manual_detection(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: false,
+                antigravity: false,
+            },
+        );
+
+        assert!(visibility.show_claude_code && visibility.allow_claude_credentials);
+        assert!(!visibility.show_codex);
+        // Kept, even though this pass could not read its credential.
+        assert!(visibility.show_antigravity && visibility.allow_antigravity_credentials);
+    }
+
     #[test]
     fn older_settings_default_floating_monitor_to_hidden() {
         let settings: SettingsFile = serde_json::from_str(
@@ -661,6 +1045,16 @@ mod tests {
         assert_eq!(
             settings.floating_default_position,
             FloatingDefaultPosition::PrimaryBottomRight
+        );
+        assert!(settings.show_claude_code);
+        assert!(!settings.show_codex);
+        assert_eq!(
+            settings.provider_order,
+            vec![
+                TrayIconKind::Claude,
+                TrayIconKind::Codex,
+                TrayIconKind::Antigravity,
+            ]
         );
     }
 

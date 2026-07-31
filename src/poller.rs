@@ -324,7 +324,7 @@ fn poll_with(
                 if active_provider_count > 1 {
                     diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
                 }
-                data.claude_code_error = Some(claude_provider_status(error));
+                data.claude_code_error = Some(provider_status(error));
                 if let PollError::RateLimited(retry_after_ms) = error {
                     data.claude_code_retry_after_ms = retry_after_ms;
                 }
@@ -416,25 +416,14 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
 }
 
 /// Collapse a poll error to display granularity (see models::ProviderStatus).
+///
+/// `NoCredentials` stays distinct from the rejection errors: a provider with
+/// no local credential was never signed in, so the recovery it needs is a
+/// first sign-in, not a re-authentication.
 pub fn provider_status(error: PollError) -> ProviderStatus {
     match error {
-        PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials => {
-            ProviderStatus::AuthenticationFailed
-        }
-        PollError::RateLimited(_) => ProviderStatus::RateLimited,
-        PollError::NetworkUnavailable => ProviderStatus::NetworkUnavailable,
-        PollError::RequestFailed => ProviderStatus::RequestFailed,
-    }
-}
-
-/// Claude collapses every non-renewable local or remote authentication
-/// failure to one actionable public state. Other providers retain the older
-/// generic distinctions because their recovery paths differ.
-pub fn claude_provider_status(error: PollError) -> ProviderStatus {
-    match error {
-        PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials => {
-            ProviderStatus::AuthenticationFailed
-        }
+        PollError::NoCredentials => ProviderStatus::NotSignedIn,
+        PollError::AuthRequired | PollError::AuthForbidden => ProviderStatus::AuthenticationFailed,
         PollError::RateLimited(_) => ProviderStatus::RateLimited,
         PollError::NetworkUnavailable => ProviderStatus::NetworkUnavailable,
         PollError::RequestFailed => ProviderStatus::RequestFailed,
@@ -1042,6 +1031,85 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
     snapshot
 }
 
+/// Which providers have a credential on this machine right now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectedProviders {
+    pub claude: bool,
+    pub codex: bool,
+    pub antigravity: bool,
+}
+
+impl DetectedProviders {
+    pub fn any(self) -> bool {
+        self.claude || self.codex || self.antigravity
+    }
+}
+
+/// The raw source probes the detector reduces to an answer.
+///
+/// Split from the probing itself so the decision is testable without a
+/// filesystem, a Windows keyring, or WSL - the same shape as
+/// `claude_config_dir_from` and `codex_direct_keyring_target_from_path`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectionInputs {
+    pub claude_windows: bool,
+    pub claude_desktop: bool,
+    pub claude_wsl: bool,
+    pub codex_windows: bool,
+    pub codex_wsl: bool,
+    pub antigravity_windows: bool,
+    pub antigravity_wsl: bool,
+}
+
+pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
+    DetectedProviders {
+        claude: inputs.claude_windows || inputs.claude_desktop || inputs.claude_wsl,
+        codex: inputs.codex_windows || inputs.codex_wsl,
+        antigravity: inputs.antigravity_windows || inputs.antigravity_wsl,
+    }
+}
+
+/// Probe every credential source that is cheap to reach.
+///
+/// "Cheap" excludes stopped WSL distros: reading inside one starts its virtual
+/// machine, and this runs on a timer. Providers that only live in a stopped
+/// distro stay undetected and can be enabled by hand, which then goes through
+/// the full credential resolution including every distro.
+///
+/// Runs on a worker thread - never call it from the UI thread.
+pub fn detect_signed_in_providers() -> DetectedProviders {
+    let running = list_running_wsl_distros();
+    let claude_wsl = running.iter().any(|distro| {
+        read_credentials_from_source(&CredentialSource::Wsl {
+            distro: distro.clone(),
+        })
+        .is_ok()
+    });
+    let inputs = DetectionInputs {
+        claude_windows: windows_credential_source()
+            .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
+        claude_desktop: claude_desktop::enabled()
+            && claude_desktop::credential_watch_paths()
+                .iter()
+                .any(|path| path.exists()),
+        claude_wsl,
+        codex_windows: read_windows_codex_credentials().is_some(),
+        codex_wsl: !running.is_empty() && read_codex_credentials_from_wsl(&running).is_some(),
+        antigravity_windows: read_windows_antigravity_credentials().is_some(),
+        antigravity_wsl: !running.is_empty()
+            && read_antigravity_credentials_from_wsl(&running).is_some(),
+    };
+    let detected = detect_from(inputs);
+    diagnose::log(format!(
+        "provider detection: claude={} codex={} antigravity={} (running WSL distros: {})",
+        detected.claude,
+        detected.codex,
+        detected.antigravity,
+        running.len()
+    ));
+    detected
+}
+
 fn claude_credential_watch_snapshot() -> CredentialWatchSnapshot {
     let mut snapshot = all_known_credential_sources()
         .into_iter()
@@ -1102,6 +1170,12 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
     }
 }
 
+/// Deliberately Windows-only, unlike the credential read above.
+///
+/// The watch re-samples every 15 seconds while polling is parked. Shelling
+/// out to `wsl.exe` at that rate would be far more expensive than the problem
+/// it solves, so a sign-in that happens inside WSL is picked up by the
+/// slower authentication recheck or the detection sweep instead.
 fn codex_credential_watch_signature() -> String {
     let Some(codex_home) = codex_home() else {
         return "win:codex-auth|missing".to_string();
@@ -1160,6 +1234,98 @@ fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialPr
         _ if output.status.success() => Ok(output.stdout),
         _ => Err(ClaudeCredentialProblem::Unreadable),
     }
+}
+
+/// Codex inside WSL keeps `auth.json` under `$CODEX_HOME` (default
+/// `~/.codex`), the same layout as the Windows install. The Windows keyring
+/// fallback has no WSL equivalent, so the file is the only source there.
+const WSL_CODEX_CREDENTIAL_SCRIPT: &str = r#"
+config_dir="${CODEX_HOME:-$HOME/.codex}"
+credential_path="$config_dir/auth.json"
+if [ ! -e "$credential_path" ]; then exit 44; fi
+if [ ! -r "$credential_path" ]; then exit 45; fi
+cat -- "$credential_path"
+"#;
+
+/// Antigravity CLI prefers the OS keyring, but WSL normally has no Secret
+/// Service, so it falls back to this file. That fallback is the only
+/// Antigravity credential in a WSL install that Windows can reach - the
+/// `gemini:antigravity` Credential Manager entry is written by the Windows
+/// IDE and CLI only.
+const WSL_ANTIGRAVITY_CREDENTIAL_SCRIPT: &str = r#"
+credential_path="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+if [ ! -e "$credential_path" ]; then exit 44; fi
+if [ ! -r "$credential_path" ]; then exit 45; fi
+cat -- "$credential_path"
+"#;
+
+/// Run one of the credential scripts above in a distro and return stdout.
+///
+/// Callers treat every failure the same way (missing, unreadable, broken
+/// distro, timeout): move on to the next source.
+fn read_wsl_script_output(distro: &str, script: &'static str) -> Option<Vec<u8>> {
+    let output = run_with_timeout(
+        Command::new("wsl.exe")
+            .arg("-d")
+            .arg(distro)
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg(script)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(5),
+    )?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn codex_tokens_from_auth_json(content: &str) -> Option<CodexTokenData> {
+    serde_json::from_str::<CodexAuthFile>(content)
+        .ok()?
+        .tokens
+        .filter(|tokens| !tokens.access_token.is_empty())
+}
+
+fn antigravity_token_from_auth_json(content: &str) -> Option<AntigravityTokenData> {
+    serde_json::from_str::<AntigravityAuthFile>(content)
+        .ok()
+        .map(|auth| auth.token)
+        .filter(|token| !token.access_token.is_empty())
+}
+
+fn read_codex_credentials_from_wsl(distros: &[String]) -> Option<CodexTokenData> {
+    for distro in distros {
+        let Some(bytes) = read_wsl_script_output(distro, WSL_CODEX_CREDENTIAL_SCRIPT) else {
+            continue;
+        };
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if let Some(tokens) = codex_tokens_from_auth_json(&content) {
+            diagnose::log(format!("loaded Codex credentials from WSL distro {distro}"));
+            return Some(tokens);
+        }
+    }
+    None
+}
+
+fn read_antigravity_credentials_from_wsl(distros: &[String]) -> Option<AntigravityTokenData> {
+    for distro in distros {
+        let Some(bytes) = read_wsl_script_output(distro, WSL_ANTIGRAVITY_CREDENTIAL_SCRIPT) else {
+            continue;
+        };
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if let Some(token) = antigravity_token_from_auth_json(&content) {
+            diagnose::log(format!(
+                "loaded Antigravity credentials from WSL distro {distro}"
+            ));
+            return Some(token);
+        }
+    }
+    None
 }
 
 fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
@@ -2385,38 +2551,50 @@ fn codex_direct_keyring_target(codex_home: &Path) -> Option<String> {
     codex_direct_keyring_target_from_path(&canonical.to_string_lossy())
 }
 
-fn read_codex_credentials() -> Option<CodexTokenData> {
+fn read_windows_codex_credentials() -> Option<CodexTokenData> {
     let codex_home = codex_home()?;
     let auth_path = codex_home.join("auth.json");
-    let auth = std::fs::read_to_string(&auth_path)
+    let tokens = std::fs::read_to_string(&auth_path)
         .ok()
-        .and_then(|content| serde_json::from_str::<CodexAuthFile>(&content).ok())
+        .and_then(|content| codex_tokens_from_auth_json(&content))
         .or_else(|| {
             let target = codex_direct_keyring_target(&codex_home)?;
             let content = read_windows_generic_credential_quiet(&target)?;
+            let tokens = codex_tokens_from_auth_json(&content)?;
             diagnose::log("loaded Codex credentials from Windows Credential Manager");
-            serde_json::from_str::<CodexAuthFile>(&content).ok()
+            Some(tokens)
         });
 
-    if auth.is_none() {
+    if tokens.is_none() {
         diagnose::log(format!(
             "no readable Codex Desktop/CLI credentials found at {} or in the direct Windows keyring",
             auth_path.display()
         ));
     }
-    auth?
-        .tokens
-        .filter(|tokens| !tokens.access_token.is_empty())
+    tokens
 }
 
-fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
+/// Windows first, then any WSL distro that is already running.
+///
+/// Restricted to running distros even on the polling path, unlike Claude's
+/// older all-distro resolution. A provider with no credential anywhere parks
+/// on "not signed in" and gets re-checked on a timer, so reading every distro
+/// here would start their virtual machines on a schedule for users who simply
+/// do not have Codex. A distro the user actually works in is already running.
+fn read_codex_credentials() -> Option<CodexTokenData> {
+    read_windows_codex_credentials()
+        .or_else(|| read_codex_credentials_from_wsl(&list_running_wsl_distros()))
+}
+
+fn read_windows_antigravity_credentials() -> Option<AntigravityTokenData> {
     let content = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET)?;
-    let auth: AntigravityAuthFile = serde_json::from_str(&content).ok()?;
-    if auth.token.access_token.is_empty() {
-        None
-    } else {
-        Some(auth.token)
-    }
+    antigravity_token_from_auth_json(&content)
+}
+
+/// See `read_codex_credentials` for why this stops at running distros.
+fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
+    read_windows_antigravity_credentials()
+        .or_else(|| read_antigravity_credentials_from_wsl(&list_running_wsl_distros()))
 }
 
 fn read_windows_generic_credential(target: &str) -> Option<String> {
@@ -2568,6 +2746,34 @@ fn enumerate_wsl_distros() -> Vec<String> {
 
     let stdout = decode_wsl_text(&output.stdout);
     stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Distros that are already up.
+///
+/// Reading a credential inside a stopped distro starts its virtual machine,
+/// which is far too heavy for something on a timer. A distro the user is
+/// actively working in is already running, so probing it costs nothing.
+/// Deliberately uncached: the running set changes whenever the user starts or
+/// stops a distro, and a stale answer here means probing a stopped distro.
+fn list_running_wsl_distros() -> Vec<String> {
+    let output = match run_with_timeout(
+        Command::new("wsl.exe")
+            .args(["-l", "-q", "--running"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(5),
+    ) {
+        Some(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    decode_wsl_text(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -3505,9 +3711,10 @@ mod tests {
             failure.data.codex_error,
             Some(ProviderStatus::RequestFailed)
         );
+        // Never signed in, not rejected: the user has nothing to re-authenticate.
         assert_eq!(
             failure.data.antigravity_error,
-            Some(ProviderStatus::AuthenticationFailed)
+            Some(ProviderStatus::NotSignedIn)
         );
     }
 
@@ -3533,12 +3740,77 @@ mod tests {
         );
         assert_eq!(
             failure.data.codex_error,
-            Some(ProviderStatus::AuthenticationFailed)
+            Some(ProviderStatus::NotSignedIn)
         );
         assert_eq!(
             failure.data.antigravity_error,
             Some(ProviderStatus::AuthenticationFailed)
         );
+        // Both still park the provider and keep the credential watch armed;
+        // only the wording and the balloon differ.
+        for status in [
+            failure.data.claude_code_error,
+            failure.data.codex_error,
+            failure.data.antigravity_error,
+        ] {
+            assert!(status.is_some_and(ProviderStatus::needs_credentials));
+        }
+    }
+
+    /// Detection is an OR across that provider's sources, so a credential
+    /// found anywhere counts and a provider with none stays undetected.
+    #[test]
+    fn detection_accepts_any_source_for_a_provider() {
+        assert_eq!(
+            detect_from(DetectionInputs {
+                claude_wsl: true,
+                codex_windows: true,
+                ..Default::default()
+            }),
+            DetectedProviders {
+                claude: true,
+                codex: true,
+                antigravity: false,
+            }
+        );
+        assert_eq!(
+            detect_from(DetectionInputs {
+                claude_desktop: true,
+                antigravity_wsl: true,
+                ..Default::default()
+            }),
+            DetectedProviders {
+                claude: true,
+                codex: false,
+                antigravity: true,
+            }
+        );
+        assert!(!detect_from(DetectionInputs::default()).any());
+        assert!(detect_from(DetectionInputs {
+            codex_wsl: true,
+            ..Default::default()
+        })
+        .any());
+    }
+
+    /// The whole point of the split: a missing credential and a rejected one
+    /// need different words and only one of them deserves a notification.
+    #[test]
+    fn missing_credentials_are_not_reported_as_an_authentication_failure() {
+        assert_eq!(
+            provider_status(PollError::NoCredentials),
+            ProviderStatus::NotSignedIn
+        );
+        assert_eq!(
+            provider_status(PollError::AuthRequired),
+            ProviderStatus::AuthenticationFailed
+        );
+        assert_eq!(
+            provider_status(PollError::AuthForbidden),
+            ProviderStatus::AuthenticationFailed
+        );
+        assert!(!ProviderStatus::NotSignedIn.warrants_credential_alert());
+        assert!(ProviderStatus::AuthenticationFailed.warrants_credential_alert());
     }
 
     #[test]

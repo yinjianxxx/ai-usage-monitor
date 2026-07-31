@@ -68,7 +68,14 @@ impl UsageData {
 /// for the detail popup's per-provider status badges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderStatus {
-    /// Missing, unusable, expired, revoked, or server-rejected credentials.
+    /// No credential for this provider exists on this machine: it was never
+    /// signed in, or the login was removed. Kept separate from
+    /// `AuthenticationFailed` because there is nothing to re-authenticate -
+    /// telling the user to "sign in again" would be wrong for a provider they
+    /// never signed in to.
+    NotSignedIn,
+    /// A credential exists but is unusable, expired, revoked, or was rejected
+    /// by the provider.
     AuthenticationFailed,
     RateLimited,
     NetworkUnavailable,
@@ -76,7 +83,16 @@ pub enum ProviderStatus {
 }
 
 impl ProviderStatus {
+    /// Both credential states park the provider until the user supplies a
+    /// login, so they share the poll pause and the credential watch.
     pub fn needs_credentials(self) -> bool {
+        matches!(self, Self::NotSignedIn | Self::AuthenticationFailed)
+    }
+
+    /// Only a broken existing login is worth interrupting the user about. A
+    /// provider that was never signed in has nothing to recover, so it stays
+    /// on the compact surfaces without raising a balloon.
+    pub fn warrants_credential_alert(self) -> bool {
         self == Self::AuthenticationFailed
     }
 

@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use windows::core::PCWSTR;
+use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Globalization::{
     CompareStringOrdinal, GetDateFormatEx, CSTR_EQUAL, DATE_SHORTDATE,
@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
@@ -28,9 +28,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{
-    TaskDialogIndirect, DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED,
-    TASKDIALOGCONFIG, TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TDCBF_NO_BUTTON,
-    TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED,
+    DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, TASKDIALOGCONFIG,
+    TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON,
+    TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED,
 };
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -183,6 +183,11 @@ struct AppState {
     allow_claude_credentials: bool,
     allow_codex_credentials: bool,
     allow_antigravity_credentials: bool,
+    /// Answer to the one-time, all-provider access prompt. Every credential
+    /// read is gated on this in addition to the per-provider switch above.
+    credential_consent_granted: bool,
+    credential_consent_decided: bool,
+    /// Whether the user has already been told this provider exists.
     claude_credential_access_decided: bool,
     codex_credential_access_decided: bool,
     antigravity_credential_access_decided: bool,
@@ -314,6 +319,7 @@ const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_ACCESS_CLAUDE_CODE: u16 = 63;
 const IDM_ACCESS_CODEX: u16 = 64;
 const IDM_ACCESS_ANTIGRAVITY: u16 = 65;
+const IDM_REDETECT_PROVIDERS: u16 = 66;
 const IDM_NOTIFY_SESSION_RESET: u16 = 80;
 const IDM_NOTIFY_WEEKLY_RESET: u16 = 81;
 const IDM_NOTIFY_CLAUDE_CLI_UPDATE: u16 = 83;
@@ -347,6 +353,15 @@ const TRAY_ORDER_EVENT_THROTTLE_MS: u128 = 100;
 /// interval on the main window.
 const TIMER_DETAIL_REFRESH: usize = 12;
 const DETAIL_REFRESH_MS: u32 = 1_000;
+/// Looks for providers that appeared since the last check.
+///
+/// Deliberately its own timer rather than a step inside the poll pass: with
+/// no provider yet allowed there is no poll worker to piggyback on, so
+/// detection would never run for exactly the users who need it most. The
+/// interval is long because it can shell out to `wsl.exe`, and a newly
+/// installed provider is not urgent.
+const TIMER_PROVIDER_DETECT: usize = 15;
+const PROVIDER_DETECT_INTERVAL_MS: u32 = 30 * 60 * 1_000;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 /// Thread message (msg.hwnd == null) handled directly in the message loop:
 /// recreate/re-attach the widget window after it was destroyed externally.
@@ -538,7 +553,12 @@ const DETAIL_CONTENT_BOTTOM_PAD: i32 = 12;
 const DETAIL_FOOTER_H: i32 = 42;
 const DETAIL_HEADER_BUTTON_SIZE: i32 = 32;
 const DETAIL_HEADER_BUTTON_GAP: i32 = 4;
+/// Refresh is an app action; the remaining three buttons are window controls.
+/// A wider gap makes that grouping visible without adding another divider.
+const DETAIL_HEADER_REFRESH_GROUP_GAP: i32 = 12;
 const DETAIL_HEADER_BUTTON_TOP: i32 = 10;
+const DETAIL_BRAND_ICON_SIZE: i32 = 20;
+const DETAIL_BRAND_ICON_TEXT_GAP: i32 = 8;
 /// Keep the popup inside the target monitor's work area. The margin is also
 /// the minimum breathing room between the DWM shadow and the screen edge.
 const DETAIL_WORK_AREA_MARGIN: i32 = 8;
@@ -1531,6 +1551,9 @@ fn save_state_settings() {
             allow_claude_credentials: s.allow_claude_credentials,
             allow_codex_credentials: s.allow_codex_credentials,
             allow_antigravity_credentials: s.allow_antigravity_credentials,
+            credential_consent_granted: s.credential_consent_granted,
+            credential_consent_decided: s.credential_consent_decided,
+            consent_schema_version: settings::CONSENT_SCHEMA_VERSION,
             claude_credential_access_decided: s.claude_credential_access_decided,
             codex_credential_access_decided: s.codex_credential_access_decided,
             antigravity_credential_access_decided: s.antigravity_credential_access_decided,
@@ -1637,6 +1660,7 @@ fn provider_tooltip_lines<'a>(
 
 fn provider_status_badge_text(status: ProviderStatus, strings: Strings) -> &'static str {
     match status {
+        ProviderStatus::NotSignedIn => strings.detail_badge_not_signed_in,
         ProviderStatus::AuthenticationFailed => strings.detail_badge_auth_failed,
         ProviderStatus::RateLimited
         | ProviderStatus::NetworkUnavailable
@@ -1645,14 +1669,10 @@ fn provider_status_badge_text(status: ProviderStatus, strings: Strings) -> &'sta
 }
 
 fn provider_status_for_kind(
-    kind: tray_icon::TrayIconKind,
+    _kind: tray_icon::TrayIconKind,
     error: poller::PollError,
 ) -> ProviderStatus {
-    if kind == tray_icon::TrayIconKind::Claude {
-        poller::claude_provider_status(error)
-    } else {
-        poller::provider_status(error)
-    }
+    poller::provider_status(error)
 }
 
 fn provider_name_with_status(
@@ -1677,7 +1697,9 @@ fn visible_provider_status(
     now_unix: u64,
 ) -> Option<ProviderStatus> {
     match status {
-        Some(ProviderStatus::AuthenticationFailed) => status,
+        // Both credential states are permanent until the user acts, so they
+        // stay visible immediately rather than waiting for a staleness window.
+        Some(ProviderStatus::NotSignedIn | ProviderStatus::AuthenticationFailed) => status,
         Some(
             ProviderStatus::RateLimited
             | ProviderStatus::NetworkUnavailable
@@ -1711,7 +1733,7 @@ fn provider_updated_ago_text(
 
 fn localized_provider_name(kind: tray_icon::TrayIconKind, strings: Strings) -> &'static str {
     match kind {
-        tray_icon::TrayIconKind::Claude => strings.claude_code_model,
+        tray_icon::TrayIconKind::Claude => strings.claude_model,
         tray_icon::TrayIconKind::Codex => strings.codex_model,
         tray_icon::TrayIconKind::Antigravity => strings.antigravity_model,
     }
@@ -1723,6 +1745,13 @@ fn credential_action_text(
     strings: Strings,
 ) -> String {
     let provider = localized_provider_name(kind, strings);
+    // A provider with no local credential was never signed in, so "sign in
+    // again" would be wrong - point at the first sign-in instead.
+    if status == ProviderStatus::NotSignedIn {
+        return strings
+            .detail_not_signed_in_action
+            .replace("{provider}", provider);
+    }
     if kind == tray_icon::TrayIconKind::Claude && status == ProviderStatus::AuthenticationFailed {
         strings.detail_claude_login_action.to_string()
     } else {
@@ -1866,7 +1895,7 @@ fn widget_tooltip_snapshot(kind: tray_icon::TrayIconKind) -> WidgetTooltipSnapsh
     };
     let (provider_name, usage, status, updated_unix) = match kind {
         tray_icon::TrayIconKind::Claude => (
-            strings.claude_code_model,
+            strings.claude_model,
             provider_has_values
                 .then(|| s.data.as_ref().and_then(|data| data.claude_code.as_ref()))
                 .flatten(),
@@ -1926,6 +1955,7 @@ fn widget_tooltip_snapshot(kind: tray_icon::TrayIconKind) -> WidgetTooltipSnapsh
         .collect::<Vec<_>>();
     if rows.is_empty() {
         let reset_text = match status {
+            Some(ProviderStatus::NotSignedIn) => strings.detail_badge_not_signed_in,
             Some(ProviderStatus::AuthenticationFailed) => strings.detail_unavailable,
             Some(
                 ProviderStatus::RateLimited
@@ -3072,6 +3102,9 @@ fn compact_attention_for_provider_status(
 ) -> compact_view::Attention {
     match status {
         Some(ProviderStatus::AuthenticationFailed) => compact_view::Attention::ActionRequired,
+        // See `compact_view::provider_view`: never signed in is a resting
+        // state, so it keeps whatever the quota values already warranted.
+        Some(ProviderStatus::NotSignedIn) => current,
         Some(
             ProviderStatus::RateLimited
             | ProviderStatus::NetworkUnavailable
@@ -3117,8 +3150,10 @@ fn update_provider_refresh_state(
     }
 
     let previous_failures = state.consecutive_failures;
+    // Only a rejected existing credential is worth a balloon; see
+    // `ProviderStatus::warrants_credential_alert`.
     let auth_transition =
-        status == Some(ProviderStatus::AuthenticationFailed) && !state.auth_failure_active;
+        status.is_some_and(ProviderStatus::warrants_credential_alert) && !state.auth_failure_active;
     match status {
         None => {
             if previous_failures > 0 {
@@ -3133,6 +3168,16 @@ fn update_provider_refresh_state(
             state.unavailable_since_unix = None;
             state.rate_limit_until = None;
             state.auth_failure_active = true;
+        }
+        // Never signed in parks the provider the same way, but it is not an
+        // active authentication failure: leaving the flag clear lets a later
+        // rejection of a newly added credential still register as a
+        // transition and raise its one balloon.
+        Some(ProviderStatus::NotSignedIn) => {
+            state.consecutive_failures = 0;
+            state.unavailable_since_unix = None;
+            state.rate_limit_until = None;
+            state.auth_failure_active = false;
         }
         Some(ProviderStatus::RateLimited) => {
             state.auth_failure_active = false;
@@ -3300,7 +3345,7 @@ fn collect_reset_notifications(
     push_provider_reset_notifications(
         &mut notifications,
         tray_icon::TrayIconKind::Claude,
-        strings.claude_code_model,
+        strings.claude_model,
         previous.claude_code.as_ref(),
         next.claude_code.as_ref(),
         notify_session_reset,
@@ -3451,9 +3496,9 @@ impl PollPassPlan {
                 .for_kind(tray_icon::TrayIconKind::Antigravity),
             now,
         );
-        let show_claude_code = state.show_claude_code && state.allow_claude_credentials;
-        let show_codex = state.show_codex && state.allow_codex_credentials;
-        let show_antigravity = state.show_antigravity && state.allow_antigravity_credentials;
+        // Mirrors `state_credential_poll_selection`; see the note there.
+        let (show_claude_code, show_codex, show_antigravity) =
+            state_credential_poll_selection(state);
         Self {
             show_claude_code,
             show_codex,
@@ -3580,12 +3625,22 @@ fn all_shown_providers_need_auth(
     show_antigravity: bool,
 ) -> bool {
     let shown_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
+    // Both credential states park a provider until the user supplies a login,
+    // so either one counts here: pausing the poll and watching the credential
+    // sources is exactly as correct for "never signed in" as for "rejected".
     shown_count > 0
         && (!show_claude_code
-            || data.claude_code_error == Some(ProviderStatus::AuthenticationFailed))
-        && (!show_codex || data.codex_error == Some(ProviderStatus::AuthenticationFailed))
+            || data
+                .claude_code_error
+                .is_some_and(ProviderStatus::needs_credentials))
+        && (!show_codex
+            || data
+                .codex_error
+                .is_some_and(ProviderStatus::needs_credentials))
         && (!show_antigravity
-            || data.antigravity_error == Some(ProviderStatus::AuthenticationFailed))
+            || data
+                .antigravity_error
+                .is_some_and(ProviderStatus::needs_credentials))
 }
 
 /// What to do with the credential watch once a poll has been evaluated.
@@ -3703,28 +3758,6 @@ fn show_info_message(title: &str, message: &str) {
     }
 }
 
-fn provider_display_name(strings: Strings, kind: tray_icon::TrayIconKind) -> &'static str {
-    match kind {
-        tray_icon::TrayIconKind::Claude => strings.claude_code_model,
-        tray_icon::TrayIconKind::Codex => strings.codex_model,
-        tray_icon::TrayIconKind::Antigravity => strings.antigravity_model,
-    }
-}
-
-fn provider_credential_source(kind: tray_icon::TrayIconKind) -> &'static str {
-    match kind {
-        tray_icon::TrayIconKind::Claude => {
-            r#""%USERPROFILE%\.claude\.credentials.json", the matching Claude credential file in WSL, or the current Windows user's Claude Desktop encrypted session cache"#
-        }
-        tray_icon::TrayIconKind::Codex => {
-            r#""%CODEX_HOME%\auth.json" (normally "%USERPROFILE%\.codex\auth.json") or the Codex entry in Windows Credential Manager"#
-        }
-        tray_icon::TrayIconKind::Antigravity => {
-            r#""gemini:antigravity" in Windows Credential Manager"#
-        }
-    }
-}
-
 fn credential_consent_fallback_message_box_style() -> MESSAGEBOX_STYLE {
     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND
 }
@@ -3741,24 +3774,67 @@ fn credential_consent_default_button() -> i32 {
     IDNO.0
 }
 
+type TaskDialogIndirectFn =
+    unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut BOOL) -> HRESULT;
+
+/// Resolve the version-6 common-controls entry point at runtime. Keeping it
+/// out of the PE import table lets the process start and use the MessageBox
+/// fallback even if Windows cannot activate Comctl32 v6 for this launch.
+unsafe fn call_task_dialog_indirect_if_available(
+    config: &TASKDIALOGCONFIG,
+    selected_button: &mut i32,
+) -> Option<HRESULT> {
+    let module = GetModuleHandleW(windows::core::w!("comctl32.dll")).ok()?;
+    let raw = GetProcAddress(module, windows::core::s!("TaskDialogIndirect"))?;
+    let task_dialog: TaskDialogIndirectFn = std::mem::transmute(raw);
+    Some(task_dialog(
+        config,
+        selected_button,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ))
+}
+
+/// Whether credentials may be read: the one-time prompt covering every
+/// provider, and the per-provider switch the user can revoke from the context
+/// menu, must both be on.
+fn credential_access_granted(consent_granted: bool, provider_allowed: bool) -> bool {
+    consent_granted && provider_allowed
+}
+
+/// A provider that is visible but has no access sits on a placeholder with no
+/// explanation, so the detail popup says how to turn it back on.
+///
+/// Requires the prompt to have been answered: the consent dialog is
+/// deliberately minimizable rather than modal, so the widget stays visible
+/// behind it, and telling the user they declined while the question is still
+/// on screen would be wrong.
+fn access_is_revoked(shown: bool, consent_decided: bool, has_access: bool) -> bool {
+    shown && consent_decided && !has_access
+}
+
 fn provider_has_credential_access(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
-        tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
-        tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
-    }
+    credential_access_granted(
+        state.credential_consent_granted,
+        match kind {
+            tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
+            tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
+            tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
+        },
+    )
 }
 
-fn provider_credential_access_decided(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => state.claude_credential_access_decided,
-        tray_icon::TrayIconKind::Codex => state.codex_credential_access_decided,
-        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_decided,
-    }
-}
-
-fn should_prompt_provider_access(shown: bool, allowed: bool, decided: bool) -> bool {
-    shown && !allowed && !decided
+fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    let shown = match kind {
+        tray_icon::TrayIconKind::Claude => state.show_claude_code,
+        tray_icon::TrayIconKind::Codex => state.show_codex,
+        tray_icon::TrayIconKind::Antigravity => state.show_antigravity,
+    };
+    access_is_revoked(
+        shown,
+        state.credential_consent_decided,
+        provider_has_credential_access(state, kind),
+    )
 }
 
 fn credential_poll_selection(
@@ -3773,6 +3849,10 @@ fn credential_poll_selection(
 }
 
 fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool) {
+    // Must stay in step with `PollPassPlan::from_state`: this decides whether
+    // a poll worker starts at all, that decides what the pass targets. If the
+    // two disagree a worker can start with nothing to do, or worse, a target
+    // can be polled without a running worker to commit it.
     credential_poll_selection(
         (
             state.show_claude_code,
@@ -3780,9 +3860,9 @@ fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool) {
             state.show_antigravity,
         ),
         (
-            state.allow_claude_credentials,
-            state.allow_codex_credentials,
-            state.allow_antigravity_credentials,
+            provider_has_credential_access(state, tray_icon::TrayIconKind::Claude),
+            provider_has_credential_access(state, tray_icon::TrayIconKind::Codex),
+            provider_has_credential_access(state, tray_icon::TrayIconKind::Antigravity),
         ),
     )
 }
@@ -3884,21 +3964,18 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
     ));
 }
 
-fn show_credential_consent_prompt(
-    hwnd: HWND,
-    language: LanguageId,
-    kind: tray_icon::TrayIconKind,
-) -> bool {
-    let strings = language.strings();
+/// Ask once, for every provider at once.
+///
+/// Naming a provider here would be wrong twice over: the answer covers all of
+/// them, and at this point nothing has been detected yet, so the app does not
+/// know which ones the machine even has. The exact credential sources are
+/// documented in the README privacy section rather than crammed in here.
+fn show_credential_consent_prompt(hwnd: HWND, language: LanguageId) -> bool {
     let copy = localization::credential_consent_copy(language);
-    let provider = provider_display_name(strings, kind);
-    let title = copy.title.replace("{provider}", provider);
-    let message = copy
-        .body
-        .replace("{provider}", provider)
-        .replace("{source}", provider_credential_source(kind));
+    let title = copy.title.to_string();
+    let message = copy.body.to_string();
 
-    diagnose::log(format!("showing {provider} credential access prompt"));
+    diagnose::log("showing credential access prompt");
     let allowed = unsafe {
         let title_wide = native_interop::wide_str(&title);
         let message_wide = native_interop::wide_str(&message);
@@ -3917,11 +3994,14 @@ fn show_credential_consent_prompt(
             ..Default::default()
         };
         let mut selected_button = credential_consent_default_button();
-        match TaskDialogIndirect(&config, Some(&mut selected_button), None, None) {
-            Ok(()) => selected_button == IDYES.0,
-            Err(error) => {
+        match call_task_dialog_indirect_if_available(&config, &mut selected_button) {
+            Some(result) if result.is_ok() => selected_button == IDYES.0,
+            result => {
                 diagnose::log(format!(
-                    "credential task dialog unavailable ({error}); using message box fallback"
+                    "credential task dialog unavailable ({}); using message box fallback",
+                    result
+                        .map(|error| windows::core::Error::from(error).to_string())
+                        .unwrap_or_else(|| "TaskDialogIndirect entry point missing".to_string())
                 ));
                 MessageBoxW(
                     hwnd,
@@ -3933,64 +4013,217 @@ fn show_credential_consent_prompt(
         }
     };
     diagnose::log(format!(
-        "{provider} credential access prompt answered: {}",
+        "credential access prompt answered: {}",
         if allowed { "allow" } else { "deny" }
     ));
     allowed
 }
 
-fn request_provider_credential_access(hwnd: HWND, kind: tray_icon::TrayIconKind) -> bool {
-    let language = {
-        let state = lock_state();
-        let Some(state) = state.as_ref() else {
-            return false;
-        };
-        if provider_has_credential_access(state, kind) {
-            return true;
-        }
-        state.language
+/// Record the answer to the one-time prompt.
+///
+/// Declining clears every provider's usage so nothing read under a previous
+/// grant stays on screen.
+fn set_credential_consent(granted: bool) {
+    let cache_snapshot = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| {
+            s.credential_consent_granted = granted;
+            s.credential_consent_decided = true;
+            if !granted {
+                for kind in [
+                    tray_icon::TrayIconKind::Claude,
+                    tray_icon::TrayIconKind::Codex,
+                    tray_icon::TrayIconKind::Antigravity,
+                ] {
+                    clear_provider_usage(s, kind);
+                }
+                s.auth_watch_active = false;
+                s.auth_watch_snapshot.clear();
+            }
+            set_widget_placeholders(s, "...");
+            POLL_COORDINATOR.invalidate_pending();
+            s.data.clone()
+        })
     };
-
-    let allowed = show_credential_consent_prompt(hwnd, language, kind);
-    if allowed {
-        set_provider_credential_access(kind, true);
-    } else {
-        set_provider_credential_access(kind, false);
-        diagnose::log(format!(
-            "{} credential access declined",
-            provider_display_name(language.strings(), kind)
-        ));
+    save_state_settings();
+    if let Some(snapshot) = cache_snapshot.as_ref() {
+        save_usage_cache(snapshot);
     }
-    allowed
+    diagnose::log(format!(
+        "credential access {}",
+        if granted { "granted" } else { "declined" }
+    ));
 }
 
-fn prompt_for_initial_provider_access(hwnd: HWND) {
-    let pending = {
+/// Show the one-time prompt if it has never been answered, then kick off the
+/// first detection pass when it was granted.
+fn prompt_for_initial_consent(hwnd: HWND) {
+    let language = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        if s.credential_consent_decided {
+            return;
+        }
+        s.language
+    };
+
+    let granted = show_credential_consent_prompt(hwnd, language);
+    set_credential_consent(granted);
+    if granted {
+        spawn_provider_detection(DetectionReason::FirstRun);
+    }
+}
+
+/// Make sure access has been granted before an action that needs it.
+///
+/// A user who declined the first-run prompt and later asks for a provider by
+/// hand is asking for exactly what the prompt covers, so ask again rather
+/// than silently upgrading their answer - or worse, leaving the menu toggle
+/// looking broken because the global gate is still shut.
+fn ensure_credential_consent(hwnd: HWND) -> bool {
+    let language = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        if s.credential_consent_granted {
+            return true;
+        }
+        s.language
+    };
+    let granted = show_credential_consent_prompt(hwnd, language);
+    set_credential_consent(granted);
+    granted
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetectionReason {
+    /// Straight after access was granted: turn on whatever is installed.
+    FirstRun,
+    /// Periodic sweep: announce what is new and change nothing else.
+    Rescan,
+    /// The user asked for a sweep from the menu: turn on what is found.
+    Manual,
+}
+
+fn state_provider_visibility(state: &AppState) -> settings::ProviderVisibility {
+    settings::ProviderVisibility {
+        show_claude_code: state.show_claude_code,
+        show_codex: state.show_codex,
+        show_antigravity: state.show_antigravity,
+        allow_claude_credentials: state.allow_claude_credentials,
+        allow_codex_credentials: state.allow_codex_credentials,
+        allow_antigravity_credentials: state.allow_antigravity_credentials,
+        claude_announced: state.claude_credential_access_decided,
+        codex_announced: state.codex_credential_access_decided,
+        antigravity_announced: state.antigravity_credential_access_decided,
+    }
+}
+
+fn apply_provider_visibility(state: &mut AppState, visibility: settings::ProviderVisibility) {
+    state.show_claude_code = visibility.show_claude_code;
+    state.show_codex = visibility.show_codex;
+    state.show_antigravity = visibility.show_antigravity;
+    state.allow_claude_credentials = visibility.allow_claude_credentials;
+    state.allow_codex_credentials = visibility.allow_codex_credentials;
+    state.allow_antigravity_credentials = visibility.allow_antigravity_credentials;
+    state.claude_credential_access_decided = visibility.claude_announced;
+    state.codex_credential_access_decided = visibility.codex_announced;
+    state.antigravity_credential_access_decided = visibility.antigravity_announced;
+}
+
+/// Detection shells out to `wsl.exe` and reads the Windows keyring, so it runs
+/// on its own short-lived thread and never on the UI thread.
+fn spawn_provider_detection(reason: DetectionReason) {
+    std::thread::spawn(move || {
+        let detected = poller::detect_signed_in_providers();
+        apply_provider_detection(reason, detected);
+    });
+}
+
+fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedProviders) {
+    let (changed, announcements, language) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        // Access can be declined while a pass is in flight.
+        if !s.credential_consent_granted {
+            return;
+        }
+        let before = state_provider_visibility(s);
+        let mut after = before;
+        let announcements = match reason {
+            DetectionReason::FirstRun => {
+                settings::apply_first_run_detection(&mut after, detected);
+                Vec::new()
+            }
+            DetectionReason::Manual => {
+                settings::apply_manual_detection(&mut after, detected);
+                Vec::new()
+            }
+            DetectionReason::Rescan => settings::take_detection_announcements(&mut after, detected),
+        };
+        let changed = after != before;
+        if changed {
+            apply_provider_visibility(s, after);
+            s.provider_refresh_states.reset_hidden(
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+            );
+            set_widget_placeholders(s, "...");
+        }
+        (changed, announcements, s.language)
+    };
+
+    if !changed && announcements.is_empty() {
+        return;
+    }
+    // Outside the lock: both take it.
+    save_state_settings();
+    post_usage_updated();
+    if changed {
+        request_poll();
+    }
+
+    let main_hwnd = current_main_hwnd();
+    if main_hwnd == HWND::default() {
+        return;
+    }
+    let strings = language.strings();
+    for kind in announcements {
+        let provider = localized_provider_name(kind, strings);
+        let title = strings
+            .provider_detected_title
+            .replace("{provider}", provider);
+        diagnose::log(format!("detected newly available provider {provider}"));
+        tray_icon::notify_balloon(main_hwnd, kind, &title, strings.provider_detected_body);
+    }
+}
+
+/// Arm the recurring detection sweep.
+///
+/// Only meaningful once access has been granted; the timer checks again when
+/// it fires, so a user who grants access later still gets swept.
+fn schedule_provider_detection(hwnd: HWND) {
+    unsafe {
+        SetTimer(hwnd, TIMER_PROVIDER_DETECT, PROVIDER_DETECT_INTERVAL_MS, None);
+    }
+}
+
+unsafe fn handle_provider_detect_timer() {
+    let granted = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| {
-                [
-                    (tray_icon::TrayIconKind::Claude, s.show_claude_code),
-                    (tray_icon::TrayIconKind::Codex, s.show_codex),
-                    (tray_icon::TrayIconKind::Antigravity, s.show_antigravity),
-                ]
-                .into_iter()
-                .filter_map(|(kind, shown)| {
-                    should_prompt_provider_access(
-                        shown,
-                        provider_has_credential_access(s, kind),
-                        provider_credential_access_decided(s, kind),
-                    )
-                    .then_some(kind)
-                })
-                .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+            .map(|s| s.credential_consent_granted)
+            .unwrap_or(false)
     };
-
-    for kind in pending {
-        let _ = request_provider_credential_access(hwnd, kind);
+    if granted {
+        spawn_provider_detection(DetectionReason::Rescan);
     }
 }
 
@@ -4261,7 +4494,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
     ) {
         let (name, usage, error, updated_unix) = match kind {
             tray_icon::TrayIconKind::Claude => (
-                strings.claude_code_model,
+                strings.claude_model,
                 s.data.as_ref().and_then(|data| data.claude_code.as_ref()),
                 s.data.as_ref().and_then(|data| data.claude_code_error),
                 s.data
@@ -4291,7 +4524,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
             s.poll_interval_ms,
             now_unix,
         );
-        providers.push(detail_provider_group_with_freshness(
+        let mut group = detail_provider_group_with_freshness(
             kind,
             name,
             usage,
@@ -4302,7 +4535,21 @@ fn detail_popup_snapshot() -> DetailPopupState {
                 data_is_cached: s.data_is_cached,
             },
             strings,
-        ));
+        );
+        // A provider whose access was declined or revoked is never polled, so
+        // it carries no status of its own and would otherwise sit on a bare
+        // "waiting for usage data" row forever. Say what happened and where
+        // to undo it. Applied here rather than inside the group builder
+        // because permission is application state, not poll state.
+        if provider_access_revoked(s, kind) {
+            group.hint = Some(DetailHint {
+                action: strings
+                    .detail_access_revoked_hint
+                    .replace("{provider}", name),
+                outcome: strings.detail_access_revoked_outcome.to_string(),
+            });
+        }
+        providers.push(group);
     }
 
     DetailPopupState {
@@ -4339,6 +4586,12 @@ fn detail_provider_group_with_freshness(
             text: strings.detail_badge_auth_failed.to_string(),
             tone: DetailBadgeTone::ActionRequired,
         }),
+        // Never signed in states a fact rather than demanding a fix, so it
+        // uses the neutral-leaning degraded tone instead of the alarm tone.
+        Some(ProviderStatus::NotSignedIn) => Some(DetailBadge {
+            text: strings.detail_badge_not_signed_in.to_string(),
+            tone: DetailBadgeTone::Degraded,
+        }),
         Some(
             ProviderStatus::RateLimited
             | ProviderStatus::NetworkUnavailable
@@ -4371,6 +4624,10 @@ fn detail_provider_group_with_freshness(
         None => {
             let reset_text = match error {
                 Some(ProviderStatus::AuthenticationFailed) => strings.detail_unavailable,
+                // Without this arm the row would fall through to "waiting for
+                // usage data" and the never-signed-in state would never be
+                // stated in the detail popup.
+                Some(ProviderStatus::NotSignedIn) => strings.detail_badge_not_signed_in,
                 Some(
                     ProviderStatus::RateLimited
                     | ProviderStatus::NetworkUnavailable
@@ -4458,7 +4715,7 @@ fn detail_provider_group_with_freshness(
     };
     let data_is_stale = usage.is_some_and(|usage| !usage.is_empty())
         && (data_is_cached
-            || error == Some(ProviderStatus::AuthenticationFailed)
+            || error.is_some_and(ProviderStatus::needs_credentials)
             || persistent_refresh_issue);
 
     DetailProviderGroup {
@@ -4693,7 +4950,7 @@ fn detail_refresh_issue_count(state: &AppState) -> (usize, usize) {
                     .and_then(|data| data.antigravity_updated_unix),
             ),
         };
-        if status == Some(ProviderStatus::AuthenticationFailed)
+        if status.is_some_and(ProviderStatus::needs_credentials)
             || provider_refresh_is_stale(
                 status,
                 state.provider_refresh_states.for_kind(*kind),
@@ -5197,7 +5454,7 @@ pub fn dump_widget(dir: &str) -> i32 {
     let tooltip_snapshots = [
         WidgetTooltipSnapshot {
             kind: tray_icon::TrayIconKind::Claude,
-            provider_name: "Claude Code".to_string(),
+            provider_name: "Claude".to_string(),
             rows: vec![
                 WidgetTooltipRow {
                     window_label: "5h".to_string(),
@@ -5475,7 +5732,7 @@ pub fn dump_detail_popup(
     let usage_providers = vec![
         DetailProviderGroup {
             kind: tray_icon::TrayIconKind::Claude,
-            name: "Claude Code".to_string(),
+            name: strings.claude_model.to_string(),
             badge: Some(DetailBadge {
                 text: strings.detail_badge_near_limit.to_string(),
                 tone: DetailBadgeTone::Critical,
@@ -5517,7 +5774,7 @@ pub fn dump_detail_popup(
             let mut providers = usage_providers;
             providers[0] = detail_provider_group(
                 tray_icon::TrayIconKind::Claude,
-                strings.claude_code_model,
+                strings.claude_model,
                 None,
                 Some(auth_status),
                 false,
@@ -6882,7 +7139,7 @@ fn detail_pin_rect(width: i32) -> RECT {
 }
 
 fn detail_refresh_rect(width: i32) -> RECT {
-    let right = detail_pin_rect(width).left - sc(DETAIL_HEADER_BUTTON_GAP);
+    let right = detail_pin_rect(width).left - sc(DETAIL_HEADER_REFRESH_GROUP_GAP);
     RECT {
         left: right - sc(DETAIL_HEADER_BUTTON_SIZE),
         top: sc(DETAIL_HEADER_BUTTON_TOP),
@@ -7489,18 +7746,33 @@ fn paint_detail_content(
         }
 
         let margin = sc(18);
-        draw_detail_text(
+        let brand_icon_size = sc(DETAIL_BRAND_ICON_SIZE);
+        // The mark is visually top-heavy. Keep its optical centre aligned
+        // with the title using a 1.5dp downward correction at every DPI.
+        let brand_icon_optical_offset = detail_brand_icon_optical_offset(active_window_dpi());
+        let brand_icon_top =
+            (sc(DETAIL_HEADER_H) - brand_icon_size) / 2 + brand_icon_optical_offset;
+        draw_detail_brand_icon(
+            hdc,
+            RECT {
+                left: margin,
+                top: brand_icon_top,
+                right: margin + brand_icon_size,
+                bottom: brand_icon_top + brand_icon_size,
+            },
+            &palette,
+            high_contrast,
+        );
+        draw_detail_title(
             hdc,
             &snapshot.title,
             RECT {
-                left: margin,
+                left: margin + brand_icon_size + sc(DETAIL_BRAND_ICON_TEXT_GAP),
                 top: sc(14),
                 right: detail_refresh_rect(width).left - sc(8),
                 bottom: sc(40),
             },
             &palette.text,
-            18,
-            FW_SEMIBOLD.0 as i32,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
 
@@ -8442,6 +8714,9 @@ fn provider_tile_asset(
 /// icon resource bits, so no runtime image dependency is required.
 type ProviderTileCacheEntry = ((tray_icon::TrayIconKind, usize, bool, TileSize), isize);
 static PROVIDER_TILE_CACHE: Mutex<Vec<ProviderTileCacheEntry>> = Mutex::new(Vec::new());
+const DETAIL_BRAND_ICON_PNG: &[u8] = include_bytes!("icons/256x256.png");
+type DetailBrandIconCacheEntry = (i32, isize);
+static DETAIL_BRAND_ICON_CACHE: Mutex<Vec<DetailBrandIconCacheEntry>> = Mutex::new(Vec::new());
 
 fn provider_tile_icon(
     kind: tray_icon::TrayIconKind,
@@ -8480,6 +8755,120 @@ fn provider_tile_icon(
         }
         Err(_) => None,
     }
+}
+
+fn detail_brand_icon(dpi: u32) -> Option<HICON> {
+    let size = scale_px_for_dpi(DETAIL_BRAND_ICON_SIZE, dpi);
+    let mut cache = DETAIL_BRAND_ICON_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, handle)) = cache.iter().find(|(cached_size, _)| *cached_size == size) {
+        return Some(HICON(*handle as *mut _));
+    }
+    match unsafe {
+        CreateIconFromResourceEx(
+            DETAIL_BRAND_ICON_PNG,
+            TRUE,
+            0x0003_0000,
+            size,
+            size,
+            LR_DEFAULTCOLOR,
+        )
+    } {
+        Ok(icon) => {
+            cache.push((size, icon.0 as isize));
+            Some(icon)
+        }
+        Err(_) => None,
+    }
+}
+
+fn detail_brand_icon_optical_offset(dpi: u32) -> i32 {
+    ((normalize_dpi(dpi) as i32 * 3 + 96) / 192).max(1)
+}
+
+fn draw_detail_brand_icon(hdc: HDC, rect: RECT, palette: &DetailPalette, high_contrast: bool) {
+    if !high_contrast {
+        if let Some(icon) = detail_brand_icon(active_window_dpi()) {
+            unsafe {
+                let _ = DrawIconEx(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    icon,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    0,
+                    HBRUSH::default(),
+                    DI_NORMAL,
+                );
+            }
+            return;
+        }
+    }
+
+    // The coloured PNG cannot guarantee contrast against a user-defined
+    // High Contrast palette. Preserve the mark's three-bar silhouette with
+    // system colours instead.
+    let radius = sc(4);
+    unsafe {
+        let region = CreateRoundRectRgn(
+            rect.left,
+            rect.top,
+            rect.right + 1,
+            rect.bottom + 1,
+            radius * 2,
+            radius * 2,
+        );
+        let brush = CreateSolidBrush(COLORREF(palette.text.to_colorref()));
+        let _ = FrameRgn(hdc, region, brush, sc(1).max(1), sc(1).max(1));
+        let _ = DeleteObject(region);
+        let _ = DeleteObject(brush);
+    }
+    for bar in [
+        RECT {
+            left: rect.left + sc(4),
+            top: rect.top + sc(5),
+            right: rect.left + sc(12),
+            bottom: rect.top + sc(7),
+        },
+        RECT {
+            left: rect.left + sc(4),
+            top: rect.top + sc(9),
+            right: rect.left + sc(16),
+            bottom: rect.top + sc(12),
+        },
+        RECT {
+            left: rect.left + sc(4),
+            top: rect.top + sc(14),
+            right: rect.left + sc(10),
+            bottom: rect.top + sc(16),
+        },
+    ] {
+        draw_rounded_rect(hdc, &bar, &palette.text, sc(1));
+    }
+}
+
+fn detail_title_uses_cjk_tracking(title: &str) -> bool {
+    matches!(title, "更筹" | "更籌")
+}
+
+fn draw_detail_title(hdc: HDC, title: &str, rect: RECT, color: &Color, flags: DRAW_TEXT_FORMAT) {
+    draw_detail_text_face_with_tracking(
+        hdc,
+        title,
+        rect,
+        color,
+        detail_body_face(title),
+        18,
+        FW_NORMAL.0 as i32,
+        flags,
+        if detail_title_uses_cjk_tracking(title) {
+            sc(1)
+        } else {
+            0
+        },
+    );
 }
 
 fn draw_detail_text(
@@ -8564,12 +8953,27 @@ fn draw_detail_body_text(
 fn draw_detail_text_face(
     hdc: HDC,
     text: &str,
+    rect: RECT,
+    color: &Color,
+    face: &'static str,
+    font_size: i32,
+    weight: i32,
+    flags: DRAW_TEXT_FORMAT,
+) {
+    draw_detail_text_face_with_tracking(hdc, text, rect, color, face, font_size, weight, flags, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_detail_text_face_with_tracking(
+    hdc: HDC,
+    text: &str,
     mut rect: RECT,
     color: &Color,
     face: &'static str,
     font_size: i32,
     weight: i32,
     flags: DRAW_TEXT_FORMAT,
+    character_extra: i32,
 ) {
     unsafe {
         let font = cached_font_named(face, sc(font_size), weight);
@@ -8580,8 +8984,12 @@ fn draw_detail_text_face(
         // behind each header glyph on a dark popup.
         let old_background_mode = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let old_character_extra = SetTextCharacterExtra(hdc, character_extra);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let _ = DrawTextW(hdc, &mut text_wide, &mut rect, flags);
+        if old_character_extra != i32::MIN {
+            let _ = SetTextCharacterExtra(hdc, old_character_extra);
+        }
         if old_background_mode != 0 {
             let _ = SetBkMode(hdc, BACKGROUND_MODE(old_background_mode as u32));
         }
@@ -10543,6 +10951,10 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             handle_countdown_timer();
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TIMER_PROVIDER_DETECT => {
+            handle_provider_detect_timer();
+            LRESULT(0)
+        }
         WM_WTSSESSION_CHANGE_MSG => {
             handle_session_change(wparam.0);
             LRESULT(0)
@@ -10804,6 +11216,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 allow_claude_credentials: settings.allow_claude_credentials,
                 allow_codex_credentials: settings.allow_codex_credentials,
                 allow_antigravity_credentials: settings.allow_antigravity_credentials,
+                credential_consent_granted: settings.credential_consent_granted,
+                credential_consent_decided: settings.credential_consent_decided,
                 claude_credential_access_decided: settings.claude_credential_access_decided,
                 codex_credential_access_decided: settings.codex_credential_access_decided,
                 antigravity_credential_access_decided: settings
@@ -10970,13 +11384,15 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
             "taskbar widget hidden pending shell recovery"
         });
 
-        // Show the provider-specific migration prompts only after the compact
-        // surface and tray icons exist, so an owner with WS_EX_NOACTIVATE
-        // cannot strand the modal before any app UI is visible. This remains
-        // before credential watches, provider timers, or the initial poll, so
-        // no credential-backed operation can run before the user decides.
-        // Older settings intentionally deserialize these permissions as false.
-        prompt_for_initial_provider_access(hwnd);
+        // Show the one-time access prompt only after the compact surface and
+        // tray icons exist, so an owner with WS_EX_NOACTIVATE cannot strand
+        // the modal before any app UI is visible. This remains before
+        // credential watches, provider timers, or the initial poll, so no
+        // credential-backed operation can run before the user decides.
+        // Existing installs are migrated in `settings::normalize` and never
+        // reach the prompt.
+        prompt_for_initial_consent(hwnd);
+        schedule_provider_detection(hwnd);
 
         schedule_countdown_timer();
         show_pending_persistence_warning_once();
@@ -11559,6 +11975,11 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     let state = lock_state();
                     state.as_ref().map(|s| {
                         let strings = s.language.strings();
+                        // `update_provider_refresh_state` only reports a
+                        // transition for `AuthenticationFailed`; a provider
+                        // that was never signed in deliberately raises no
+                        // balloon, so this status is exact rather than a
+                        // fallback. Keep both in step if that ever changes.
                         let (title, body) = credential_notification_text(
                             kind,
                             ProviderStatus::AuthenticationFailed,
@@ -11789,6 +12210,11 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     let state = lock_state();
                     state.as_ref().map(|s| {
                         let strings = s.language.strings();
+                        // `update_provider_refresh_state` only reports a
+                        // transition for `AuthenticationFailed`; a provider
+                        // that was never signed in deliberately raises no
+                        // balloon, so this status is exact rather than a
+                        // fallback. Keep both in step if that ever changes.
                         let (title, body) = credential_notification_text(
                             kind,
                             ProviderStatus::AuthenticationFailed,
@@ -12664,14 +13090,9 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         IDM_MODEL_ANTIGRAVITY => tray_icon::TrayIconKind::Antigravity,
                         _ => unreachable!(),
                     };
-                    let needs_access_prompt = {
+                    {
                         let mut state = lock_state();
-                        state.as_mut().is_some_and(|s| {
-                            let was_shown = match kind {
-                                tray_icon::TrayIconKind::Claude => s.show_claude_code,
-                                tray_icon::TrayIconKind::Codex => s.show_codex,
-                                tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
-                            };
+                        if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
                                     if s.show_codex || s.show_antigravity || !s.show_claude_code {
@@ -12703,11 +13124,29 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                 tray_icon::TrayIconKind::Codex => s.show_codex,
                                 tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
                             };
-                            !was_shown && is_shown && !provider_has_credential_access(s, kind)
-                        })
-                    };
-                    if needs_access_prompt {
-                        let _ = request_provider_credential_access(hwnd, kind);
+                            // Turning a provider on is a request to monitor
+                            // it, so it also restores access. Without this the
+                            // provider would appear and immediately report
+                            // that its access was declined.
+                            let grant = is_shown && s.credential_consent_granted;
+                            match kind {
+                                tray_icon::TrayIconKind::Claude => {
+                                    s.allow_claude_credentials |= grant;
+                                    // Toggling by hand settles whether the user
+                                    // knows this provider exists, so detection
+                                    // never announces it afterwards.
+                                    s.claude_credential_access_decided = true;
+                                }
+                                tray_icon::TrayIconKind::Codex => {
+                                    s.allow_codex_credentials |= grant;
+                                    s.codex_credential_access_decided = true;
+                                }
+                                tray_icon::TrayIconKind::Antigravity => {
+                                    s.allow_antigravity_credentials |= grant;
+                                    s.antigravity_credential_access_decided = true;
+                                }
+                            }
+                        }
                     }
                     save_state_settings();
                     position_at_taskbar();
@@ -12716,6 +13155,11 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     sync_tray_icons(hwnd);
                     refresh_provider_order_from_tray(hwnd);
                     request_poll();
+                }
+                IDM_REDETECT_PROVIDERS => {
+                    if ensure_credential_consent(hwnd) {
+                        spawn_provider_detection(DetectionReason::Manual);
+                    }
                 }
                 IDM_ACCESS_CLAUDE_CODE | IDM_ACCESS_CODEX | IDM_ACCESS_ANTIGRAVITY => {
                     let kind = match id {
@@ -12730,10 +13174,14 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             .as_ref()
                             .is_some_and(|s| provider_has_credential_access(s, kind))
                     };
+                    // Access was already granted once for every provider, so
+                    // restoring one is a plain toggle - unless the one-time
+                    // prompt was declined, in which case it has to be asked
+                    // again before anything is read.
                     if currently_allowed {
                         set_provider_credential_access(kind, false);
-                    } else {
-                        let _ = request_provider_credential_access(hwnd, kind);
+                    } else if ensure_credential_consent(hwnd) {
+                        set_provider_credential_access(kind, true);
                     }
                     position_at_taskbar();
                     render_layered();
@@ -13047,7 +13495,7 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             let _ = DestroyMenu(menu);
             return;
         };
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
+        let claude_model = native_interop::wide_str(strings.claude_model);
         let only_one_provider =
             u8::from(show_claude_code) + u8::from(show_codex) + u8::from(show_antigravity) == 1;
         let claude_flags = provider_menu_item_flags(show_claude_code, only_one_provider);
@@ -13095,7 +13543,7 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
         for (id, label, allowed) in [
             (
                 IDM_ACCESS_CLAUDE_CODE,
-                strings.claude_code_model,
+                strings.claude_model,
                 allow_claude_credentials,
             ),
             (
@@ -13122,6 +13570,17 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                 PCWSTR::from_raw(label.as_ptr()),
             );
         }
+        // Existing installs are never swept automatically, and a user who
+        // just signed in somewhere should not have to wait out the detection
+        // interval. Both are served by asking for a sweep on demand.
+        let _ = AppendMenuW(access_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let redetect_label = native_interop::wide_str(strings.redetect_providers);
+        let _ = AppendMenuW(
+            access_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_REDETECT_PROVIDERS as usize,
+            PCWSTR::from_raw(redetect_label.as_ptr()),
+        );
         let access_label = native_interop::wide_str(
             localization::credential_consent_copy(language).provider_access,
         );
@@ -13614,6 +14073,18 @@ mod reset_notification_tests {
     }
 
     #[test]
+    fn detail_brand_icon_scales_and_keeps_its_optical_offset_across_dpis() {
+        for (dpi, expected_offset) in [(96, 2), (120, 2), (144, 2), (168, 3), (192, 3)] {
+            let expected_size = scale_px_for_dpi(DETAIL_BRAND_ICON_SIZE, dpi);
+            let icon = detail_brand_icon(dpi).expect("detail brand icon");
+            let (width, height, bits_per_pixel) = hicon_color_bitmap_metrics(icon);
+            assert_eq!((width, height), (expected_size, expected_size));
+            assert_eq!(bits_per_pixel, 32);
+            assert_eq!(detail_brand_icon_optical_offset(dpi), expected_offset);
+        }
+    }
+
+    #[test]
     fn compact_high_contrast_text_roles_match_their_backdrops() {
         let system = |index| theme::system_color(index).to_colorref();
         let resolved = |key| compact_color(key, true, true).to_colorref();
@@ -13704,7 +14175,7 @@ mod reset_notification_tests {
         let strings = LanguageId::SimplifiedChinese.strings();
         assert_eq!(
             localized_provider_name(tray_icon::TrayIconKind::Claude, strings),
-            strings.claude_code_model
+            strings.claude_model
         );
         assert_eq!(
             localized_provider_name(tray_icon::TrayIconKind::Codex, strings),
@@ -13937,6 +14408,95 @@ mod reset_notification_tests {
         assert!(coordinator.request(false));
     }
 
+    /// Never signed in must keep parking the poll and arming the credential
+    /// watch exactly like a rejected credential does. Losing this would send
+    /// the widget back to polling an endpoint it has no token for, and would
+    /// stop it recovering on its own when the user finally signs in.
+    #[test]
+    fn never_signed_in_still_pauses_polling_and_arms_the_watch() {
+        let data = AppUsageData {
+            codex_error: Some(ProviderStatus::NotSignedIn),
+            ..Default::default()
+        };
+        assert!(all_shown_providers_need_auth(&data, false, true, false));
+        assert!(shown_provider_needs_auth(
+            None,
+            Some(ProviderStatus::NotSignedIn),
+            None,
+            false,
+            true,
+            false
+        ));
+
+        let mixed = AppUsageData {
+            claude_code_error: Some(ProviderStatus::NotSignedIn),
+            codex_error: Some(ProviderStatus::AuthenticationFailed),
+            ..Default::default()
+        };
+        assert!(all_shown_providers_need_auth(&mixed, true, true, false));
+
+        // A provider that is merely rate limited is not waiting on the user.
+        let transient = AppUsageData {
+            codex_error: Some(ProviderStatus::RateLimited),
+            ..Default::default()
+        };
+        assert!(!all_shown_providers_need_auth(&transient, false, true, false));
+    }
+
+    /// Only a rejected credential earns a balloon, and the flag it leaves
+    /// behind decides whether a later rejection can still raise one.
+    #[test]
+    fn never_signed_in_raises_no_balloon_but_leaves_the_next_one_possible() {
+        let mut state = ProviderRefreshState::default();
+        let now = Instant::now();
+
+        let announced = update_provider_refresh_state(
+            &mut state,
+            "Codex",
+            true,
+            true,
+            Some(ProviderStatus::NotSignedIn),
+            false,
+            None,
+            POLL_5_MIN,
+            0,
+            now,
+        );
+        assert!(!announced, "never signed in must not notify");
+        assert!(!state.auth_failure_active);
+
+        // The user signs in and the credential is rejected: that is news.
+        let announced = update_provider_refresh_state(
+            &mut state,
+            "Codex",
+            true,
+            true,
+            Some(ProviderStatus::AuthenticationFailed),
+            false,
+            None,
+            POLL_5_MIN,
+            0,
+            now,
+        );
+        assert!(announced, "a rejected credential must notify");
+        assert!(state.auth_failure_active);
+
+        // Still rejected on the next pass: no second balloon.
+        let announced = update_provider_refresh_state(
+            &mut state,
+            "Codex",
+            true,
+            true,
+            Some(ProviderStatus::AuthenticationFailed),
+            false,
+            None,
+            POLL_5_MIN,
+            0,
+            now,
+        );
+        assert!(!announced);
+    }
+
     #[test]
     fn credential_poll_selection_requires_visibility_and_explicit_consent() {
         assert_eq!(
@@ -13953,12 +14513,26 @@ mod reset_notification_tests {
         );
     }
 
+    /// Declining the one-time prompt must read nothing, no matter what the
+    /// per-provider switches say - including the switches an existing install
+    /// carried over.
     #[test]
-    fn provider_access_prompt_runs_only_before_the_first_decision() {
-        assert!(should_prompt_provider_access(true, false, false));
-        assert!(!should_prompt_provider_access(false, false, false));
-        assert!(!should_prompt_provider_access(true, true, false));
-        assert!(!should_prompt_provider_access(true, false, true));
+    fn credential_access_needs_both_the_global_and_the_per_provider_switch() {
+        assert!(credential_access_granted(true, true));
+        assert!(!credential_access_granted(true, false));
+        assert!(!credential_access_granted(false, true));
+        assert!(!credential_access_granted(false, false));
+    }
+
+    /// A provider left visible without access would otherwise sit on an
+    /// unexplained placeholder with no route back.
+    #[test]
+    fn revoked_access_is_reported_only_for_visible_providers() {
+        assert!(access_is_revoked(true, true, false));
+        assert!(!access_is_revoked(true, true, true));
+        assert!(!access_is_revoked(false, true, false));
+        // The prompt is still on screen: nothing has been declined yet.
+        assert!(!access_is_revoked(true, false, false));
     }
 
     #[test]
@@ -15377,7 +15951,11 @@ mod reset_notification_tests {
             detail_move_rect(width),
             detail_close_rect(width),
         ];
-        for pair in buttons.windows(2) {
+        assert_eq!(
+            buttons[1].left - buttons[0].right,
+            sc(DETAIL_HEADER_REFRESH_GROUP_GAP)
+        );
+        for pair in buttons[1..].windows(2) {
             assert_eq!(pair[1].left - pair[0].right, sc(DETAIL_HEADER_BUTTON_GAP));
         }
         for button in buttons {
@@ -15387,6 +15965,13 @@ mod reset_notification_tests {
             let y = (button.top + button.bottom) / 2;
             assert!(!detail_header_is_draggable(x, y, width));
         }
+    }
+
+    #[test]
+    fn detail_title_tracking_is_limited_to_localized_chinese_brand_names() {
+        assert!(detail_title_uses_cjk_tracking("更筹"));
+        assert!(detail_title_uses_cjk_tracking("更籌"));
+        assert!(!detail_title_uses_cjk_tracking("Gengchou"));
     }
 
     #[test]

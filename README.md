@@ -16,14 +16,14 @@
 [![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup in dark theme: Claude Code flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="400"> <img src=".github/readme/detail-popup-en-light.png" alt="The same detail popup in light theme" width="400">
+<img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup in dark theme: Claude flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="400"> <img src=".github/readme/detail-popup-en-light.png" alt="The same detail popup in light theme" width="400">
 
 <sub>The detail popup in dark and light — including what a near-limit warning looks like.</sub>
 
 </div>
 
 Gengchou puts the quota windows your AI providers actually report — how much
-is used, and when it resets — directly on the Windows taskbar. Claude Code,
+is used, and when it resets — directly on the Windows taskbar. Claude,
 Codex, and Antigravity each get a live percentage on whichever surface you
 prefer, from a full detail card down to a single tray number, so checking
 your remaining budget never means opening a dashboard.
@@ -77,7 +77,7 @@ it red, and shows its own reset countdown — the warning finds you, not the
 other way around:
 
 <div align="center">
-<img src=".github/readme/widget-badges-warn-dark.png" alt="Taskbar widget in warning state: Claude Code's 7-day window at 92% has taken over the badge in red with its reset countdown">
+<img src=".github/readme/widget-badges-warn-dark.png" alt="Taskbar widget in warning state: Claude's 7-day window at 92% has taken over the badge in red with its reset countdown">
 </div>
 
 ## Install
@@ -151,14 +151,17 @@ Release maintainers should also follow the
 
 - Quota data comes from what each provider actually reports — windows and
   reset times are never guessed or extrapolated
-- Enable any combination of Claude Code, Codex, and Google Antigravity
+- New installations show Codex only; enable any combination of Claude, Codex,
+  and Google Antigravity
 - Windows system colours in High Contrast mode
 - Optional reset notifications (off by default)
 - Survives `explorer.exe` restarts and RDP / lock-screen transitions; polling
   keeps its cadence while the session is locked, and restoration only rebuilds
   local UI surfaces
 - Multi-monitor and multi-taskbar aware
-- 11 languages · no telemetry · a single ~1 MB portable executable
+- 11 languages · no telemetry · a single portable executable
+- The in-app brand is **更筹** in Simplified Chinese, **更籌** in Traditional
+  Chinese, and **Gengchou** in every other language
 
 ## Provider requirements
 
@@ -166,7 +169,7 @@ The monitor only reads your existing local sessions — it never creates
 accounts or bypasses provider authentication, and what it can show follows
 each provider's own account rules:
 
-- **Claude Code** — a signed-in Claude Code session on Windows or WSL, or a
+- **Claude** — a signed-in Claude Code session on Windows or WSL, or a
   signed-in Claude Desktop session on Windows. The CLI executable is not
   required when Desktop has a supported local session. Claude Code credentials
   are checked across Windows and every known usable WSL distribution. Windows
@@ -175,8 +178,22 @@ each provider's own account rules:
   distribution resolves its own `CLAUDE_CONFIG_DIR` or falls back to
   `$HOME/.claude`
 - **Codex** — a signed-in Codex Desktop or CLI session; the CLI executable is
-  not required when Desktop has already saved a supported local session
-- **Antigravity** — a signed-in Antigravity session
+  not required when Desktop has already saved a supported local session.
+  Windows resolves `%CODEX_HOME%\auth.json` (normally
+  `%USERPROFILE%\.codex\auth.json`) or the Codex entry in Windows Credential
+  Manager; if neither is usable, `$CODEX_HOME/auth.json` (default
+  `$HOME/.codex/auth.json`) in a **running** WSL distribution is read next
+- **Antigravity** — a signed-in Antigravity session; the IDE and the CLI share
+  one credential. Windows resolves `gemini:antigravity` in Windows Credential
+  Manager; if that is unavailable,
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` in a **running** WSL
+  distribution is read next
+
+Codex and Antigravity credentials inside WSL are only read from distributions
+that are **already running**. Reading a stopped distribution would start its
+virtual machine, and this check runs on a schedule, so Gengchou never wakes WSL
+for it. Start the distribution first, then use **Provider access → Detect
+providers again** in the context menu to check immediately.
 
 Gengchou automatically finds a usable Claude session. When the Anthropic usage
 endpoint confirms that a Windows Claude Code credential has been rejected, it
@@ -223,13 +240,27 @@ codes, followed by the copyable `claude auth login` recovery command. Tokens,
 account identifiers, and raw CLI output are excluded. The same safe report is
 written to Gengchou's diagnostic log.
 
-Before it reads a provider's local credential source or starts polling,
-Gengchou asks for provider-specific permission and identifies the source it
-will read. Permission defaults to **No**. After permission is granted, Gengchou
-re-reads the original file or Windows Credential Manager entry as needed, so
-provider-side token refresh continues to work without copying the token into
-Gengchou. Use **Provider access** in the context menu to grant or revoke each
-permission at any time.
+On first start Gengchou asks once for permission, explaining that the access is
+used only to query usage, consumes no model allowance, and stores no sign-in
+information. Permission defaults to **No**, and no credential is read before it
+is granted. Once granted, Gengchou checks which providers are signed in on this
+machine and shows only those. Permission is granted once for every provider,
+but revoking stays per provider: use **Provider access** in the context menu to
+turn any single one off at any time. Gengchou re-reads the original file or
+Windows Credential Manager entry as needed, so provider-side token refresh
+continues to work without copying the token into Gengchou.
+
+Upgrading from an earlier version does not show the prompt again and keeps the
+existing provider selection and permissions as they are. To pick up a newly
+installed provider, use **Provider access → Detect providers again**. Gengchou
+also checks periodically and shows a single notification when it finds a newly
+signed-in provider; it never changes what is displayed on its own.
+
+A provider with no credential on this machine shows **Not detected** in the
+detail popup along with a note that it is recognized automatically after
+sign-in, and raises no notification — a provider that was never signed in has
+nothing to sign in to *again*. **Authentication failed** is reserved for
+credentials that do exist but expired or were rejected.
 
 ## Data & privacy
 
