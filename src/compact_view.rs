@@ -204,6 +204,10 @@ fn provider_view(
     };
     let attention = match error {
         Some(ProviderStatus::AuthenticationFailed) => Attention::ActionRequired,
+        // Never signed in is a resting state, not a failure: the user may
+        // simply not use this provider. Showing the "not detected" badge is
+        // enough - raising the alarm colour would demand action that isn't due.
+        Some(ProviderStatus::NotSignedIn) => quota_attention,
         // A single rate limit or request failure is handled by automatic retry.
         // The application layer promotes it to `Stale` only after the value's
         // freshness or the consecutive-failure count crosses the UI threshold.

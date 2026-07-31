@@ -35,10 +35,11 @@ with a short note in the release runbook.
   manual refresh, and clean Exit.
 - On a fresh profile and on an upgrade from settings without permission
   fields, confirm each visible provider prompts before any credential read,
-  credential watch, or quota request. The prompt must name the provider and
-  exact source, appear only after an app surface is visible, default to No,
-  minimize and restore without granting access, and persist either decision
-  without prompting again at the next launch.
+  credential watch, or quota request. The prompt must name the provider,
+  explain that local login state is used only for usage queries without model
+  calls, appear only after an app surface is visible, default to No, minimize
+  and restore without granting access, and persist either decision without
+  prompting again at the next launch.
 - Grant one provider under Provider access and confirm only that provider
   polls. Rotate its original file or Credential Manager entry and confirm the
   new credential is picked up without Gengchou storing a token. Revoke access,
@@ -236,8 +237,8 @@ with a short note in the release runbook.
 - Publish and re-download the final GitHub release before preparing any WinGet
   manifest; use the public `gengchou-windows-x64.zip` URL and its released
   SHA-256, never a draft or local build.
-- Submit the first `ynjmxn.Gengchou` package only after the matching GitHub
-  release is public, then wait for the WinGet validation pipeline and review.
+- Submit or update `ynjmxn.Gengchou` only after the matching GitHub release is
+  public, then wait for the WinGet validation pipeline and review.
 - After the WinGet pull request is merged, install the public package on a
   clean Windows profile, confirm the installed command is `gengchou`, and test
   launch, update detection, and uninstall.

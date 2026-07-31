@@ -151,58 +151,58 @@ pub fn credential_consent_copy(language: LanguageId) -> CredentialConsentCopy {
     let (provider_access, title, body) = match language {
         LanguageId::English => (
             "Provider access",
-            "Allow access to {provider}?",
-            "Before reading {source}, Gengchou needs your permission. If allowed, it re-reads that source as needed and sends the session only to {provider} for read-only quota requests.\n\nGengchou never stores the token. You can revoke access from the Provider access menu at any time.\n\nAllow access?",
+            "Allow Gengchou to check your AI usage?",
+            "Gengchou uses the sign-in state already on this machine to check quota usage. It does not consume model allowance and does not store your sign-in information.\n\nYou can revoke access at any time from Provider access in the context menu.",
         ),
         LanguageId::Dutch => (
             "Providertoegang",
-            "Toegang tot {provider} toestaan?",
-            "Gengchou heeft uw toestemming nodig voordat {source} wordt gelezen. Na toestemming leest Gengchou deze bron opnieuw wanneer dat nodig is en stuurt de sessie alleen naar {provider} voor alleen-lezen quota-aanvragen.\n\nGengchou slaat het token nooit op. U kunt de toegang op elk moment intrekken via het menu Providertoegang.\n\nToegang toestaan?",
+            "Gengchou toegang geven tot uw AI-verbruik?",
+            "Gengchou gebruikt de aanmeldstatus die al op deze computer aanwezig is om het verbruik op te vragen. Dit verbruikt geen modeltegoed en uw aanmeldgegevens worden niet opgeslagen.\n\nU kunt de toegang op elk moment intrekken via Providertoegang in het contextmenu.",
         ),
         LanguageId::Spanish => (
             "Acceso a proveedores",
-            "¿Permitir el acceso a {provider}?",
-            "Gengchou necesita su permiso antes de leer {source}. Si lo permite, vuelve a leer esa fuente cuando sea necesario y envía la sesión únicamente a {provider} para consultar la cuota en modo de solo lectura.\n\nGengchou nunca guarda el token. Puede revocar el acceso en cualquier momento desde el menú Acceso a proveedores.\n\n¿Permitir el acceso?",
+            "¿Permitir que Gengchou consulte tu uso de IA?",
+            "Gengchou usa la sesión ya iniciada en este equipo para consultar el uso. No consume cuota de modelo ni guarda tus datos de inicio de sesión.\n\nPuedes revocar el acceso en cualquier momento desde Acceso a proveedores en el menú contextual.",
         ),
         LanguageId::French => (
             "Accès aux fournisseurs",
-            "Autoriser l'accès à {provider} ?",
-            "Gengchou a besoin de votre autorisation avant de lire {source}. Une fois autorisé, il relit cette source lorsque nécessaire et envoie la session uniquement à {provider} pour des requêtes de quota en lecture seule.\n\nGengchou ne stocke jamais le jeton. Vous pouvez révoquer l'accès à tout moment depuis le menu Accès aux fournisseurs.\n\nAutoriser l'accès ?",
+            "Autoriser Gengchou à consulter votre utilisation d'IA ?",
+            "Gengchou utilise la session déjà présente sur cet ordinateur pour consulter votre utilisation. Cela ne consomme aucun quota de modèle et vos informations de connexion ne sont pas enregistrées.\n\nVous pouvez révoquer l'accès à tout moment depuis Accès aux fournisseurs dans le menu contextuel.",
         ),
         LanguageId::German => (
             "Anbieterzugriff",
-            "Zugriff auf {provider} erlauben?",
-            "Gengchou benötigt Ihre Zustimmung, bevor {source} gelesen wird. Nach der Zustimmung liest Gengchou diese Quelle bei Bedarf erneut und sendet die Sitzung nur für schreibgeschützte Kontingentabfragen an {provider}.\n\nGengchou speichert das Token niemals. Sie können den Zugriff jederzeit im Menü Anbieterzugriff widerrufen.\n\nZugriff erlauben?",
+            "Gengchou erlauben, Ihre KI-Nutzung abzufragen?",
+            "Gengchou verwendet die auf diesem Computer bereits vorhandene Anmeldung, um die Nutzung abzufragen. Dabei wird kein Modellkontingent verbraucht und Ihre Anmeldedaten werden nicht gespeichert.\n\nSie können den Zugriff jederzeit im Kontextmenü unter „Anbieterzugriff“ widerrufen.",
         ),
         LanguageId::Japanese => (
             "プロバイダーへのアクセス",
-            "{provider} へのアクセスを許可しますか？",
-            "{source} を読み取る前に、Gengchou は許可を必要とします。許可すると、必要に応じてこのソースを再度読み取り、読み取り専用のクォータ照会のためだけにセッションを {provider} へ送信します。\n\nGengchou はトークンを保存しません。プロバイダーへのアクセス メニューからいつでも許可を取り消せます。\n\nアクセスを許可しますか？",
+            "Gengchou に AI 使用量の確認を許可しますか？",
+            "Gengchou はこのコンピューターに既にあるサインイン状態を使用して使用量を確認します。モデルの利用枠は消費せず、サインイン情報も保存しません。\n\nコンテキスト メニューの「プロバイダーへのアクセス」からいつでも許可を取り消せます。",
         ),
         LanguageId::Korean => (
             "공급자 액세스",
-            "{provider} 액세스를 허용하시겠습니까?",
-            "{source}을(를) 읽기 전에 Gengchou에 사용자의 허가가 필요합니다. 허용하면 필요할 때 이 원본을 다시 읽고 읽기 전용 할당량 요청을 위해서만 세션을 {provider}에 보냅니다.\n\nGengchou는 토큰을 저장하지 않습니다. 공급자 액세스 메뉴에서 언제든지 권한을 철회할 수 있습니다.\n\n액세스를 허용하시겠습니까?",
+            "Gengchou가 AI 사용량을 조회하도록 허용하시겠습니까?",
+            "Gengchou는 이 컴퓨터에 이미 있는 로그인 상태를 사용하여 사용량을 조회합니다. 모델 할당량을 소비하지 않으며 로그인 정보를 저장하지도 않습니다.\n\n상황에 맞는 메뉴의 '공급자 액세스'에서 언제든지 권한을 철회할 수 있습니다.",
         ),
         LanguageId::SimplifiedChinese => (
             "服务商访问权限",
-            "允许访问 {provider}？",
-            "读取 {source} 前，Gengchou 需要获得你的明确授权。授权后，Gengchou 会按需重新读取该来源，并且只把会话用于向 {provider} 发起只读的额度查询。\n\nGengchou 不会保存令牌。你可以随时在“服务商访问权限”菜单中撤销授权。\n\n是否允许访问？",
+            "允许更筹查询本机 AI 用量？",
+            "更筹会使用本机已有的登录状态查询用量，不会消耗模型额度，也不会保存登录信息。\n\n可随时在右键菜单的“服务商访问权限”中撤销。",
         ),
         LanguageId::TraditionalChinese => (
             "服務商存取權限",
-            "允許存取 {provider}？",
-            "讀取 {source} 前，Gengchou 需要取得你的明確授權。授權後，Gengchou 會按需重新讀取該來源，並且只把工作階段用於向 {provider} 發起唯讀的配額查詢。\n\nGengchou 不會儲存權杖。你可以隨時在「服務商存取權限」選單中撤銷授權。\n\n是否允許存取？",
+            "允許更籌查詢本機 AI 用量？",
+            "更籌會使用本機已有的登入狀態查詢用量，不會消耗模型額度，也不會儲存登入資訊。\n\n可隨時在右鍵選單的「服務商存取權限」中撤銷。",
         ),
         LanguageId::Russian => (
             "Доступ к провайдерам",
-            "Разрешить доступ к {provider}?",
-            "Перед чтением {source} Gengchou требуется ваше разрешение. После разрешения источник перечитывается по мере необходимости, а сеанс отправляется только в {provider} для запросов квоты без изменения данных.\n\nGengchou никогда не сохраняет токен. Доступ можно отозвать в любое время в меню доступа к провайдерам.\n\nРазрешить доступ?",
+            "Разрешить Gengchou запрашивать использование ИИ?",
+            "Gengchou использует вход, уже выполненный на этом компьютере, чтобы запрашивать использование. Это не расходует квоту модели, а данные для входа не сохраняются.\n\nВы можете отозвать доступ в любое время в меню «Доступ к провайдерам».",
         ),
         LanguageId::PortugueseBrazil => (
             "Acesso aos provedores",
-            "Permitir acesso ao {provider}?",
-            "O Gengchou precisa da sua permissão antes de ler {source}. Se permitido, ele relê essa fonte quando necessário e envia a sessão somente ao {provider} para consultas de cota somente leitura.\n\nO Gengchou nunca armazena o token. Você pode revogar o acesso a qualquer momento no menu Acesso aos provedores.\n\nPermitir acesso?",
+            "Permitir que o Gengchou consulte seu uso de IA?",
+            "O Gengchou usa o login já existente neste computador para consultar o uso. Isso não consome cota de modelo e seus dados de login não são armazenados.\n\nVocê pode revogar o acesso a qualquer momento em Acesso aos provedores no menu de contexto.",
         ),
     };
     CredentialConsentCopy {
@@ -225,7 +225,7 @@ pub struct Strings {
     pub fifteen_minutes: &'static str,
     pub thirty_minutes: &'static str,
     pub models: &'static str,
-    pub claude_code_model: &'static str,
+    pub claude_model: &'static str,
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
     pub settings: &'static str,
@@ -301,6 +301,21 @@ pub struct Strings {
     pub detail_badge_stale: &'static str,
     pub detail_badge_near_limit: &'static str,
     pub detail_badge_limit_reached: &'static str,
+    /// Shown when no credential for a provider exists on this machine. Kept
+    /// distinct from `detail_badge_auth_failed`: nothing has failed, the
+    /// provider was simply never signed in.
+    pub detail_badge_not_signed_in: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub detail_not_signed_in_action: &'static str,
+    /// "{provider}" is replaced with the localized provider name. Rendered as
+    /// the hint's single-line action, so it stays short; the route back is in
+    /// `detail_access_revoked_outcome`.
+    pub detail_access_revoked_hint: &'static str,
+    pub detail_access_revoked_outcome: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub provider_detected_title: &'static str,
+    pub provider_detected_body: &'static str,
+    pub redetect_providers: &'static str,
     /// Short weekday names, Sunday first (SYSTEMTIME::wDayOfWeek order).
     pub weekdays: [&'static str; 7],
 }
@@ -409,6 +424,13 @@ mod tests {
                 strings.notify_claude_cli_update,
                 strings.claude_cli_updated_title,
                 strings.claude_cli_updated_body,
+                strings.detail_badge_not_signed_in,
+                strings.detail_not_signed_in_action,
+                strings.detail_access_revoked_hint,
+                strings.detail_access_revoked_outcome,
+                strings.provider_detected_title,
+                strings.provider_detected_body,
+                strings.redetect_providers,
             ] {
                 assert!(
                     !value.trim().is_empty(),
@@ -417,7 +439,41 @@ mod tests {
                 );
             }
             assert!(strings.detail_claude_login_action.contains("Claude"));
-            assert!(strings.detail_sign_in_again_action.contains("{provider}"));
+            for value in [
+                strings.detail_sign_in_again_action,
+                strings.detail_not_signed_in_action,
+                strings.detail_access_revoked_hint,
+                strings.provider_detected_title,
+            ] {
+                assert!(
+                    value.contains("{provider}"),
+                    "missing {{provider}} placeholder for {}",
+                    language.code()
+                );
+            }
+        }
+    }
+
+    /// The first-run prompt now covers every provider at once, so naming one
+    /// would be wrong. It also no longer spells out credential paths - those
+    /// live in the README privacy section.
+    #[test]
+    fn consent_copy_is_provider_neutral_in_every_language() {
+        for language in LanguageId::ALL {
+            let copy = credential_consent_copy(language);
+            for value in [copy.title, copy.body] {
+                assert!(
+                    !value.contains("{provider}"),
+                    "{} consent copy still names a provider",
+                    language.code()
+                );
+                assert!(
+                    !value.contains("{source}"),
+                    "{} consent copy still names a credential source",
+                    language.code()
+                );
+            }
+            assert!(!copy.provider_access.trim().is_empty());
         }
     }
 
@@ -437,6 +493,29 @@ mod tests {
     }
 
     #[test]
+    fn quota_provider_is_named_claude_in_every_language() {
+        for language in LanguageId::ALL {
+            assert_eq!(
+                language.strings().claude_model,
+                "Claude",
+                "{} provider label",
+                language.code()
+            );
+        }
+    }
+
+    #[test]
+    fn simplified_chinese_consent_copy_matches_the_approved_short_form() {
+        let copy = credential_consent_copy(LanguageId::SimplifiedChinese);
+        assert_eq!(copy.provider_access, "服务商访问权限");
+        assert_eq!(copy.title, "允许更筹查询本机 AI 用量？");
+        assert_eq!(
+            copy.body,
+            "更筹会使用本机已有的登录状态查询用量，不会消耗模型额度，也不会保存登录信息。\n\n可随时在右键菜单的“服务商访问权限”中撤销。"
+        );
+    }
+
+    #[test]
     fn simplified_chinese_claude_recovery_copy_matches_the_approved_short_form() {
         let strings = LanguageId::SimplifiedChinese.strings();
         assert_eq!(strings.detail_badge_auth_failed, "认证失败");
@@ -445,6 +524,30 @@ mod tests {
         assert_eq!(strings.detail_claude_login_action, "请重新登录 Claude");
         assert_eq!(strings.detail_sign_in_again_action, "请重新登录 {provider}");
         assert_eq!(strings.detail_monitoring_resumes, "登录后自动恢复");
+    }
+
+    #[test]
+    fn app_display_name_is_localized_only_for_chinese() {
+        assert_eq!(LanguageId::SimplifiedChinese.strings().window_title, "更筹");
+        assert_eq!(
+            LanguageId::TraditionalChinese.strings().window_title,
+            "更籌"
+        );
+        assert!(credential_consent_copy(LanguageId::SimplifiedChinese)
+            .body
+            .contains("更筹"));
+        assert!(credential_consent_copy(LanguageId::TraditionalChinese)
+            .body
+            .contains("更籌"));
+
+        for language in LanguageId::ALL {
+            if !matches!(
+                language,
+                LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese
+            ) {
+                assert_eq!(language.strings().window_title, "Gengchou");
+            }
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "透過 WinGet 更新";
 
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "zh-TW",
-    window_title: "Gengchou",
+    window_title: "更籌",
     refresh: "重新整理",
     refresh_now: "立即重新整理",
     one_minute: "1 分鐘",
@@ -14,7 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     fifteen_minutes: "15 分鐘",
     thirty_minutes: "30 分鐘",
     models: "服務商",
-    claude_code_model: "Claude Code",
+    claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "設定",
@@ -84,5 +84,12 @@ pub(super) const STRINGS: Strings = Strings {
     detail_badge_stale: "更新失敗",
     detail_badge_near_limit: "接近上限",
     detail_badge_limit_reached: "已達上限",
+    detail_badge_not_signed_in: "未偵測到",
+    detail_not_signed_in_action: "登入 {provider} 後自動識別",
+    detail_access_revoked_hint: "已拒絕存取 {provider}",
+    detail_access_revoked_outcome: "可在右鍵選單中重新開啟",
+    provider_detected_title: "已偵測到 {provider}",
+    provider_detected_body: "可在右鍵選單中開啟以監控其用量。",
+    redetect_providers: "重新偵測服務商",
     weekdays: ["週日", "週一", "週二", "週三", "週四", "週五", "週六"],
 };
