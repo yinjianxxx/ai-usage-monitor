@@ -46,7 +46,6 @@ pub(super) const STRINGS: Strings = Strings {
     notifications: "Notifications",
     notify_session_reset: "단기 한도 초기화 알림",
     notify_weekly_reset: "장기 한도 초기화 알림",
-    notify_claude_cli_update: "Claude Code 업데이트 시 알림",
     claude_cli_updated_title: "Claude Code 업데이트됨",
     claude_cli_updated_body: "{before}에서 {after}(으)로 업데이트하고 인증을 복구했습니다.",
     reset_notification_title: "사용량 기간이 초기화됨",

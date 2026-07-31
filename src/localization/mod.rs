@@ -257,7 +257,6 @@ pub struct Strings {
     pub notifications: &'static str,
     pub notify_session_reset: &'static str,
     pub notify_weekly_reset: &'static str,
-    pub notify_claude_cli_update: &'static str,
     pub claude_cli_updated_title: &'static str,
     pub claude_cli_updated_body: &'static str,
     pub reset_notification_title: &'static str,
@@ -421,7 +420,6 @@ mod tests {
                 strings.detail_all_not_updated,
                 strings.detail_claude_login_action,
                 strings.detail_monitoring_resumes,
-                strings.notify_claude_cli_update,
                 strings.claude_cli_updated_title,
                 strings.claude_cli_updated_body,
                 strings.detail_badge_not_signed_in,
@@ -486,10 +484,14 @@ mod tests {
         }
     }
 
+    /// The balloon names the CLI it changed, so the user knows what was
+    /// touched without opening anything.
     #[test]
     fn english_claude_update_notification_copy_is_complete() {
         let strings = LanguageId::English.strings();
-        assert!(strings.notify_claude_cli_update.contains("Claude Code"));
+        assert!(strings.claude_cli_updated_title.contains("Claude Code"));
+        assert!(strings.claude_cli_updated_body.contains("{before}"));
+        assert!(strings.claude_cli_updated_body.contains("{after}"));
     }
 
     #[test]

@@ -229,7 +229,6 @@ struct AppState {
     last_success_unix: Option<u64>,
     notify_session_reset: bool,
     notify_weekly_reset: bool,
-    notify_claude_cli_update: bool,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
     details_hwnd: Option<HWND>,
@@ -322,7 +321,6 @@ const IDM_ACCESS_ANTIGRAVITY: u16 = 65;
 const IDM_REDETECT_PROVIDERS: u16 = 66;
 const IDM_NOTIFY_SESSION_RESET: u16 = 80;
 const IDM_NOTIFY_WEEKLY_RESET: u16 = 81;
-const IDM_NOTIFY_CLAUDE_CLI_UPDATE: u16 = 83;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 /// WM_MOUSELEAVE (winuser.h), kept local to avoid pulling a control-specific
@@ -1560,7 +1558,6 @@ fn save_state_settings() {
             provider_order: s.provider_order.clone(),
             notify_session_reset: s.notify_session_reset,
             notify_weekly_reset: s.notify_weekly_reset,
-            notify_claude_cli_update: s.notify_claude_cli_update,
         })
     };
     if let Some(snapshot) = snapshot {
@@ -11243,7 +11240,6 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 last_success_unix: None,
                 notify_session_reset: settings.notify_session_reset,
                 notify_weekly_reset: settings.notify_weekly_reset,
-                notify_claude_cli_update: settings.notify_claude_cli_update,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 details_hwnd: None,
@@ -11661,20 +11657,24 @@ fn post_usage_updated() {
     }
 }
 
+/// Report that Gengchou updated the Claude Code CLI in the background.
+///
+/// Not optional. This is not a preference like the quota-reset notifications
+/// next to it used to suggest - it discloses that the app changed something on
+/// the user's machine, and an app that can silently upgrade your CLI is worse
+/// than one that occasionally tells you it did. The opt-out that matters is
+/// `DISABLE_UPDATES=1`, which stops the update itself.
 fn notify_claude_cli_update_if_needed(hwnd: HWND) {
     let Some(update) = poller::take_claude_cli_update_notification() else {
         return;
     };
-    let (enabled, strings) = {
+    let strings = {
         let state = lock_state();
         let Some(state) = state.as_ref() else {
             return;
         };
-        (state.notify_claude_cli_update, state.language.strings())
+        state.language.strings()
     };
-    if !enabled {
-        return;
-    }
     let before = update.before_version.as_deref().unwrap_or("?");
     let after = update.after_version.as_deref().unwrap_or("?");
     let body = strings
@@ -13228,8 +13228,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     refresh_floating_monitor();
                 }
                 IDM_NOTIFY_SESSION_RESET
-                | IDM_NOTIFY_WEEKLY_RESET
-                | IDM_NOTIFY_CLAUDE_CLI_UPDATE => {
+                | IDM_NOTIFY_WEEKLY_RESET => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -13239,9 +13238,6 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                 }
                                 IDM_NOTIFY_WEEKLY_RESET => {
                                     s.notify_weekly_reset = !s.notify_weekly_reset;
-                                }
-                                IDM_NOTIFY_CLAUDE_CLI_UPDATE => {
-                                    s.notify_claude_cli_update = !s.notify_claude_cli_update;
                                 }
                                 _ => {}
                             }
@@ -13383,7 +13379,6 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             allow_antigravity_credentials,
             notify_session_reset,
             notify_weekly_reset,
-            notify_claude_cli_update,
             widget_placement,
             floating_placement,
         ) = {
@@ -13407,7 +13402,6 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     s.allow_antigravity_credentials,
                     s.notify_session_reset,
                     s.notify_weekly_reset,
-                    s.notify_claude_cli_update,
                     s.widget_placement.clone(),
                     s.floating_placement.clone(),
                 ),
@@ -13429,7 +13423,6 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     false,
                     false,
                     false,
-                    true,
                     WidgetPlacement::PrimaryRight,
                     FloatingPlacement::PrimaryBottomRight,
                 ),
@@ -13728,18 +13721,6 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             weekly_reset_flags,
             IDM_NOTIFY_WEEKLY_RESET as usize,
             PCWSTR::from_raw(weekly_reset_label.as_ptr()),
-        );
-        let cli_update_label = native_interop::wide_str(strings.notify_claude_cli_update);
-        let cli_update_flags = if notify_claude_cli_update {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            notifications_menu,
-            cli_update_flags,
-            IDM_NOTIFY_CLAUDE_CLI_UPDATE as usize,
-            PCWSTR::from_raw(cli_update_label.as_ptr()),
         );
         let notifications_label = native_interop::wide_str(strings.notifications);
         let _ = AppendMenuW(

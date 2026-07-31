@@ -46,7 +46,6 @@ pub(super) const STRINGS: Strings = Strings {
     notifications: "Notifications",
     notify_session_reset: "Notify on short-window reset",
     notify_weekly_reset: "Notify on long-window reset",
-    notify_claude_cli_update: "Notify when Claude Code is updated",
     claude_cli_updated_title: "Claude Code updated",
     claude_cli_updated_body: "Updated from {before} to {after}; authentication recovered.",
     reset_notification_title: "Usage window reset",
