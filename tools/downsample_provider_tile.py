@@ -56,6 +56,24 @@ def main() -> None:
                 f"alpha_levels={alpha_levels}, opaque_colors={opaque_colors}"
             )
 
+        # The rounded tile must still reach the midpoint of every edge. A
+        # locator screenshot can retain the requested dimensions while filling
+        # the portion outside a too-small browser viewport with transparency;
+        # checking only the PNG size would miss that clipping.
+        alpha = resized.getchannel("A")
+        midpoint = args.size // 2
+        edge_alpha = (
+            alpha.getpixel((0, midpoint)),
+            alpha.getpixel((args.size - 1, midpoint)),
+            alpha.getpixel((midpoint, 0)),
+            alpha.getpixel((midpoint, args.size - 1)),
+        )
+        if min(edge_alpha) == 0 or alpha.getbbox() != (0, 0, args.size, args.size):
+            raise ValueError(
+                "downsampled tile was clipped by the renderer: "
+                f"edge_alpha={edge_alpha}, alpha_bbox={alpha.getbbox()}"
+            )
+
     args.destination.parent.mkdir(parents=True, exist_ok=True)
     resized.save(args.destination, format="PNG", optimize=True)
 

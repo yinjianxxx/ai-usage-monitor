@@ -3,7 +3,7 @@ name = "gengchou"
 # Versioning starts at 2.x, above the original project's 1.x line: also
 # guarantees the manual update check never treats an upstream 1.x release as
 # newer (see updater::is_version_newer).
-version = "2.3.4"
+version = "2.3.5"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
@@ -21,15 +21,17 @@ Comments = "Originally derived from CodeZeno/Claude-Code-Usage-Monitor"
 LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 Jianxin Yin"
 
 [dependencies]
-ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
 native-tls = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+base64 = "0.22"
 
 [dependencies.windows]
 version = "0.58"
 features = [
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
@@ -49,6 +51,7 @@ features = [
     "Win32_System_RemoteDesktop",
     "Win32_Graphics_Dwm",
     "Win32_Storage_FileSystem",
+    "Win32_Networking_WinHttp",
 ]
 
 [build-dependencies]

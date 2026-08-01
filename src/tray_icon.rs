@@ -12,8 +12,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::compact_view;
 use crate::diagnose;
 use crate::native_interop::{self, Color, WM_APP_TRAY};
+use crate::provider_tile::{self, ProviderBrand};
 use crate::theme;
 
 const CLAUDE_TRAY_ICON_ID: u32 = 1;
@@ -35,6 +37,7 @@ static ANTIGRAVITY_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 static APP_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 
 const ICON_SIZE: i32 = 64;
+const TRAY_BRAND_TILE_DPI: u32 = 384;
 const BAR_LEFT: i32 = 0;
 const BAR_RIGHT: i32 = ICON_SIZE;
 const BAR_5H_TOP: i32 = 42;
@@ -49,10 +52,17 @@ const NUMBER_BOTTOM: i32 = 38;
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
 
 /// Actions the tray message handler can request from the main window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
     None,
-    ShowDetails,
-    ShowContextMenu(Option<TrayIconKind>),
+    ShowDetails {
+        kind: Option<TrayIconKind>,
+        keyboard: bool,
+    },
+    ShowContextMenu {
+        kind: Option<TrayIconKind>,
+        anchor_to_icon: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,12 +75,20 @@ pub enum TrayIconKind {
 
 pub struct TrayIconData {
     pub kind: TrayIconKind,
-    /// Available provider windows, ordered shortest to longest (at most two).
+    /// Canonical headline first, then the most urgent remaining window.
     pub percents: Vec<f64>,
     pub tooltip: String,
 }
 
 impl TrayIconKind {
+    pub(crate) fn brand(self) -> ProviderBrand {
+        match self {
+            Self::Claude => ProviderBrand::Claude,
+            Self::Codex => ProviderBrand::Codex,
+            Self::Antigravity => ProviderBrand::Antigravity,
+        }
+    }
+
     fn id(self) -> u32 {
         match self {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
@@ -138,12 +156,20 @@ fn use_legacy_app_uid() {
 /// distinct uID values, matching how `ensure` registers them.
 pub fn rect(hwnd: HWND, kind: TrayIconKind) -> Option<RECT> {
     let mode = kind.identity_mode();
+    rect_for_identity(hwnd, kind.id(), kind.guid(), mode)
+}
+
+pub fn app_rect(hwnd: HWND) -> Option<RECT> {
+    rect_for_identity(hwnd, APP_TRAY_ICON_ID, app_icon_guid(), app_identity_mode())
+}
+
+fn rect_for_identity(hwnd: HWND, id: u32, guid: GUID, mode: IdentityMode) -> Option<RECT> {
     let identifier = NOTIFYICONIDENTIFIER {
         cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
         hWnd: hwnd,
-        uID: kind.id(),
+        uID: id,
         guidItem: if mode == IdentityMode::Guid {
-            kind.guid()
+            guid
         } else {
             GUID::zeroed()
         },
@@ -252,16 +278,15 @@ fn provider_color(kind: TrayIconKind, is_dark: bool, high_contrast: bool) -> Col
 fn number_color(kind: TrayIconKind, percent: f64, is_dark: bool, high_contrast: bool) -> Color {
     if high_contrast {
         theme::system_color(COLOR_HIGHLIGHT)
-    } else if percent >= 90.0 {
+    } else if compact_view::display_percent_warns(percent) {
         Color::from_hex("#E5484D")
     } else {
         provider_color(kind, is_dark, false)
     }
 }
 
-/// Placeholder letter while no usage data is available: the provider
-/// companies' initials (A = Anthropic, O = OpenAI, G = Google), which stay
-/// unambiguous where Claude/Codex would both be "C".
+/// High Contrast and decode-failure fallback while no usage data is available:
+/// provider-company initials avoid the Claude/Codex "C" collision.
 fn placeholder_letter(kind: TrayIconKind) -> &'static str {
     match kind {
         TrayIconKind::Claude => "A",
@@ -285,13 +310,23 @@ fn bar_track_color(is_dark: bool, high_contrast: bool) -> Color {
 /// Create the tray icon: the first available quota percentage on top and zero,
 /// one, or two proportional bars below. A single window gets one thicker,
 /// centered bar; two windows retain the compact stacked layout. While no data
-/// is available the number gives way to the provider's company initial.
+/// is available, standard themes use the provider tile; High Contrast retains
+/// the system-colour company-initial fallback.
 pub fn create_icon(
     kind: TrayIconKind,
     percents: &[f64],
     is_dark: bool,
     high_contrast: bool,
 ) -> HICON {
+    if percents.is_empty() && !high_contrast {
+        if let Some((icon, size)) =
+            provider_tile::create_chip16_icon(kind.brand(), TRAY_BRAND_TILE_DPI, is_dark)
+        {
+            debug_assert_eq!(size, ICON_SIZE);
+            return icon;
+        }
+    }
+
     let size = ICON_SIZE;
     let base_col = provider_color(kind, is_dark, high_contrast);
     let percent = percents.first().copied();
@@ -302,7 +337,7 @@ pub fn create_icon(
     let track_col = bar_track_color(is_dark, high_contrast);
 
     let display_text = match percent {
-        Some(p) => format!("{}", p.round().clamp(0.0, 100.0) as u32),
+        Some(p) => compact_view::display_percent(p).to_string(),
         None => placeholder_letter(kind).to_string(),
     };
 
@@ -530,6 +565,36 @@ fn app_notify_icon_data_for_mode(hwnd: HWND, mode: IdentityMode) -> NOTIFYICONDA
 
 fn app_notify_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     app_notify_icon_data_for_mode(hwnd, app_identity_mode())
+}
+
+fn provider_tooltip_notify_icon_data_for_mode(
+    hwnd: HWND,
+    kind: TrayIconKind,
+    mode: IdentityMode,
+    tooltip: &str,
+) -> NOTIFYICONDATAW {
+    let mut nid = notify_icon_data_for_mode(hwnd, kind, mode);
+    nid.uFlags |= NIF_TIP | NIF_SHOWTIP;
+    copy_to_tip(tooltip, &mut nid.szTip);
+    nid
+}
+
+fn update_provider_tooltip(hwnd: HWND, kind: TrayIconKind, tooltip: &str) {
+    unsafe {
+        let nid =
+            provider_tooltip_notify_icon_data_for_mode(hwnd, kind, kind.identity_mode(), tooltip);
+        // Countdown-only refresh: modifying the tooltip must not recreate the
+        // HICON, re-register the callback, or disturb the user's Shell order.
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// Refresh the native provider tooltip text without touching icon identity,
+/// artwork, callback registration, or Shell ordering.
+pub fn update_provider_tooltips(hwnd: HWND, icons: &[TrayIconData]) {
+    for icon in icons {
+        update_provider_tooltip(hwnd, icon.kind, &icon.tooltip);
+    }
 }
 
 /// Copy a string into a fixed-size wide buffer (truncates to fit).
@@ -782,6 +847,18 @@ pub fn dump_icons(dir: &str) -> i32 {
                 }
             }
         }
+        if percents.is_empty() {
+            let hicon = create_icon(*kind, percents, false, true);
+            let path = format!("{dir}\\{name}-hc.bmp");
+            if hicon.is_invalid() || !icon_to_bmp(hicon, &path) {
+                failures += 1;
+            }
+            if !hicon.is_invalid() {
+                unsafe {
+                    let _ = DestroyIcon(hicon);
+                }
+            }
+        }
     }
     if failures == 0 {
         0
@@ -833,6 +910,36 @@ mod tests {
         assert_ne!(guid.uFlags.0 & NIF_GUID.0, 0);
         assert_eq!(legacy.uFlags.0 & NIF_GUID.0, 0);
         assert_eq!(legacy.guidItem, GUID::zeroed());
+    }
+
+    #[test]
+    fn tray_number_warning_color_follows_the_displayed_percentage() {
+        let normal = number_color(TrayIconKind::Claude, 89.4, false, false);
+        let rounded_warning = number_color(TrayIconKind::Claude, 89.6, false, false);
+
+        assert_eq!((normal.r, normal.g, normal.b), (0xD9, 0x77, 0x57));
+        assert_eq!(
+            (rounded_warning.r, rounded_warning.g, rounded_warning.b),
+            (0xE5, 0x48, 0x4D)
+        );
+    }
+
+    #[test]
+    fn countdown_tooltip_refresh_does_not_modify_icon_or_callback() {
+        let nid = provider_tooltip_notify_icon_data_for_mode(
+            HWND::default(),
+            TrayIconKind::Claude,
+            IdentityMode::Guid,
+            "Claude Code\n5h: 53% (Resets in 45m)",
+        );
+
+        assert_ne!(nid.uFlags.0 & NIF_GUID.0, 0);
+        assert_ne!(nid.uFlags.0 & NIF_TIP.0, 0);
+        assert_ne!(nid.uFlags.0 & NIF_SHOWTIP.0, 0);
+        assert_eq!(nid.uFlags.0 & NIF_ICON.0, 0);
+        assert_eq!(nid.uFlags.0 & NIF_MESSAGE.0, 0);
+        assert!(nid.hIcon.is_invalid());
+        assert_eq!(nid.uCallbackMessage, 0);
     }
 
     #[test]
@@ -920,19 +1027,49 @@ mod tests {
     #[test]
     fn version_four_callback_decodes_icon_and_keyboard_events() {
         let select = LPARAM(((TrayIconKind::Codex.id() << 16) | NIN_KEYSELECT) as usize as isize);
-        assert!(matches!(handle_message(select), TrayAction::ShowDetails));
+        assert_eq!(
+            handle_message(select),
+            TrayAction::ShowDetails {
+                kind: Some(TrayIconKind::Codex),
+                keyboard: true,
+            }
+        );
+
+        let pointer = LPARAM(((TrayIconKind::Claude.id() << 16) | NIN_SELECT) as usize as isize);
+        assert_eq!(
+            handle_message(pointer),
+            TrayAction::ShowDetails {
+                kind: Some(TrayIconKind::Claude),
+                keyboard: false,
+            }
+        );
+
+        let app_keyboard = LPARAM(((APP_TRAY_ICON_ID << 16) | NIN_KEYSELECT) as usize as isize);
+        assert_eq!(
+            handle_message(app_keyboard),
+            TrayAction::ShowDetails {
+                kind: None,
+                keyboard: true,
+            }
+        );
 
         let context =
             LPARAM(((TrayIconKind::Antigravity.id() << 16) | WM_CONTEXTMENU) as usize as isize);
         assert!(matches!(
             handle_message(context),
-            TrayAction::ShowContextMenu(Some(TrayIconKind::Antigravity))
+            TrayAction::ShowContextMenu {
+                kind: Some(TrayIconKind::Antigravity),
+                anchor_to_icon: true,
+            }
         ));
 
         let app_context = LPARAM(((APP_TRAY_ICON_ID << 16) | WM_CONTEXTMENU) as usize as isize);
         assert!(matches!(
             handle_message(app_context),
-            TrayAction::ShowContextMenu(None)
+            TrayAction::ShowContextMenu {
+                kind: None,
+                anchor_to_icon: true,
+            }
         ));
     }
 
@@ -1034,8 +1171,22 @@ pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let event = raw & 0xFFFF;
     let kind = TrayIconKind::from_id(raw >> 16);
     match event {
-        WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT => TrayAction::ShowDetails,
-        WM_RBUTTONUP | WM_CONTEXTMENU => TrayAction::ShowContextMenu(kind),
+        WM_LBUTTONUP | NIN_SELECT => TrayAction::ShowDetails {
+            kind,
+            keyboard: false,
+        },
+        NIN_KEYSELECT => TrayAction::ShowDetails {
+            kind,
+            keyboard: true,
+        },
+        WM_RBUTTONUP => TrayAction::ShowContextMenu {
+            kind,
+            anchor_to_icon: false,
+        },
+        WM_CONTEXTMENU => TrayAction::ShowContextMenu {
+            kind,
+            anchor_to_icon: true,
+        },
         _ => TrayAction::None,
     }
 }

@@ -17,10 +17,11 @@ originate from this project.
 ## jens-duttke/usage-monitor-for-claude
 
 - Source: https://github.com/jens-duttke/usage-monitor-for-claude
+- Reference commit: `a3503e9a49c0028d8c5db6897dcd3964746bdd15`
 
 Elements of the tray-icon presentation and Claude OAuth usage polling,
-caching, cooldown, and HTTP 429 handling were adapted from or informed by
-this project.
+caching, cooldown, HTTP 429 handling, and the hidden `claude update`
+credential-recovery pattern were adapted from or informed by this project.
 
 MIT License
 

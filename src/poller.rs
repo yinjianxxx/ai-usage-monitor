@@ -15,6 +15,7 @@ use crate::models::{
     AppUsageData, ProviderStatus, UsageData, UsageWindow, FIVE_HOURS_SECONDS, ONE_DAY_SECONDS,
     ONE_WEEK_SECONDS,
 };
+use crate::{claude_cli, claude_desktop};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_USER_AGENT: &str = "claude-code/2.1.85";
@@ -25,11 +26,12 @@ const CLAUDE_RATE_LIMIT_MIN_RETRY_MS: u32 = 300_000;
 const CLAUDE_RATE_LIMIT_MAX_RETRY_MS: u32 = 3_600_000;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const AUTH_CONFIRM_RETRY_DELAY_MS: u64 = 1_000;
 const CODEX_REQUEST_TIMEOUT_SECS: u64 = 10;
 const CODEX_RETRY_DELAY_MS: u64 = 1_000;
 const ANTIGRAVITY_REQUEST_TIMEOUT_SECS: u64 = 10;
 const ANTIGRAVITY_FIVE_HOUR_RESET_GRACE_SECS: u64 = 15 * 60;
-const AUTH_REJECTION_RECHECK_SECS: u64 = 15 * 60;
+pub(crate) const AUTH_REJECTION_RECHECK_MS: u32 = 15 * 60 * 1_000;
 const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_USER_QUOTA_URL: &str =
@@ -43,9 +45,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
     AuthRequired,
+    AuthForbidden,
     NoCredentials,
-    TokenExpired,
     RateLimited(Option<u32>),
+    NetworkUnavailable,
     RequestFailed,
 }
 
@@ -57,7 +60,7 @@ pub struct PollFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
-    ActiveSource,
+    ClaudeSources,
     Codex,
     Antigravity,
     AllProviders,
@@ -94,9 +97,32 @@ struct ClaudeRateLimit {
 struct ClaudePollState {
     cached: Option<CachedClaudeUsage>,
     rate_limit: Option<ClaudeRateLimit>,
+    auth_rejected_token_hash: Option<u64>,
 }
 
 static CLAUDE_POLL_STATE: OnceLock<Mutex<ClaudePollState>> = OnceLock::new();
+
+static CLAUDE_CLI_UPDATE_NOTIFICATION: OnceLock<Mutex<Option<claude_cli::UpdateResult>>> =
+    OnceLock::new();
+
+pub(crate) fn take_claude_cli_update_notification() -> Option<claude_cli::UpdateResult> {
+    CLAUDE_CLI_UPDATE_NOTIFICATION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?
+        .take()
+}
+
+fn queue_claude_cli_update_notification(result: claude_cli::UpdateResult) {
+    if result.version_changed {
+        if let Ok(mut pending) = CLAUDE_CLI_UPDATE_NOTIFICATION
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *pending = Some(result);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AuthRejectionBackoff {
@@ -298,7 +324,10 @@ fn poll_with(
                 if active_provider_count > 1 {
                     diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
                 }
-                data.claude_code_error = Some(provider_status(error));
+                data.claude_code_error = Some(claude_provider_status(error));
+                if let PollError::RateLimited(retry_after_ms) = error {
+                    data.claude_code_retry_after_ms = retry_after_ms;
+                }
                 record_poll_error(&mut data, error);
                 errors.push(error);
             }
@@ -313,6 +342,9 @@ fn poll_with(
                     diagnose::log(format!("Codex usage poll failed: {error:?}"));
                 }
                 data.codex_error = Some(provider_status(error));
+                if let PollError::RateLimited(retry_after_ms) = error {
+                    data.codex_retry_after_ms = retry_after_ms;
+                }
                 record_poll_error(&mut data, error);
                 errors.push(error);
             }
@@ -327,6 +359,9 @@ fn poll_with(
                     diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
                 }
                 data.antigravity_error = Some(provider_status(error));
+                if let PollError::RateLimited(retry_after_ms) = error {
+                    data.antigravity_retry_after_ms = retry_after_ms;
+                }
                 record_poll_error(&mut data, error);
                 errors.push(error);
             }
@@ -354,7 +389,7 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
     let all_require_user_action = errors.iter().all(|error| {
         matches!(
             error,
-            PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired
+            PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials
         )
     });
     if all_require_user_action {
@@ -373,6 +408,8 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
         .any(|error| matches!(error, PollError::RateLimited(_)))
     {
         PollError::RateLimited(retry_after_ms)
+    } else if errors.contains(&PollError::NetworkUnavailable) {
+        PollError::NetworkUnavailable
     } else {
         PollError::RequestFailed
     }
@@ -381,23 +418,32 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
 /// Collapse a poll error to display granularity (see models::ProviderStatus).
 pub fn provider_status(error: PollError) -> ProviderStatus {
     match error {
-        PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired => {
-            ProviderStatus::AuthRequired
+        PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials => {
+            ProviderStatus::AuthenticationFailed
         }
         PollError::RateLimited(_) => ProviderStatus::RateLimited,
+        PollError::NetworkUnavailable => ProviderStatus::NetworkUnavailable,
+        PollError::RequestFailed => ProviderStatus::RequestFailed,
+    }
+}
+
+/// Claude collapses every non-renewable local or remote authentication
+/// failure to one actionable public state. Other providers retain the older
+/// generic distinctions because their recovery paths differ.
+pub fn claude_provider_status(error: PollError) -> ProviderStatus {
+    match error {
+        PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials => {
+            ProviderStatus::AuthenticationFailed
+        }
+        PollError::RateLimited(_) => ProviderStatus::RateLimited,
+        PollError::NetworkUnavailable => ProviderStatus::NetworkUnavailable,
         PollError::RequestFailed => ProviderStatus::RequestFailed,
     }
 }
 
 fn record_poll_error(data: &mut AppUsageData, error: PollError) {
-    if let PollError::RateLimited(retry_after_ms) = error {
-        data.rate_limited = true;
-        if let Some(retry_after_ms) = retry_after_ms {
-            data.rate_limit_retry_after_ms = Some(
-                data.rate_limit_retry_after_ms
-                    .map_or(retry_after_ms, |current| current.max(retry_after_ms)),
-            );
-        }
+    if matches!(error, PollError::AuthRequired | PollError::AuthForbidden) {
+        data.remote_auth_rejection = true;
     }
 }
 
@@ -409,6 +455,32 @@ fn token_hash(token: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     token.hash(&mut hasher);
     hasher.finish()
+}
+
+fn note_claude_auth_candidate(token_hash: u64) {
+    if let Ok(mut state) = claude_poll_state().lock() {
+        if state.auth_rejected_token_hash != Some(token_hash) {
+            state.auth_rejected_token_hash = None;
+        }
+    }
+}
+
+fn record_claude_auth_rejection(token_hash: u64) {
+    if let Ok(mut state) = claude_poll_state().lock() {
+        state.auth_rejected_token_hash = Some(token_hash);
+    }
+}
+
+fn clear_claude_auth_rejection() {
+    if let Ok(mut state) = claude_poll_state().lock() {
+        state.auth_rejected_token_hash = None;
+    }
+}
+
+fn claude_auth_rejection_matches(token_hash: u64) -> bool {
+    claude_poll_state()
+        .lock()
+        .is_ok_and(|state| state.auth_rejected_token_hash == Some(token_hash))
 }
 
 fn claude_poll_interval_ms(cached: &CachedClaudeUsage) -> u64 {
@@ -589,16 +661,34 @@ fn claude_rate_limit_remaining_ms(token_hash: u64) -> Option<u32> {
 }
 
 fn poll_claude_code(force_refresh: bool) -> Result<UsageData, PollError> {
-    let creds = match read_first_credentials() {
-        Some(c) => c,
-        None => {
-            diagnose::log("poll failed: no Claude credentials found");
+    let creds = match select_claude_credentials() {
+        ClaudeCredentialSelection::Usable(creds) => creds,
+        ClaudeCredentialSelection::Refreshable(creds) => {
+            diagnose::log(format!(
+                "Claude access credential is locally expired; confirming with the usage endpoint source={}",
+                creds.source.diagnostic_label()
+            ));
+            creds
+        }
+        ClaudeCredentialSelection::LoginRequired { source, problem } => {
+            let source = source
+                .as_ref()
+                .map(CredentialSource::diagnostic_label)
+                .unwrap_or_else(|| "none".to_string());
+            diagnose::log(format!(
+                "Claude credential is not usable source={source} reason={}",
+                problem.code()
+            ));
+            if let Some(result) = try_claude_desktop(force_refresh) {
+                return result;
+            }
+            clear_claude_auth_rejection();
             return Err(PollError::NoCredentials);
         }
     };
 
-    let creds = refresh_or_fallback(creds)?;
     let token_hash = token_hash(&creds.access_token);
+    note_claude_auth_candidate(token_hash);
     if let Some(remaining_ms) = claude_rate_limit_remaining_ms(token_hash) {
         diagnose::log(format!(
             "Claude usage poll skipped; rate-limit backoff remaining={}s",
@@ -612,8 +702,57 @@ fn poll_claude_code(force_refresh: bool) -> Result<UsageData, PollError> {
 
     match fetch_usage_with_fallback(&creds.access_token) {
         Ok(data) => {
+            clear_claude_auth_rejection();
             store_cached_claude_usage(token_hash, &data);
             Ok(data)
+        }
+        Err(PollError::AuthRequired | PollError::AuthForbidden) => {
+            if should_auto_recover_claude(&creds.source) {
+                diagnose::log("Claude credential rejected; starting hidden `claude update`");
+                match recover_claude_credentials(&creds) {
+                    Ok((new_hash, data, update_result)) => {
+                        clear_claude_auth_rejection();
+                        store_cached_claude_usage(new_hash, &data);
+                        if let Some(update_result) = update_result {
+                            queue_claude_cli_update_notification(update_result);
+                        }
+                        diagnose::log(
+                            "Claude credential recovery succeeded and usage retry passed",
+                        );
+                        Ok(data)
+                    }
+                    Err(failure) => {
+                        let authentication_failure = matches!(
+                            failure.poll_error,
+                            PollError::AuthRequired
+                                | PollError::AuthForbidden
+                                | PollError::NoCredentials
+                        );
+                        if authentication_failure {
+                            if let Some(result) = try_claude_desktop(force_refresh) {
+                                return result;
+                            }
+                            record_claude_auth_rejection(token_hash);
+                        } else {
+                            clear_claude_auth_rejection();
+                        }
+                        diagnose::log(format!(
+                            "Claude credential recovery failed reason={}",
+                            failure.reason
+                        ));
+                        Err(failure.poll_error)
+                    }
+                }
+            } else {
+                record_claude_auth_rejection(token_hash);
+                diagnose::log(
+                    "Claude credential rejected; credential source is WSL and CLI recovery is Windows-only",
+                );
+                if let Some(result) = try_claude_desktop(force_refresh) {
+                    return result;
+                }
+                Err(PollError::AuthRequired)
+            }
         }
         Err(PollError::RateLimited(retry_after_ms)) => {
             let delay_ms = store_claude_rate_limit(token_hash, retry_after_ms);
@@ -621,6 +760,145 @@ fn poll_claude_code(force_refresh: bool) -> Result<UsageData, PollError> {
         }
         Err(error) => Err(error),
     }
+}
+
+/// Tries Claude Desktop when it has a readable, eligible token cache. `None`
+/// means the normal CLI/WSL result remains authoritative; `Some` means at
+/// least one Desktop candidate was available and the enclosed result is
+/// authoritative.
+fn try_claude_desktop(force_refresh: bool) -> Option<Result<UsageData, PollError>> {
+    if !claude_desktop::enabled() {
+        return None;
+    }
+
+    let candidates = match claude_desktop::read_candidates(now_unix_millis()) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            diagnose::log(format!(
+                "Claude Desktop credentials unavailable reason={}",
+                error.code()
+            ));
+            return None;
+        }
+    };
+    diagnose::log(format!(
+        "Claude Desktop credentials found {} eligible access-token candidate(s)",
+        candidates.len()
+    ));
+    Some(poll_claude_desktop_candidates(candidates, force_refresh))
+}
+
+fn poll_claude_desktop_candidates(
+    candidates: Vec<claude_desktop::DesktopTokenCandidate>,
+    force_refresh: bool,
+) -> Result<UsageData, PollError> {
+    let mut last_auth_rejection = None;
+
+    for candidate in candidates {
+        let token_hash = token_hash(candidate.access_token());
+        note_claude_auth_candidate(token_hash);
+        if let Some(remaining_ms) = claude_rate_limit_remaining_ms(token_hash) {
+            return Err(PollError::RateLimited(Some(remaining_ms)));
+        }
+        if let Some(cached) = cached_claude_usage(token_hash, force_refresh) {
+            return Ok(cached);
+        }
+
+        diagnose::log(format!(
+            "Claude Desktop credential trying source={}",
+            candidate.source_label()
+        ));
+        match fetch_usage_with_fallback(candidate.access_token()) {
+            Ok(data) => {
+                clear_claude_auth_rejection();
+                store_cached_claude_usage(token_hash, &data);
+                diagnose::log("Claude Desktop credential usage retry succeeded");
+                return Ok(data);
+            }
+            Err(PollError::AuthRequired | PollError::AuthForbidden) => {
+                last_auth_rejection = Some(token_hash);
+            }
+            Err(PollError::RateLimited(retry_after_ms)) => {
+                let delay_ms = store_claude_rate_limit(token_hash, retry_after_ms);
+                return Err(PollError::RateLimited(Some(delay_ms)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(token_hash) = last_auth_rejection {
+        record_claude_auth_rejection(token_hash);
+        diagnose::log("Claude Desktop credentials exhausted rejected candidates");
+        Err(PollError::AuthRequired)
+    } else {
+        Err(PollError::NoCredentials)
+    }
+}
+
+fn should_auto_recover_claude(source: &CredentialSource) -> bool {
+    matches!(source, CredentialSource::Windows(_))
+}
+
+fn recover_claude_credentials(
+    previous: &Credentials,
+) -> Result<(u64, UsageData, Option<claude_cli::UpdateResult>), ClaudeRecoveryFailure> {
+    let previous_hash = token_hash(&previous.access_token);
+    if let Ok(current) = read_credentials_from_source(&previous.source) {
+        if token_hash(&current.access_token) != previous_hash {
+            diagnose::log(
+                "Claude credential changed during auth confirmation; retrying without CLI update",
+            );
+            return verify_recovered_claude_credentials(current, None);
+        }
+    }
+
+    let update_result = claude_cli::run_update().map_err(|reason| ClaudeRecoveryFailure {
+        reason,
+        poll_error: PollError::AuthRequired,
+    })?;
+    let refreshed = read_credentials_from_source(&previous.source).map_err(|problem| {
+        ClaudeRecoveryFailure {
+            reason: format!("credential_{}", problem.code()),
+            poll_error: PollError::AuthRequired,
+        }
+    })?;
+    if token_hash(&refreshed.access_token) == previous_hash {
+        return Err(ClaudeRecoveryFailure {
+            reason: "credential_unchanged".to_string(),
+            poll_error: PollError::AuthRequired,
+        });
+    }
+
+    verify_recovered_claude_credentials(refreshed, Some(update_result))
+}
+
+fn verify_recovered_claude_credentials(
+    refreshed: Credentials,
+    update_result: Option<claude_cli::UpdateResult>,
+) -> Result<(u64, UsageData, Option<claude_cli::UpdateResult>), ClaudeRecoveryFailure> {
+    let refreshed_hash = token_hash(&refreshed.access_token);
+    let usage = match fetch_usage_with_fallback(&refreshed.access_token) {
+        Ok(data) => data,
+        Err(PollError::RateLimited(retry_after_ms)) => {
+            let delay_ms = store_claude_rate_limit(refreshed_hash, retry_after_ms);
+            return Err(ClaudeRecoveryFailure {
+                reason: format!("usage_retry_rate_limited_{delay_ms}"),
+                poll_error: PollError::RateLimited(Some(delay_ms)),
+            });
+        }
+        Err(error) => {
+            return Err(ClaudeRecoveryFailure {
+                reason: format!("usage_retry_{error:?}"),
+                poll_error: error,
+            })
+        }
+    };
+    Ok((refreshed_hash, usage, update_result))
+}
+
+struct ClaudeRecoveryFailure {
+    reason: String,
+    poll_error: PollError,
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
@@ -643,7 +921,7 @@ fn poll_codex() -> Result<UsageData, PollError> {
             clear_auth_rejection(&CODEX_AUTH_REJECTION);
             Ok(data)
         }
-        Err(PollError::AuthRequired) => {
+        Err(PollError::AuthRequired | PollError::AuthForbidden) => {
             record_auth_rejection(&CODEX_AUTH_REJECTION, token_hash);
             diagnose::log(
                 "Codex usage endpoint returned auth required; automatic CLI refresh is disabled because it would require running a model-capable Codex command.",
@@ -673,7 +951,7 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
             clear_auth_rejection(&ANTIGRAVITY_AUTH_REJECTION);
             Ok(data)
         }
-        Err(PollError::AuthRequired) => {
+        Err(PollError::AuthRequired | PollError::AuthForbidden) => {
             record_auth_rejection(&ANTIGRAVITY_AUTH_REJECTION, token_hash);
             Err(PollError::AuthRequired)
         }
@@ -706,7 +984,7 @@ fn record_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>, 
     if let Ok(mut rejection) = state.lock() {
         *rejection = Some(AuthRejectionBackoff {
             token_hash,
-            retry_at: Instant::now() + Duration::from_secs(AUTH_REJECTION_RECHECK_SECS),
+            retry_at: Instant::now() + Duration::from_millis(u64::from(AUTH_REJECTION_RECHECK_MS)),
         });
     }
 }
@@ -719,23 +997,6 @@ fn clear_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>) {
     }
 }
 
-fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
-    loop {
-        if !is_token_expired(creds.expires_at) {
-            return Ok(creds);
-        }
-
-        let source = creds.source.clone();
-        diagnose::log(format!(
-            "Claude credentials from {source:?} are expired; automatic CLI refresh is disabled because it would require running a model-capable Claude command."
-        ));
-
-        match read_next_credentials_after(&source) {
-            Some(next) => creds = next,
-            None => return Err(PollError::TokenExpired),
-        }
-    }
-}
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -757,25 +1018,20 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
     }
 }
 
-fn build_agent() -> Result<ureq::Agent, PollError> {
-    build_agent_with_timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-}
-
-fn build_agent_with_timeout(timeout: Duration) -> Result<ureq::Agent, PollError> {
-    let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .tls_connector(std::sync::Arc::new(tls))
-        .build())
+fn build_agent_for_url(url: &str, timeout: Duration) -> Result<ureq::Agent, PollError> {
+    crate::http_client::build_agent(url, timeout).map_err(|error| {
+        diagnose::log_error("unable to initialize provider HTTP client", error);
+        PollError::NetworkUnavailable
+    })
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     let mut snapshot = match mode {
-        CredentialWatchMode::ActiveSource => claude_credential_watch_snapshot(true),
+        CredentialWatchMode::ClaudeSources => claude_credential_watch_snapshot(),
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
         CredentialWatchMode::AllProviders => {
-            let mut snapshot = claude_credential_watch_snapshot(false);
+            let mut snapshot = claude_credential_watch_snapshot();
             snapshot.push(codex_credential_watch_signature());
             snapshot.push(antigravity_credential_watch_signature());
             snapshot
@@ -786,18 +1042,19 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
     snapshot
 }
 
-fn claude_credential_watch_snapshot(active_only: bool) -> CredentialWatchSnapshot {
-    let sources = if active_only {
-        read_first_credentials()
-            .map(|creds| vec![creds.source])
-            .unwrap_or_else(all_known_credential_sources)
-    } else {
-        all_known_credential_sources()
-    };
-    sources
+fn claude_credential_watch_snapshot() -> CredentialWatchSnapshot {
+    let mut snapshot = all_known_credential_sources()
         .into_iter()
         .filter_map(|source| credential_watch_signature(&source))
-        .collect()
+        .collect::<Vec<_>>();
+    if claude_desktop::enabled() {
+        snapshot.extend(
+            claude_desktop::credential_watch_paths()
+                .into_iter()
+                .map(|path| windows_credential_watch_signature(&path)),
+        );
+    }
+    snapshot
 }
 
 fn all_known_credential_sources() -> Vec<CredentialSource> {
@@ -811,10 +1068,22 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     sources
 }
 
+fn claude_config_dir_from(configured: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    configured
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| home.map(|home| home.join(".claude")))
+}
+
+fn windows_claude_config_dir() -> Option<PathBuf> {
+    claude_config_dir_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
 fn windows_credential_source() -> Option<CredentialSource> {
-    let home = dirs::home_dir()?;
     Some(CredentialSource::Windows(
-        home.join(".claude").join(".credentials.json"),
+        windows_claude_config_dir()?.join(".credentials.json"),
     ))
 }
 
@@ -855,7 +1124,21 @@ fn content_watch_signature(key: &str, content: &[u8]) -> String {
     format!("{key}|present|{}|{}", content.len(), hasher.finish())
 }
 
-fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
+const WSL_CREDENTIAL_MISSING_EXIT: i32 = 44;
+const WSL_CREDENTIAL_UNREADABLE_EXIT: i32 = 45;
+const WSL_CREDENTIAL_READ_SCRIPT: &str = r#"
+config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+credential_path="$config_dir/.credentials.json"
+if [ ! -e "$credential_path" ]; then exit 44; fi
+if [ ! -r "$credential_path" ]; then exit 45; fi
+cat -- "$credential_path"
+"#;
+const WSL_CREDENTIAL_PATH_SCRIPT: &str = r#"
+config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+printf '%s\n' "$config_dir/.credentials.json"
+"#;
+
+fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialProblem> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
             .arg("-d")
@@ -863,25 +1146,58 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
             .arg("--")
             .arg("sh")
             .arg("-lc")
-            .arg("test -f ~/.claude/.credentials.json && cat ~/.claude/.credentials.json")
+            .arg(WSL_CREDENTIAL_READ_SCRIPT)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(5),
+    )
+    .ok_or(ClaudeCredentialProblem::Unreadable)?;
+
+    match output.status.code() {
+        Some(WSL_CREDENTIAL_MISSING_EXIT) => Err(ClaudeCredentialProblem::Missing),
+        Some(WSL_CREDENTIAL_UNREADABLE_EXIT) => Err(ClaudeCredentialProblem::Unreadable),
+        _ if output.status.success() => Ok(output.stdout),
+        _ => Err(ClaudeCredentialProblem::Unreadable),
+    }
+}
+
+fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
+    let output = run_with_timeout(
+        Command::new("wsl.exe")
+            .arg("-d")
+            .arg(distro)
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg(WSL_CREDENTIAL_PATH_SCRIPT)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
     )?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
 
-    let state = if output.status.success() {
-        let key = format!("wsl:{distro}");
-        return Some(content_watch_signature(&key, &output.stdout));
-    } else {
-        "missing".to_string()
-    };
-
-    Some(format!("wsl:{distro}|{state}"))
+fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
+    let key = format!("wsl:{distro}");
+    Some(match read_wsl_credential_bytes(distro) {
+        Ok(content) => content_watch_signature(&key, &content),
+        Err(problem) => format!("{key}|{}", problem.code()),
+    })
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    match try_usage_endpoint(token)? {
+    let result = fetch_claude_usage_with_auth_retry(
+        || try_usage_endpoint(token),
+        || std::thread::sleep(Duration::from_millis(AUTH_CONFIRM_RETRY_DELAY_MS)),
+    )?;
+    match result {
         Some(data) => {
             if data.windows.iter().any(|window| window.resets_at.is_none()) {
                 diagnose::log(
@@ -898,8 +1214,43 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
         }
     }
 }
+
+fn fetch_claude_usage_with_auth_retry(
+    mut fetch_once: impl FnMut() -> Result<Option<UsageData>, PollError>,
+    mut retry_wait: impl FnMut(),
+) -> Result<Option<UsageData>, PollError> {
+    let started = Instant::now();
+    match fetch_once() {
+        Err(PollError::AuthRequired) => {
+            diagnose::log(format!(
+                "Claude usage endpoint returned an unconfirmed auth error after {}ms; retrying once in {}ms",
+                started.elapsed().as_millis(),
+                AUTH_CONFIRM_RETRY_DELAY_MS
+            ));
+            retry_wait();
+            let result = fetch_once();
+            match &result {
+                Ok(_) => diagnose::log(format!(
+                    "Claude usage endpoint auth error did not repeat; total_elapsed_ms={}",
+                    started.elapsed().as_millis()
+                )),
+                Err(PollError::AuthRequired) => diagnose::log(format!(
+                    "Claude usage endpoint auth failure confirmed; total_elapsed_ms={}",
+                    started.elapsed().as_millis()
+                )),
+                Err(error) => diagnose::log(format!(
+                    "Claude usage endpoint auth confirmation returned a different result; total_elapsed_ms={} error={error:?}",
+                    started.elapsed().as_millis()
+                )),
+            }
+            result
+        }
+        result => result,
+    }
+}
+
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
-    let agent = build_agent()?;
+    let agent = build_agent_for_url(USAGE_URL, Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))?;
 
     let resp = match agent
         .get(USAGE_URL)
@@ -912,7 +1263,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, response)) => {
             match http_status_poll_error("Claude usage endpoint", code, &response) {
-                PollError::AuthRequired => return Err(PollError::AuthRequired),
+                auth @ (PollError::AuthRequired | PollError::AuthForbidden) => return Err(auth),
                 rate_limited @ PollError::RateLimited(_) => return Err(rate_limited),
                 _ => {
                     diagnose::log(
@@ -924,7 +1275,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         }
         Err(error) => {
             diagnose::log_error("Claude usage endpoint request failed", error);
-            return Ok(None);
+            return Err(PollError::NetworkUnavailable);
         }
     };
 
@@ -958,7 +1309,8 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
 
 fn classify_http_status(code: u16, retry_after_ms: Option<u32>) -> PollError {
     match code {
-        401 | 403 => PollError::AuthRequired,
+        401 => PollError::AuthRequired,
+        403 => PollError::AuthForbidden,
         429 => PollError::RateLimited(retry_after_ms),
         _ => PollError::RequestFailed,
     }
@@ -968,9 +1320,9 @@ fn http_status_poll_error(endpoint: &str, code: u16, response: &ureq::Response) 
     let retry_after_ms = (code == 429).then(|| retry_after_ms(response)).flatten();
     let error = classify_http_status(code, retry_after_ms);
     match error {
-        PollError::AuthRequired => diagnose::log(format!(
-            "{endpoint} returned auth error status {code}; re-login required"
-        )),
+        PollError::AuthRequired | PollError::AuthForbidden => {
+            diagnose::log(format!("{endpoint} returned auth error status {code}"))
+        }
         PollError::RateLimited(retry_after_ms) => diagnose::log(format!(
             "{endpoint} returned rate limit status 429; retry_after_ms={}",
             retry_after_ms
@@ -1041,11 +1393,14 @@ impl CodexAttemptError {
 }
 
 fn codex_http_status_is_retryable(code: u16) -> bool {
-    matches!(code, 502..=504)
+    matches!(code, 401 | 403 | 502..=504)
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
-    let agent = build_agent_with_timeout(Duration::from_secs(CODEX_REQUEST_TIMEOUT_SECS))?;
+    let agent = build_agent_for_url(
+        CODEX_USAGE_URL,
+        Duration::from_secs(CODEX_REQUEST_TIMEOUT_SECS),
+    )?;
     fetch_codex_usage_with_retry(
         || fetch_codex_usage_once(&agent, token, account_id),
         || std::thread::sleep(Duration::from_millis(CODEX_RETRY_DELAY_MS)),
@@ -1062,7 +1417,7 @@ fn fetch_codex_usage_with_retry(
         Err(CodexAttemptError::Final(error)) => Err(error),
         Err(CodexAttemptError::Retryable(_)) => {
             diagnose::log(format!(
-                "Codex usage endpoint transient failure after {}ms; retrying once in {}ms",
+                "Codex usage endpoint retryable failure after {}ms; retrying once in {}ms",
                 started.elapsed().as_millis(),
                 CODEX_RETRY_DELAY_MS
             ));
@@ -1114,7 +1469,7 @@ fn fetch_codex_usage_once(
         }
         Err(error) => {
             diagnose::log_error("Codex usage endpoint request failed", error);
-            return Err(CodexAttemptError::Retryable(PollError::RequestFailed));
+            return Err(CodexAttemptError::Retryable(PollError::NetworkUnavailable));
         }
     };
 
@@ -1187,7 +1542,10 @@ fn fetch_antigravity_usage_from_endpoint(
     base_url: &str,
     token: &str,
 ) -> Result<UsageData, PollError> {
-    let agent = build_agent_with_timeout(Duration::from_secs(ANTIGRAVITY_REQUEST_TIMEOUT_SECS))?;
+    let agent = build_agent_for_url(
+        base_url,
+        Duration::from_secs(ANTIGRAVITY_REQUEST_TIMEOUT_SECS),
+    )?;
     let project = fetch_antigravity_project(&agent, base_url, token)?;
     if let Some(project) = project.as_deref() {
         let per_model = match fetch_antigravity_user_quota(&agent, token, project) {
@@ -1244,7 +1602,7 @@ fn fetch_antigravity_user_quota(
         }
         Err(error) => {
             diagnose::log_error("Antigravity retrieveUserQuota request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(PollError::NetworkUnavailable);
         }
     };
 
@@ -1290,7 +1648,7 @@ fn fetch_antigravity_project(
         }
         Err(error) => {
             diagnose::log_error("Antigravity loadCodeAssist request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(PollError::NetworkUnavailable);
         }
     };
 
@@ -1333,7 +1691,7 @@ fn fetch_antigravity_model_quota(
         }
         Err(error) => {
             diagnose::log_error("Antigravity fetchAvailableModels request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(PollError::NetworkUnavailable);
         }
     };
 
@@ -1383,7 +1741,7 @@ fn fetch_antigravity_quota_summary(
         }
         Err(error) => {
             diagnose::log_error("Antigravity retrieveUserQuotaSummary request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(PollError::NetworkUnavailable);
         }
     };
 
@@ -1671,52 +2029,336 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
+#[derive(Clone)]
 struct Credentials {
     access_token: String,
-    expires_at: Option<i64>,
+    access_expires_at: Option<i64>,
+    refresh_token_present: bool,
+    refresh_token_expires_at: Option<i64>,
     source: CredentialSource,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CredentialSource {
     Windows(PathBuf),
     Wsl { distro: String },
 }
 
-fn read_first_credentials() -> Option<Credentials> {
-    if let Some(creds) = read_windows_credentials() {
-        return Some(creds);
-    }
-
-    for distro in list_wsl_distros() {
-        if let Some(creds) = read_wsl_credentials(&distro) {
-            return Some(creds);
+impl CredentialSource {
+    fn diagnostic_label(&self) -> String {
+        match self {
+            Self::Windows(path) => format!("windows:{}", path.display()),
+            Self::Wsl { distro } => format!("wsl:{distro}"),
         }
     }
-
-    None
 }
 
-fn read_windows_credentials() -> Option<Credentials> {
-    let CredentialSource::Windows(cred_path) = windows_credential_source()? else {
-        return None;
-    };
-    let content = match std::fs::read_to_string(&cred_path) {
-        Ok(content) => content,
-        Err(error) => {
-            if diagnose::is_enabled() {
-                diagnose::log_error(
-                    &format!(
-                        "unable to read Windows credentials at {}",
-                        cred_path.display()
-                    ),
-                    error,
-                );
-            }
-            return None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeCredentialProblem {
+    Missing,
+    Unreadable,
+    InvalidJson,
+    UnsupportedShape,
+    RefreshMissing,
+    RefreshExpired,
+}
+
+impl ClaudeCredentialProblem {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+            Self::InvalidJson => "invalid_json",
+            Self::UnsupportedShape => "unsupported_shape",
+            Self::RefreshMissing => "refresh_missing",
+            Self::RefreshExpired => "refresh_expired",
         }
-    };
-    parse_credentials(&content, CredentialSource::Windows(cred_path))
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Missing => 0,
+            Self::Unreadable | Self::InvalidJson | Self::UnsupportedShape => 1,
+            Self::RefreshMissing | Self::RefreshExpired => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeCredentialLifecycle {
+    Usable,
+    Refreshable,
+    LoginRequired(ClaudeCredentialProblem),
+}
+
+enum ClaudeCredentialSelection {
+    Usable(Credentials),
+    Refreshable(Credentials),
+    LoginRequired {
+        source: Option<CredentialSource>,
+        problem: ClaudeCredentialProblem,
+    },
+}
+
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn classify_claude_credentials(
+    credentials: &Credentials,
+    now_ms: i64,
+) -> ClaudeCredentialLifecycle {
+    if !timestamp_is_expired(credentials.access_expires_at, now_ms) {
+        return ClaudeCredentialLifecycle::Usable;
+    }
+    if !credentials.refresh_token_present {
+        return ClaudeCredentialLifecycle::LoginRequired(ClaudeCredentialProblem::RefreshMissing);
+    }
+    if timestamp_is_expired(credentials.refresh_token_expires_at, now_ms) {
+        return ClaudeCredentialLifecycle::LoginRequired(ClaudeCredentialProblem::RefreshExpired);
+    }
+    ClaudeCredentialLifecycle::Refreshable
+}
+
+fn select_claude_credentials() -> ClaudeCredentialSelection {
+    select_claude_credentials_at(now_unix_millis())
+}
+
+fn select_claude_credentials_at(now_ms: i64) -> ClaudeCredentialSelection {
+    let probes = all_known_credential_sources()
+        .into_iter()
+        .map(|source| {
+            let result = read_credentials_from_source(&source);
+            (source, result)
+        })
+        .collect::<Vec<_>>();
+    choose_claude_credentials(probes, now_ms)
+}
+
+fn choose_claude_credentials(
+    probes: impl IntoIterator<
+        Item = (
+            CredentialSource,
+            Result<Credentials, ClaudeCredentialProblem>,
+        ),
+    >,
+    now_ms: i64,
+) -> ClaudeCredentialSelection {
+    let mut refreshable = None;
+    let mut best_problem: Option<(Option<CredentialSource>, ClaudeCredentialProblem)> = None;
+
+    for (source, result) in probes {
+        match result {
+            Ok(credentials) => match classify_claude_credentials(&credentials, now_ms) {
+                ClaudeCredentialLifecycle::Usable => {
+                    return ClaudeCredentialSelection::Usable(credentials)
+                }
+                ClaudeCredentialLifecycle::Refreshable => {
+                    refreshable.get_or_insert(credentials);
+                }
+                ClaudeCredentialLifecycle::LoginRequired(problem) => {
+                    diagnose::log(format!(
+                        "Claude credential source rejected source={} reason={}",
+                        source.diagnostic_label(),
+                        problem.code()
+                    ));
+                    if best_problem
+                        .as_ref()
+                        .is_none_or(|(_, current)| problem.priority() > current.priority())
+                    {
+                        best_problem = Some((Some(source), problem));
+                    }
+                }
+            },
+            Err(problem) => {
+                diagnose::log(format!(
+                    "Claude credential source unavailable source={} reason={}",
+                    source.diagnostic_label(),
+                    problem.code()
+                ));
+                if best_problem
+                    .as_ref()
+                    .is_none_or(|(_, current)| problem.priority() > current.priority())
+                {
+                    best_problem = Some((Some(source), problem));
+                }
+            }
+        }
+    }
+
+    if let Some(credentials) = refreshable {
+        return ClaudeCredentialSelection::Refreshable(credentials);
+    }
+    let (source, problem) = best_problem.unwrap_or((None, ClaudeCredentialProblem::Missing));
+    ClaudeCredentialSelection::LoginRequired { source, problem }
+}
+
+fn read_credentials_from_source(
+    source: &CredentialSource,
+) -> Result<Credentials, ClaudeCredentialProblem> {
+    match source {
+        CredentialSource::Windows(path) => read_windows_credentials(path),
+        CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
+    }
+}
+
+fn read_windows_credentials(cred_path: &Path) -> Result<Credentials, ClaudeCredentialProblem> {
+    let content = std::fs::read_to_string(cred_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ClaudeCredentialProblem::Missing
+        } else {
+            ClaudeCredentialProblem::Unreadable
+        }
+    })?;
+    parse_credentials(&content, CredentialSource::Windows(cred_path.to_path_buf()))
+}
+
+fn diagnostic_expiry(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn diagnostic_first_line(bytes: &[u8]) -> Option<String> {
+    let line = String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(240)
+        .collect::<String>();
+    (!line.is_empty()).then_some(line)
+}
+
+fn run_diagnostic_command(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    run_with_timeout(
+        Command::new(program)
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(10),
+    )
+}
+
+/// User-triggered, read-only Claude login diagnostics. The report deliberately
+/// includes no credential values, account identifiers, or raw CLI output.
+/// `claude auth status` is non-model and is never called from background polls.
+pub fn claude_auth_diagnostics_report() -> String {
+    let now_ms = now_unix_millis();
+    let mut lines = vec![
+        "Claude authentication diagnostics".to_string(),
+        "ReadOnly: true".to_string(),
+    ];
+
+    let sources = all_known_credential_sources();
+    lines.push(format!("CredentialSourceCount: {}", sources.len()));
+    for (index, source) in sources.into_iter().enumerate() {
+        let path = match &source {
+            CredentialSource::Windows(path) => path.display().to_string(),
+            CredentialSource::Wsl { distro } => {
+                resolved_wsl_credential_path(distro).unwrap_or_else(|| "unavailable".to_string())
+            }
+        };
+        lines.push(format!("Source[{index}]: {}", source.diagnostic_label()));
+        lines.push(format!("Source[{index}].Path: {path}"));
+        match read_credentials_from_source(&source) {
+            Ok(credentials) => {
+                let remotely_rejected =
+                    claude_auth_rejection_matches(token_hash(&credentials.access_token));
+                let (state, reason) = if remotely_rejected {
+                    ("login_required", "auth_rejected")
+                } else {
+                    match classify_claude_credentials(&credentials, now_ms) {
+                        ClaudeCredentialLifecycle::Usable => ("usable", "none"),
+                        ClaudeCredentialLifecycle::Refreshable => ("refreshable", "none"),
+                        ClaudeCredentialLifecycle::LoginRequired(problem) => {
+                            ("login_required", problem.code())
+                        }
+                    }
+                };
+                lines.push(format!("Source[{index}].File: present"));
+                lines.push(format!("Source[{index}].State: {state}"));
+                lines.push(format!("Source[{index}].Reason: {reason}"));
+                lines.push(format!(
+                    "Source[{index}].AccessExpiresAtMs: {}",
+                    diagnostic_expiry(credentials.access_expires_at)
+                ));
+                lines.push(format!(
+                    "Source[{index}].RefreshTokenPresent: {}",
+                    credentials.refresh_token_present
+                ));
+                lines.push(format!(
+                    "Source[{index}].RefreshExpiresAtMs: {}",
+                    diagnostic_expiry(credentials.refresh_token_expires_at)
+                ));
+            }
+            Err(problem) => {
+                let file = if problem == ClaudeCredentialProblem::Missing {
+                    "missing"
+                } else {
+                    "unusable"
+                };
+                lines.push(format!("Source[{index}].File: {file}"));
+                lines.push(format!("Source[{index}].State: login_required"));
+                lines.push(format!("Source[{index}].Reason: {}", problem.code()));
+            }
+        }
+    }
+
+    let cli_path = run_diagnostic_command("where.exe", &["claude"])
+        .filter(|output| output.status.success())
+        .and_then(|output| diagnostic_first_line(&output.stdout));
+    lines.push(format!(
+        "ClaudeCliPath: {}",
+        cli_path.as_deref().unwrap_or("not_found")
+    ));
+
+    let cli_version = run_diagnostic_command("claude", &["--version"])
+        .filter(|output| output.status.success())
+        .and_then(|output| diagnostic_first_line(&output.stdout));
+    lines.push(format!(
+        "ClaudeCliVersion: {}",
+        cli_version.as_deref().unwrap_or("unavailable")
+    ));
+
+    match run_diagnostic_command("claude", &["auth", "status"]) {
+        Some(output) if output.status.success() => {
+            let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+            let logged_in = status
+                .as_ref()
+                .and_then(|value| value.get("loggedIn"))
+                .and_then(serde_json::Value::as_bool)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let auth_method = status
+                .as_ref()
+                .and_then(|value| value.get("authMethod"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    value
+                        .chars()
+                        .filter(|ch| !ch.is_control())
+                        .take(80)
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!("ClaudeAuthLoggedIn: {logged_in}"));
+            lines.push(format!("ClaudeAuthMethod: {auth_method}"));
+        }
+        Some(output) => lines.push(format!(
+            "ClaudeAuthStatus: failed_exit_{}",
+            output.status.code().unwrap_or(-1)
+        )),
+        None => lines.push("ClaudeAuthStatus: unavailable".to_string()),
+    }
+    lines.push("RecoveryCommand: claude auth login".to_string());
+    lines.join("\n")
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -1822,30 +2464,9 @@ fn read_windows_generic_credential_quiet(target: &str) -> Option<String> {
     result
 }
 
-fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
-    let output = run_with_timeout(
-        Command::new("wsl.exe")
-            .arg("-d")
-            .arg(distro)
-            .arg("--")
-            .arg("sh")
-            .arg("-lc")
-            .arg("cat ~/.claude/.credentials.json")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
-        Duration::from_secs(5),
-    )?;
-
-    if !output.status.success() {
-        diagnose::log(format!(
-            "WSL credentials probe failed for distro {distro} with status {}",
-            output.status
-        ));
-        return None;
-    }
-
-    let content = String::from_utf8(output.stdout).ok()?;
+fn read_wsl_credentials(distro: &str) -> Result<Credentials, ClaudeCredentialProblem> {
+    let bytes = read_wsl_credential_bytes(distro)?;
+    let content = String::from_utf8(bytes).map_err(|_| ClaudeCredentialProblem::InvalidJson)?;
     parse_credentials(
         &content,
         CredentialSource::Wsl {
@@ -1854,47 +2475,40 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
     )
 }
 
-fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credentials> {
-    let json: serde_json::Value = serde_json::from_str(content).ok()?;
-
-    let oauth = json.get("claudeAiOauth")?;
+fn parse_credentials(
+    content: &str,
+    source: CredentialSource,
+) -> Result<Credentials, ClaudeCredentialProblem> {
+    let json: serde_json::Value =
+        serde_json::from_str(content).map_err(|_| ClaudeCredentialProblem::InvalidJson)?;
+    let oauth = json
+        .get("claudeAiOauth")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ClaudeCredentialProblem::UnsupportedShape)?;
     let access_token = oauth
         .get("accessToken")
-        .and_then(|v| v.as_str())?
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or(ClaudeCredentialProblem::UnsupportedShape)?
         .to_string();
-    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+    let access_expires_at = oauth.get("expiresAt").and_then(serde_json::Value::as_i64);
+    // Never retain, log, or expose the refresh-token value. Presence and its
+    // expiry are sufficient to classify the recovery path.
+    let refresh_token_present = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    let refresh_token_expires_at = oauth
+        .get("refreshTokenExpiresAt")
+        .and_then(serde_json::Value::as_i64);
 
-    Some(Credentials {
+    Ok(Credentials {
         access_token,
-        expires_at,
+        access_expires_at,
+        refresh_token_present,
+        refresh_token_expires_at,
         source,
     })
-}
-
-fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
-    match source {
-        CredentialSource::Windows(_) => {
-            for distro in list_wsl_distros() {
-                if let Some(creds) = read_wsl_credentials(&distro) {
-                    return Some(creds);
-                }
-            }
-        }
-        CredentialSource::Wsl { distro } => {
-            let mut past_current = false;
-            for candidate_distro in list_wsl_distros() {
-                if !past_current {
-                    past_current = candidate_distro == *distro;
-                    continue;
-                }
-                if let Some(creds) = read_wsl_credentials(&candidate_distro) {
-                    return Some(creds);
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Installed distros change about as often as Windows itself, but every
@@ -2009,13 +2623,8 @@ fn looks_like_utf16le(bytes: &[u8]) -> bool {
     nul_high_bytes * 2 >= units
 }
 
-fn is_token_expired(expires_at: Option<i64>) -> bool {
-    let Some(exp) = expires_at else { return false };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    now >= exp
+fn timestamp_is_expired(expires_at: Option<i64>, now_ms: i64) -> bool {
+    expires_at.is_some_and(|expires_at| now_ms >= expires_at)
 }
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
@@ -2130,7 +2739,7 @@ fn is_leap(y: u64) -> bool {
 /// and floating surfaces compact.
 #[cfg(test)]
 fn format_line(section: &UsageWindow) -> String {
-    let pct = format!("{:.0}%", section.percentage);
+    let pct = crate::compact_view::display_percent_text(section.percentage);
     let cd = format_countdown(section.resets_at);
     if cd.is_empty() {
         pct
@@ -2164,37 +2773,45 @@ fn format_countdown_from_secs(total_secs: u64) -> String {
     if total_secs == 0 {
         return "now".to_string();
     }
-    let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
 
-    if total_days >= 1 {
-        format!("{total_days}d")
-    } else if total_hours >= 1 {
-        format!("{total_hours}h")
-    } else if total_mins >= 1 {
-        format!("{total_mins}m")
+    // All relative-time surfaces use the same display bucket: once seconds
+    // are hidden, a partial minute counts as the next minute. Derive the
+    // compact unit from that rounded value as well, otherwise 45m 01s becomes
+    // "45m" here while tooltips and the detail popup say "46m".
+    let total_minutes = display_minutes_from_secs(total_secs);
+    if total_minutes >= 24 * 60 {
+        format!("{}d", total_minutes / (24 * 60))
+    } else if total_minutes >= 60 {
+        format!("{}h", total_minutes / 60)
     } else {
-        format!("{total_secs}s")
+        format!("{total_minutes}m")
     }
 }
 
+/// Shared minute rounding policy for compact, tooltip, and detail surfaces.
+pub(crate) fn display_minutes_from_secs(total_secs: u64) -> u64 {
+    total_secs.div_ceil(60).max(1)
+}
+
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
-    let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
+    if total_secs <= 60 {
+        return Duration::from_secs(1);
+    }
 
-    let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
-        total_hours * 3600
-    } else if total_mins >= 1 {
-        total_mins * 60
+    let total_minutes = display_minutes_from_secs(total_secs);
+    let next_bucket_minutes = if total_minutes >= 24 * 60 {
+        (total_minutes / (24 * 60)) * (24 * 60) - 1
+    } else if total_minutes >= 60 {
+        (total_minutes / 60) * 60 - 1
     } else {
-        total_secs
+        total_minutes - 1
     };
+    let next_bucket_secs = next_bucket_minutes.saturating_mul(60);
 
-    Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
+    Duration::from_secs(total_secs.saturating_sub(next_bucket_secs).max(1))
 }
 
 /// Returns true if any reported window has reached "now".
@@ -2209,6 +2826,133 @@ pub fn is_past_reset(data: &UsageData) -> bool {
 mod tests {
     use super::*;
 
+    fn test_credentials(
+        source: CredentialSource,
+        access_expires_at: Option<i64>,
+        refresh_token_present: bool,
+        refresh_token_expires_at: Option<i64>,
+    ) -> Credentials {
+        Credentials {
+            access_token: format!("test-token-{}", source.diagnostic_label()),
+            access_expires_at,
+            refresh_token_present,
+            refresh_token_expires_at,
+            source,
+        }
+    }
+
+    #[test]
+    fn claude_config_dir_prefers_the_supported_override_and_ignores_an_empty_one() {
+        let home = PathBuf::from(r"C:\Users\Example");
+        let configured = PathBuf::from(r"D:\ClaudeProfile");
+        assert_eq!(
+            claude_config_dir_from(Some(configured.clone()), Some(home.clone())),
+            Some(configured)
+        );
+        assert_eq!(
+            claude_config_dir_from(Some(PathBuf::new()), Some(home.clone())),
+            Some(home.join(".claude"))
+        );
+        assert_eq!(claude_config_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn wsl_read_watch_and_diagnostics_share_the_supported_config_resolution() {
+        for script in [WSL_CREDENTIAL_READ_SCRIPT, WSL_CREDENTIAL_PATH_SCRIPT] {
+            assert!(script.contains("${CLAUDE_CONFIG_DIR:-$HOME/.claude}"));
+            assert!(script.contains(".credentials.json"));
+        }
+    }
+
+    #[test]
+    fn claude_credential_parser_retains_only_refresh_presence_and_expiry() {
+        let source = CredentialSource::Windows(PathBuf::from("credentials.json"));
+        let credentials = parse_credentials(
+            r#"{"claudeAiOauth":{"accessToken":"access-value","expiresAt":2000,"refreshToken":"refresh-value","refreshTokenExpiresAt":3000}}"#,
+            source,
+        )
+        .expect("supported Claude credential shape");
+        assert_eq!(credentials.access_token, "access-value");
+        assert_eq!(credentials.access_expires_at, Some(2000));
+        assert!(credentials.refresh_token_present);
+        assert_eq!(credentials.refresh_token_expires_at, Some(3000));
+    }
+
+    #[test]
+    fn claude_credential_parser_distinguishes_invalid_json_from_an_unsupported_shape() {
+        let source = CredentialSource::Windows(PathBuf::from("credentials.json"));
+        assert!(matches!(
+            parse_credentials("not json", source.clone()),
+            Err(ClaudeCredentialProblem::InvalidJson)
+        ));
+        assert!(matches!(
+            parse_credentials(r#"{"claudeAiOauth":{}}"#, source),
+            Err(ClaudeCredentialProblem::UnsupportedShape)
+        ));
+    }
+
+    #[test]
+    fn claude_credential_lifecycle_uses_the_recorded_expiries_without_fixed_lifetimes() {
+        let source = CredentialSource::Windows(PathBuf::from("credentials.json"));
+        let usable = test_credentials(source.clone(), Some(2_000), false, None);
+        assert!(matches!(
+            classify_claude_credentials(&usable, 1_000),
+            ClaudeCredentialLifecycle::Usable
+        ));
+
+        let refreshable_unknown = test_credentials(source.clone(), Some(900), true, None);
+        assert!(matches!(
+            classify_claude_credentials(&refreshable_unknown, 1_000),
+            ClaudeCredentialLifecycle::Refreshable
+        ));
+
+        let no_refresh = test_credentials(source.clone(), Some(900), false, None);
+        assert!(matches!(
+            classify_claude_credentials(&no_refresh, 1_000),
+            ClaudeCredentialLifecycle::LoginRequired(ClaudeCredentialProblem::RefreshMissing)
+        ));
+
+        let refresh_expired = test_credentials(source, Some(900), true, Some(1_000));
+        assert!(matches!(
+            classify_claude_credentials(&refresh_expired, 1_000),
+            ClaudeCredentialLifecycle::LoginRequired(ClaudeCredentialProblem::RefreshExpired)
+        ));
+    }
+
+    #[test]
+    fn later_usable_claude_source_beats_earlier_invalid_or_refreshable_sources() {
+        let windows = CredentialSource::Windows(PathBuf::from("credentials.json"));
+        let wsl_refreshable = CredentialSource::Wsl {
+            distro: "refreshable".to_string(),
+        };
+        let wsl_usable = CredentialSource::Wsl {
+            distro: "usable".to_string(),
+        };
+        let probes = vec![
+            (windows, Err(ClaudeCredentialProblem::InvalidJson)),
+            (
+                wsl_refreshable.clone(),
+                Ok(test_credentials(
+                    wsl_refreshable,
+                    Some(900),
+                    true,
+                    Some(2_000),
+                )),
+            ),
+            (
+                wsl_usable.clone(),
+                Ok(test_credentials(wsl_usable, Some(2_000), false, None)),
+            ),
+        ];
+        match choose_claude_credentials(probes, 1_000) {
+            ClaudeCredentialSelection::Usable(credentials) => assert!(matches!(
+                credentials.source,
+                CredentialSource::Wsl { ref distro } if distro == "usable"
+            )),
+            _ => panic!("a later usable source must win"),
+        }
+    }
+
     #[test]
     fn compact_countdown_always_uses_english_units() {
         assert_eq!(format_countdown_from_secs(2 * 86_400), "2d");
@@ -2216,6 +2960,34 @@ mod tests {
         assert_eq!(format_countdown_from_secs(42 * 60), "42m");
         assert_eq!(format_countdown_from_secs(17), "17s");
         assert_eq!(format_countdown_from_secs(0), "now");
+    }
+
+    #[test]
+    fn compact_countdown_uses_the_shared_ceil_minute_policy() {
+        assert_eq!(format_countdown_from_secs(45 * 60), "45m");
+        assert_eq!(format_countdown_from_secs(45 * 60 + 1), "46m");
+        assert_eq!(format_countdown_from_secs(59 * 60 + 1), "1h");
+        assert_eq!(format_countdown_from_secs(23 * 60 * 60 + 59 * 60 + 1), "1d");
+    }
+
+    #[test]
+    fn compact_countdown_timer_follows_the_rounded_bucket_boundary() {
+        assert_eq!(
+            time_until_display_change_from_secs(45 * 60 + 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(45 * 60),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(60),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(60 * 60 + 1),
+            Duration::from_secs(61)
+        );
     }
 
     #[test]
@@ -2236,19 +3008,108 @@ mod tests {
             PollError::RateLimited(Some(120_000))
         );
         assert_eq!(classify_http_status(401, None), PollError::AuthRequired);
-        assert_eq!(classify_http_status(403, None), PollError::AuthRequired);
+        assert_eq!(classify_http_status(403, None), PollError::AuthForbidden);
         assert_eq!(classify_http_status(500, None), PollError::RequestFailed);
     }
 
     #[test]
-    fn codex_retries_only_transient_gateway_statuses() {
+    fn claude_cli_recovery_is_limited_to_windows_credentials() {
+        let windows =
+            CredentialSource::Windows(PathBuf::from(r"C:\Users\test\.claude\.credentials.json"));
+        let wsl = CredentialSource::Wsl {
+            distro: "Ubuntu".to_string(),
+        };
+
+        assert!(should_auto_recover_claude(&windows));
+        assert!(!should_auto_recover_claude(&wsl));
+    }
+
+    #[test]
+    fn codex_retries_auth_and_transient_gateway_statuses() {
+        assert!(codex_http_status_is_retryable(401));
+        assert!(codex_http_status_is_retryable(403));
         assert!(codex_http_status_is_retryable(502));
         assert!(codex_http_status_is_retryable(503));
         assert!(codex_http_status_is_retryable(504));
-        assert!(!codex_http_status_is_retryable(401));
-        assert!(!codex_http_status_is_retryable(403));
         assert!(!codex_http_status_is_retryable(429));
         assert!(!codex_http_status_is_retryable(500));
+    }
+
+    #[test]
+    fn claude_auth_failure_retries_once_and_recovers() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u8);
+        let waits = Cell::new(0_u8);
+        let data = fetch_claude_usage_with_auth_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(PollError::AuthRequired)
+                } else {
+                    Ok(Some(usage_with_percent(42.0)))
+                }
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .expect("second Claude attempt should recover")
+        .expect("second Claude attempt should return usage");
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(data.windows[0].percentage, 42.0);
+    }
+
+    #[test]
+    fn claude_auth_confirmation_returns_the_second_attempt_error() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u8);
+        let waits = Cell::new(0_u8);
+        let error = fetch_claude_usage_with_auth_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(PollError::AuthRequired)
+                } else {
+                    Err(PollError::RequestFailed)
+                }
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .expect_err("the second Claude attempt should determine the result");
+
+        assert_eq!(error, PollError::RequestFailed);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(waits.get(), 1);
+    }
+
+    #[test]
+    fn claude_non_401_failures_are_not_retried() {
+        use std::cell::Cell;
+
+        for expected in [
+            PollError::AuthForbidden,
+            PollError::NoCredentials,
+            PollError::RateLimited(None),
+            PollError::NetworkUnavailable,
+            PollError::RequestFailed,
+        ] {
+            let attempts = Cell::new(0_u8);
+            let waits = Cell::new(0_u8);
+            let error = fetch_claude_usage_with_auth_retry(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(expected)
+                },
+                || waits.set(waits.get() + 1),
+            )
+            .expect_err("non-auth Claude failures should be returned immediately");
+
+            assert_eq!(error, expected);
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(waits.get(), 0);
+        }
     }
 
     #[test]
@@ -2276,6 +3137,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_auth_confirmation_returns_the_second_attempt_error() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u8);
+        let waits = Cell::new(0_u8);
+        let error = fetch_codex_usage_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(CodexAttemptError::Retryable(PollError::AuthRequired))
+                } else {
+                    Err(CodexAttemptError::Final(PollError::RequestFailed))
+                }
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .expect_err("the second Codex attempt should determine the result");
+
+        assert_eq!(error, PollError::RequestFailed);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(waits.get(), 1);
+    }
+
+    #[test]
     fn codex_final_failure_is_not_retried() {
         use std::cell::Cell;
 
@@ -2284,15 +3169,20 @@ mod tests {
         let error = fetch_codex_usage_with_retry(
             || {
                 attempts.set(attempts.get() + 1);
-                Err(CodexAttemptError::Final(PollError::AuthRequired))
+                Err(CodexAttemptError::Final(PollError::RateLimited(None)))
             },
             || waits.set(waits.get() + 1),
         )
-        .expect_err("auth failures must not be retried");
+        .expect_err("final failures must not be retried");
 
-        assert_eq!(error, PollError::AuthRequired);
+        assert_eq!(error, PollError::RateLimited(None));
         assert_eq!(attempts.get(), 1);
         assert_eq!(waits.get(), 0);
+    }
+
+    #[test]
+    fn auth_rejection_recheck_is_exposed_in_milliseconds() {
+        assert_eq!(AUTH_REJECTION_RECHECK_MS, 15 * 60 * 1_000);
     }
 
     #[test]
@@ -2552,7 +3442,10 @@ mod tests {
         .expect("codex data should keep the poll successful");
 
         assert!(data.claude_code.is_none());
-        assert_eq!(data.claude_code_error, Some(ProviderStatus::AuthRequired));
+        assert_eq!(
+            data.claude_code_error,
+            Some(ProviderStatus::AuthenticationFailed)
+        );
         assert!(data.codex_error.is_none());
         assert_eq!(data.codex.unwrap().windows[0].percentage, 42.0);
     }
@@ -2588,8 +3481,8 @@ mod tests {
         assert!(data.claude_code.is_none());
         assert_eq!(data.claude_code_error, Some(ProviderStatus::RateLimited));
         assert_eq!(data.codex.unwrap().windows[0].percentage, 42.0);
-        assert!(data.rate_limited);
-        assert_eq!(data.rate_limit_retry_after_ms, Some(120_000));
+        assert_eq!(data.claude_code_retry_after_ms, Some(120_000));
+        assert_eq!(data.codex_retry_after_ms, None);
     }
     #[test]
     fn mixed_all_provider_failure_does_not_claim_every_provider_needs_login() {
@@ -2606,7 +3499,7 @@ mod tests {
         assert_eq!(failure.error, PollError::RequestFailed);
         assert_eq!(
             failure.data.claude_code_error,
-            Some(ProviderStatus::AuthRequired)
+            Some(ProviderStatus::AuthenticationFailed)
         );
         assert_eq!(
             failure.data.codex_error,
@@ -2614,7 +3507,7 @@ mod tests {
         );
         assert_eq!(
             failure.data.antigravity_error,
-            Some(ProviderStatus::AuthRequired)
+            Some(ProviderStatus::AuthenticationFailed)
         );
     }
 
@@ -2626,14 +3519,26 @@ mod tests {
             true,
             || Err(PollError::AuthRequired),
             || Err(PollError::NoCredentials),
-            || Err(PollError::TokenExpired),
+            || Err(PollError::AuthRequired),
         )
         .expect_err("all-provider authentication failure should return an error");
 
         assert!(matches!(
             failure.error,
-            PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired
+            PollError::AuthRequired | PollError::NoCredentials
         ));
+        assert_eq!(
+            failure.data.claude_code_error,
+            Some(ProviderStatus::AuthenticationFailed)
+        );
+        assert_eq!(
+            failure.data.codex_error,
+            Some(ProviderStatus::AuthenticationFailed)
+        );
+        assert_eq!(
+            failure.data.antigravity_error,
+            Some(ProviderStatus::AuthenticationFailed)
+        );
     }
 
     #[test]

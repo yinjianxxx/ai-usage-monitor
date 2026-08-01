@@ -271,8 +271,21 @@ try {
     if ($Scenario -eq 'ChildExit') {
         Remove-Item -LiteralPath $parentMarker -Force
     }
-    $parentProcess.Kill()
-    if (-not $parentProcess.WaitForExit(5000)) {
+    # The parent can cross into the exited state between HasExited and Kill().
+    # Treat that as a successful release; only fail when it is still alive
+    # after Kill itself failed.
+    if (-not $parentProcess.HasExited) {
+        try {
+            $parentProcess.Kill()
+        }
+        catch {
+            $parentProcess.Refresh()
+            if (-not $parentProcess.HasExited) {
+                throw "Unable to release the old parent fixture $($parentProcess.Id): $_"
+            }
+        }
+    }
+    if (-not $parentProcess.HasExited -and -not $parentProcess.WaitForExit(5000)) {
         throw 'The old parent fixture did not exit within five seconds.'
     }
 

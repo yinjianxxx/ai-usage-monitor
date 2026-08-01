@@ -1,4 +1,13 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use windows::core::PCWSTR;
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
@@ -63,6 +72,128 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
         )
     });
     taskbars
+}
+
+fn wide_array_to_string(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
+}
+
+/// Resolve a GDI display name (for example `\\.\DISPLAY1`) to the more
+/// stable monitor device path exposed by DisplayConfig. DisplayConfig can be
+/// transiently unavailable during shell/display rebuilds, so callers must
+/// retain the GDI name as a fallback identity.
+fn query_stable_monitor_device_path(gdi_device_name: &str) -> Option<String> {
+    unsafe {
+        let mut path_count = 0u32;
+        let mut mode_count = 0u32;
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count).0
+            != 0
+        {
+            return None;
+        }
+
+        // The display topology can change between the size query and the
+        // data query. Retry with fresh buffer sizes instead of treating that
+        // ordinary race as a permanent identity failure.
+        for _ in 0..3 {
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+            let mut actual_path_count = path_count;
+            let mut actual_mode_count = mode_count;
+            let result = QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut actual_path_count,
+                paths.as_mut_ptr(),
+                &mut actual_mode_count,
+                modes.as_mut_ptr(),
+                None,
+            );
+            if result.0 != 0 {
+                if GetDisplayConfigBufferSizes(
+                    QDC_ONLY_ACTIVE_PATHS,
+                    &mut path_count,
+                    &mut mode_count,
+                )
+                .0 != 0
+                {
+                    return None;
+                }
+                continue;
+            }
+            paths.truncate(actual_path_count as usize);
+
+            for path in paths {
+                let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                    header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                        size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                        adapterId: path.sourceInfo.adapterId,
+                        id: path.sourceInfo.id,
+                    },
+                    ..Default::default()
+                };
+                if DisplayConfigGetDeviceInfo(&mut source.header) != 0
+                    || !wide_array_to_string(&source.viewGdiDeviceName)
+                        .eq_ignore_ascii_case(gdi_device_name)
+                {
+                    continue;
+                }
+
+                let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+                    header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                        size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                        adapterId: path.targetInfo.adapterId,
+                        id: path.targetInfo.id,
+                    },
+                    ..Default::default()
+                };
+                if DisplayConfigGetDeviceInfo(&mut target.header) != 0 {
+                    continue;
+                }
+                let device_path = wide_array_to_string(&target.monitorDevicePath);
+                if !device_path.is_empty() {
+                    return Some(device_path);
+                }
+            }
+            return None;
+        }
+        None
+    }
+}
+
+static MONITOR_DEVICE_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> =
+    OnceLock::new();
+
+pub fn stable_monitor_device_path(gdi_device_name: &str) -> Option<String> {
+    let cache = MONITOR_DEVICE_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(gdi_device_name)
+        .cloned()
+    {
+        return cached;
+    }
+    let resolved = query_stable_monitor_device_path(gdi_device_name);
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(gdi_device_name.to_string(), resolved.clone());
+    resolved
+}
+
+pub fn clear_monitor_device_path_cache() {
+    if let Some(cache) = MONITOR_DEVICE_PATH_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
 
 /// Find a child window by class name

@@ -214,6 +214,7 @@ pub fn credential_consent_copy(language: LanguageId) -> CredentialConsentCopy {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Strings {
+    pub locale_name: &'static str,
     pub window_title: &'static str,
     pub refresh: &'static str,
     pub refresh_now: &'static str,
@@ -228,9 +229,14 @@ pub struct Strings {
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
     pub settings: &'static str,
+    pub settings_storage_failed: &'static str,
     pub start_with_windows: &'static str,
-    pub reset_widget_position: &'static str,
-    pub reset_floating_position: &'static str,
+    pub widget_default_position: &'static str,
+    pub floating_default_position: &'static str,
+    pub primary_taskbar_left: &'static str,
+    pub primary_taskbar_right: &'static str,
+    pub primary_display_bottom_left: &'static str,
+    pub primary_display_bottom_right: &'static str,
     pub language: &'static str,
     pub system_default: &'static str,
     pub check_for_updates: &'static str,
@@ -251,6 +257,9 @@ pub struct Strings {
     pub notifications: &'static str,
     pub notify_session_reset: &'static str,
     pub notify_weekly_reset: &'static str,
+    pub notify_claude_cli_update: &'static str,
+    pub claude_cli_updated_title: &'static str,
+    pub claude_cli_updated_body: &'static str,
     pub reset_notification_title: &'static str,
     pub reset_notification_body: &'static str,
     pub session_window: &'static str,
@@ -260,18 +269,23 @@ pub struct Strings {
     pub hour_suffix: &'static str,
     pub minute_suffix: &'static str,
     pub second_suffix: &'static str,
-    pub token_expired_title: &'static str,
-    pub token_expired_body: &'static str,
-    pub codex_token_expired_title: &'static str,
-    pub codex_token_expired_body: &'static str,
-    pub antigravity_token_expired_title: &'static str,
-    pub antigravity_token_expired_body: &'static str,
-    pub codex_window_title: &'static str,
-    pub antigravity_window_title: &'static str,
     // Detail popup (tray left-click) strings.
     pub detail_waiting: &'static str,
-    pub detail_auth_required: &'static str,
-    pub detail_sign_in_hint: &'static str,
+    pub detail_unavailable: &'static str,
+    pub detail_temporarily_unavailable: &'static str,
+    pub detail_pin_action: &'static str,
+    pub detail_unpin_action: &'static str,
+    pub detail_lock_position_action: &'static str,
+    pub detail_unlock_position_action: &'static str,
+    pub detail_close_action: &'static str,
+    pub detail_refreshing: &'static str,
+    pub detail_network_action: &'static str,
+    pub detail_network_outcome: &'static str,
+    pub detail_badge_auth_failed: &'static str,
+    pub detail_claude_login_action: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub detail_sign_in_again_action: &'static str,
+    pub detail_monitoring_resumes: &'static str,
     pub detail_reset_unavailable: &'static str,
     /// "{duration}" is replaced with a relative countdown like "2h 13m".
     pub detail_resets_in: &'static str,
@@ -282,15 +296,11 @@ pub struct Strings {
     pub detail_next_in: &'static str,
     /// "{interval}" is replaced with the poll interval like "15m".
     pub detail_poll_every: &'static str,
-    pub detail_rate_limited: &'static str,
-    pub detail_badge_rate_limited: &'static str,
-    pub detail_badge_error: &'static str,
-    pub detail_badge_loading: &'static str,
+    pub detail_some_not_updated: &'static str,
+    pub detail_all_not_updated: &'static str,
+    pub detail_badge_stale: &'static str,
     pub detail_badge_near_limit: &'static str,
-    pub detail_badge_normal: &'static str,
-    pub detail_badge_unused: &'static str,
-    pub detail_badge_cached: &'static str,
-    pub detail_stale: &'static str,
+    pub detail_badge_limit_reached: &'static str,
     /// Short weekday names, Sunday first (SYSTEMTIME::wDayOfWeek order).
     pub weekdays: [&'static str; 7],
 }
@@ -374,5 +384,215 @@ fn default_locale_name() -> Option<LanguageId> {
         }
         let locale = String::from_utf16_lossy(&buffer[..(len as usize - 1)]);
         LanguageId::from_code(&locale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_status_copy_is_complete_in_every_language() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            for value in [
+                strings.detail_badge_auth_failed,
+                strings.detail_badge_limit_reached,
+                strings.detail_badge_stale,
+                strings.detail_unavailable,
+                strings.detail_temporarily_unavailable,
+                strings.detail_network_outcome,
+                strings.detail_some_not_updated,
+                strings.detail_all_not_updated,
+                strings.detail_claude_login_action,
+                strings.detail_monitoring_resumes,
+                strings.notify_claude_cli_update,
+                strings.claude_cli_updated_title,
+                strings.claude_cli_updated_body,
+            ] {
+                assert!(
+                    !value.trim().is_empty(),
+                    "missing copy for {}",
+                    language.code()
+                );
+            }
+            assert!(strings.detail_claude_login_action.contains("Claude"));
+            assert!(strings.detail_sign_in_again_action.contains("{provider}"));
+        }
+    }
+
+    #[test]
+    fn compact_quota_window_labels_are_identical_in_every_language() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert_eq!(strings.session_window, "5h", "{} session", language.code());
+            assert_eq!(strings.weekly_window, "7d", "{} weekly", language.code());
+        }
+    }
+
+    #[test]
+    fn english_claude_update_notification_copy_is_complete() {
+        let strings = LanguageId::English.strings();
+        assert!(strings.notify_claude_cli_update.contains("Claude Code"));
+    }
+
+    #[test]
+    fn simplified_chinese_claude_recovery_copy_matches_the_approved_short_form() {
+        let strings = LanguageId::SimplifiedChinese.strings();
+        assert_eq!(strings.detail_badge_auth_failed, "认证失败");
+        assert_eq!(strings.detail_badge_stale, "刷新失败");
+        assert_eq!(strings.detail_network_action, "请检查网络连接");
+        assert_eq!(strings.detail_claude_login_action, "请重新登录 Claude");
+        assert_eq!(strings.detail_sign_in_again_action, "请重新登录 {provider}");
+        assert_eq!(strings.detail_monitoring_resumes, "登录后自动恢复");
+    }
+
+    #[test]
+    fn compact_surface_names_match_the_approved_menu_system_in_every_language() {
+        let cases = [
+            (
+                LanguageId::English,
+                [
+                    "Provider tray icons",
+                    "Taskbar widget",
+                    "Floating window",
+                    "Taskbar widget position",
+                    "Floating window position",
+                ],
+            ),
+            (
+                LanguageId::Dutch,
+                [
+                    "Systeemvakpictogrammen per aanbieder",
+                    "Taakbalkwidget",
+                    "Zwevend venster",
+                    "Positie taakbalkwidget",
+                    "Positie zwevend venster",
+                ],
+            ),
+            (
+                LanguageId::Spanish,
+                [
+                    "Iconos de proveedores en la bandeja",
+                    "Widget de la barra de tareas",
+                    "Ventana flotante",
+                    "Posición del widget de la barra de tareas",
+                    "Posición de la ventana flotante",
+                ],
+            ),
+            (
+                LanguageId::French,
+                [
+                    "Icônes des fournisseurs dans la zone de notification",
+                    "Widget de la barre des tâches",
+                    "Fenêtre flottante",
+                    "Position du widget de la barre des tâches",
+                    "Position de la fenêtre flottante",
+                ],
+            ),
+            (
+                LanguageId::German,
+                [
+                    "Anbietersymbole im Infobereich",
+                    "Taskleisten-Widget",
+                    "Schwebendes Fenster",
+                    "Position des Taskleisten-Widgets",
+                    "Position des schwebenden Fensters",
+                ],
+            ),
+            (
+                LanguageId::Japanese,
+                [
+                    "プロバイダー別の通知領域アイコン",
+                    "タスクバー ウィジェット",
+                    "フローティングウィンドウ",
+                    "タスクバー ウィジェットの位置",
+                    "フローティングウィンドウの位置",
+                ],
+            ),
+            (
+                LanguageId::Korean,
+                [
+                    "서비스별 알림 영역 아이콘",
+                    "작업 표시줄 위젯",
+                    "플로팅 창",
+                    "작업 표시줄 위젯 위치",
+                    "플로팅 창 위치",
+                ],
+            ),
+            (
+                LanguageId::SimplifiedChinese,
+                [
+                    "服务商托盘图标",
+                    "任务栏小组件",
+                    "桌面浮窗",
+                    "任务栏小组件位置",
+                    "桌面浮窗位置",
+                ],
+            ),
+            (
+                LanguageId::TraditionalChinese,
+                [
+                    "服務商系統匣圖示",
+                    "工作列小工具",
+                    "桌面浮窗",
+                    "工作列小工具位置",
+                    "桌面浮窗位置",
+                ],
+            ),
+            (
+                LanguageId::Russian,
+                [
+                    "Значки провайдеров в области уведомлений",
+                    "Виджет панели задач",
+                    "Плавающее окно",
+                    "Положение виджета панели задач",
+                    "Положение плавающего окна",
+                ],
+            ),
+            (
+                LanguageId::PortugueseBrazil,
+                [
+                    "Ícones dos provedores na bandeja",
+                    "Widget da barra de tarefas",
+                    "Janela flutuante",
+                    "Posição do widget da barra de tarefas",
+                    "Posição da janela flutuante",
+                ],
+            ),
+        ];
+
+        for (language, expected) in cases {
+            let strings = language.strings();
+            assert_eq!(
+                [
+                    strings.detailed_tray_icons,
+                    strings.show_widget,
+                    strings.show_floating_monitor,
+                    strings.widget_default_position,
+                    strings.floating_default_position,
+                ],
+                expected,
+                "{}",
+                strings.locale_name
+            );
+        }
+    }
+
+    #[test]
+    fn taskbar_default_labels_name_primary_display_edges() {
+        let english = LanguageId::English.strings();
+        assert_eq!(
+            english.primary_taskbar_left,
+            "Left Side of Primary Display Taskbar"
+        );
+        assert_eq!(
+            english.primary_taskbar_right,
+            "Right Side of Primary Display Taskbar"
+        );
+
+        let simplified = LanguageId::SimplifiedChinese.strings();
+        assert_eq!(simplified.primary_taskbar_left, "主屏幕任务栏左侧");
+        assert_eq!(simplified.primary_taskbar_right, "主屏幕任务栏右侧");
     }
 }
