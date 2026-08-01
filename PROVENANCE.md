@@ -50,7 +50,11 @@ taskbar. Only a user drag or **Reset Position** updates the saved anchor.
 ## Third-party provenance
 
 - The main codebase derives from CodeZeno/Claude-Code-Usage-Monitor v1.4.8 (commit `9b29972`).
-- The tray-icon presentation and Claude OAuth usage polling, caching, cooldown, and HTTP 429 handling were adapted from or informed by [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude).
+- The tray-icon presentation and Claude OAuth usage polling, caching, cooldown,
+  HTTP 429 handling, and automatic `claude update` credential-recovery pattern
+  were adapted from or informed by
+  [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)
+  at commit `a3503e9a49c0028d8c5db6897dcd3964746bdd15`.
 - Complete notices are provided in `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `DEPENDENCY_LICENSES.md`.
 
 ## Build

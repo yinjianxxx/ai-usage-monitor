@@ -41,7 +41,7 @@ usage and reset cycles.
 
 |  | Dark | Light |
 | ---: | :--- | :--- |
-| **Taskbar widget** | <img src=".github/readme/widget-badges-dark.png" alt="Taskbar widget, dark theme: one badge per provider with logo, window label, and usage percentage"> | <img src=".github/readme/widget-badges-light.png" alt="Taskbar widget, light theme"> |
+| **Taskbar widget** | <img src=".github/readme/widget-badges-dark.png" alt="Taskbar widget, dark theme: one badge per provider with logo, window label, usage percentage, and reset countdown"> | <img src=".github/readme/widget-badges-light.png" alt="Taskbar widget, light theme"> |
 | **Floating window** | <img src=".github/readme/floating-rows-dark.png" alt="Floating window, dark theme: up to two quota windows per provider with percentages, countdowns, and micro gauges"> | <img src=".github/readme/floating-rows-light.png" alt="Floating window, light theme"> |
 | **Tray icons** | <img src=".github/readme/tray-icons-dark.png" alt="Tray icons, dark theme: per-provider usage numbers over adaptive bars"> | <img src=".github/readme/tray-icons-light.png" alt="Tray icons, light theme"> |
 
@@ -51,7 +51,7 @@ show the exact pixels the shipped code draws. Regenerate them any time with
 [`tools/render-readme-images.ps1`](tools/render-readme-images.ps1).
 
 - **Taskbar widget.** Embeds in the taskbar itself: one content-sized badge
-  per provider showing its logo, quota-window label, and short-window usage.
+  per provider showing its logo, quota-window label, usage, and reset countdown.
   Hover a badge to see every reported window with reset times. Drag the left
   divider to reposition it, or drop it on another taskbar to change monitors.
   If Explorer is temporarily gone, the widget hides and re-embeds rather than
@@ -64,11 +64,13 @@ show the exact pixels the shipped code draws. Regenerate them any time with
   can be reset from **Settings**.
 - **Tray icons.** One live icon per enabled provider — the number and adaptive
   bars follow whatever quota windows that provider reports; with no data the
-  number gives way to the provider's initial. Disable **Icons** to keep a
-  single neutral app icon instead.
+  number gives way to the provider's initial. Disable **Provider tray icons**
+  to keep a single neutral app icon instead.
 - **Detail popup.** Opens from a left-click on any surface: per-provider
-  status badges, exact reset clock times, a live refresh countdown, and a
-  temporary position lock for the current opening.
+  status badges, exact reset clock times, and a live refresh countdown. Its
+  separate pin and position-lock controls can keep it open or stop it moving.
+  The pin preference survives popup closes and app restarts; position locking
+  applies only to the current opening.
 
 When any quota window reaches 90%, it takes over that provider's badge, turns
 it red, and shows its own reset countdown — the warning finds you, not the
@@ -101,6 +103,12 @@ Installation options, in recommended order:
    WinGet distribution starts with v2.3.4. The ZIP and EXE remain available
    for portable or manual installations.
 
+To query usage, Gengchou reads credentials or session data already stored on
+this PC and sends a credential only to the provider that issued it, over
+HTTPS. It does not upload credentials or usage data to Gengchou or any third
+party. See [Data & privacy](#data--privacy) before installing for the complete
+data-flow and storage details.
+
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
 download verification, and self-updates check it automatically. Starting with
 v2.1.0, release binaries also carry GitHub artifact attestations; these provide
@@ -127,12 +135,17 @@ Release maintainers should also follow the
 ## Controls
 
 - **Left-click** the widget or a tray icon to open or close the detail popup.
-- The popup is movable by default; its lock button pins it for the current
-  opening, and closing it restores automatic placement.
-- **Right-click** any surface, then click **Icons**, **Widget**, or
+- The popup is movable and closes on focus loss by default. Use the pin button
+  to keep it open and the separate lock button to stop it moving. From left to
+  right, the header controls are Refresh, Pin, Position lock, and Close. State
+  icons show the current state. All four support Tab / Shift+Tab and Enter /
+  Space; Esc always closes the popup.
+- **Right-click** any surface, then click **Provider tray icons**, **Widget**, or
   **Floating Window** directly to toggle that surface. Position resets,
   notifications, and start-with-Windows live under **Settings**.
-- **Refresh** polls immediately with **Now** or sets the automatic interval.
+- **Refresh** polls immediately with **Refresh now** or sets the automatic
+  interval. Existing values stay visible while the refresh runs; the detail
+  footer says only **Refreshing**.
 
 ## Beyond the surfaces
 
@@ -153,11 +166,62 @@ The monitor only reads your existing local sessions — it never creates
 accounts or bypasses provider authentication, and what it can show follows
 each provider's own account rules:
 
-- **Claude Code** — installed and signed in (WSL credentials are picked up
-  when a usable distribution exists)
+- **Claude Code** — a signed-in Claude Code session on Windows or WSL, or a
+  signed-in Claude Desktop session on Windows. The CLI executable is not
+  required when Desktop has a supported local session. Claude Code credentials
+  are checked across Windows and every known usable WSL distribution. Windows
+  defaults to `%USERPROFILE%\.claude\.credentials.json`; when
+  `CLAUDE_CONFIG_DIR` is set, its `.credentials.json` is used instead. Each WSL
+  distribution resolves its own `CLAUDE_CONFIG_DIR` or falls back to
+  `$HOME/.claude`
 - **Codex** — a signed-in Codex Desktop or CLI session; the CLI executable is
   not required when Desktop has already saved a supported local session
 - **Antigravity** — a signed-in Antigravity session
+
+Gengchou automatically finds a usable Claude session. When the Anthropic usage
+endpoint confirms that a Windows Claude Code credential has been rejected, it
+can run the installed `claude update` command in a hidden background process
+(60-second timeout), verify that the local credential actually changed, and
+retry the usage endpoint. If no usable CLI credential remains — or the CLI is
+not installed — Gengchou can instead use an eligible, unexpired access token
+from the current Windows user's Claude Desktop session. Both paths are enabled
+by default and have no Settings item. WSL credentials never invoke the Windows
+CLI, and network errors or rate limits never cause a credential-source switch.
+
+To disable only `claude update`, set `DISABLE_UPDATES=1` before launching
+Gengchou. To disable only Claude Desktop session access, set
+`GENGCHOU_DISABLE_CLAUDE_DESKTOP_AUTH=1`. Restart Gengchou after changing either
+variable. Claude Code and Claude Desktop can be signed into different accounts;
+usable CLI credentials take precedence, so disable Desktop access if that
+fallback is not wanted.
+
+Only a CLI version change produces an optional notification (enabled by
+default). Credential-only recovery and Desktop session selection stay silent.
+If no usable session remains, missing, non-renewable, and server-rejected
+credentials all appear as **Authentication failed** and ask the user to sign in
+to Claude again. In Claude Desktop, send a message first to let the normal
+session flow refresh its credentials; if monitoring still does not recover,
+sign out and back in. In Claude Code CLI, run `claude auth login`. Credential
+watching resumes monitoring automatically after sign-in.
+
+The popup reserves badges for four conditions, in priority order:
+**Authentication failed**, **Refresh failed**, **Near limit**, and **Limit
+reached**. A network or request failure becomes **Refresh failed** after three
+consecutive failures or when its data reaches the stale threshold (the greater
+of twice the polling interval and five minutes). A 429 response cools down only
+that provider and retries silently while its data is fresh; once stale, it uses
+the same **Refresh failed** state. Old values stay visible but muted with **Last
+updated … ago**. With no history, initial loading says **Waiting for usage
+data**, authentication failure says **Unable to get usage data**, and a
+persistent service or request failure says **Temporarily unable to get
+usage**. The footer reports whether some or all providers failed to update.
+
+For support, run `gengchou.exe --claude-auth-diagnostics` in a terminal. Only
+this explicit command invokes the non-model `claude auth status`; it reports
+resolved config paths, file state, expiries, CLI version, and internal reason
+codes, followed by the copyable `claude auth login` recovery command. Tokens,
+account identifiers, and raw CLI output are excluded. The same safe report is
+written to Gengchou's diagnostic log.
 
 Before it reads a provider's local credential source or starts polling,
 Gengchou asks for provider-specific permission and identifies the source it
@@ -175,9 +239,20 @@ permission at any time.
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
 | Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
-v2.3.0 reads and writes only the Gengchou paths above. Installations older than
-v2.2.4 must first run the retained v2.2.4 bridge twice and complete its
-verification before moving to v2.3.0 or later.
+If `%APPDATA%` is unavailable, settings and the usage cache fall back to the
+Windows configuration directory and then `%LOCALAPPDATA%`. If no durable path
+can be used, the app continues for the current session and shows one storage
+warning instead of silently claiming that changes were saved.
+
+Gengchou's own direct writes are limited to the paths above. Claude Desktop
+session access is read-only: Gengchou reads the encrypted cache and Chromium
+`Local State`, decrypts the cache only in memory, extracts only eligible access
+tokens, never extracts or stores a refresh token, overwrites the decrypted JSON
+and retained token buffers before release, and does not modify Desktop files.
+Unless disabled with `DISABLE_UPDATES`, the separately installed Claude CLI may
+update its own installation and credential files according to `claude update`'s
+behavior. Installations older than v2.2.4 must first run the retained v2.2.4
+bridge twice and complete its verification before moving to v2.3.0 or later.
 
 To uninstall: disable **Start with Windows** if you enabled it, then delete
 the executable, `%APPDATA%\Gengchou`, and `%LOCALAPPDATA%\Gengchou`.
@@ -188,12 +263,33 @@ checks and user-approved update downloads. The app never:
 
 - collects analytics or telemetry, or uploads any files;
 - sends credentials anywhere except the provider that issued them;
-- modifies your credentials;
+- starts `claude auth login` or writes credential files directly;
+- runs provider commands except the non-model `claude --version` / `claude
+  update` recovery described above and the explicit
+  `--claude-auth-diagnostics` support command;
 - triggers model generation — no `claude -p`, `codex exec`, or calls to
   `/v1/messages`, `/v1/chat/completions`, and similar endpoints.
 
+Proxy selection uses standard `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`
+environment variables first, then the current Windows user's static system
+proxy, and finally a direct connection. Automatic PAC/WPAD scripts are not
+executed yet.
+
 Provider bearer tokens travel inside each TLS request, so only configure
 proxies you trust.
+
+## Update troubleshooting
+
+After a successful portable update, the previous executable may briefly remain
+beside the app as `gengchou.exe.old`. Gengchou now continues to start if a
+virus scanner, indexer, or another file handle still has that confirmed backup
+open; cleanup is retried on a later launch and the exact path is written to
+`%LOCALAPPDATA%\Gengchou\diagnose.log`.
+
+If the file remains and a later update cannot proceed, exit Gengchou, wait for
+the process holding the file to release it, delete only the reported `.old`
+file beside `gengchou.exe`, and start the app again. Do not delete the running
+executable or the update workspace.
 
 ## Stability
 

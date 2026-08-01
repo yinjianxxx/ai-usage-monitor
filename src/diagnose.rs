@@ -140,10 +140,6 @@ fn validate_regular_file_if_exists(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn is_enabled() -> bool {
-    DIAGNOSE_STATE.get().is_some()
-}
-
 fn timestamp() -> String {
     let t = unsafe { GetLocalTime() };
     format!(

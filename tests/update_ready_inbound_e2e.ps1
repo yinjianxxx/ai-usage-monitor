@@ -24,7 +24,10 @@ $marker = Join-Path $readyDir 'update-ready-e2e.marker'
 New-Item -ItemType Directory -Path $readyDir -Force | Out-Null
 
 function Invoke-ReadyProbe {
-    param([hashtable]$Environment)
+    param(
+        [hashtable]$Environment,
+        [string]$ProbeBinary = $BinaryPath
+    )
 
     $previous = @{}
     foreach ($name in $Environment.Keys) {
@@ -32,7 +35,7 @@ function Invoke-ReadyProbe {
         [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
     }
     try {
-        $process = Start-Process -FilePath $BinaryPath `
+        $process = Start-Process -FilePath $ProbeBinary `
             -ArgumentList '--confirm-update-ready-test' `
             -WorkingDirectory $testRoot `
             -WindowStyle Hidden `
@@ -66,7 +69,50 @@ try {
         throw 'Update readiness marker content was not preserved exactly.'
     }
 
-    Write-Output 'Updater inbound E2E passed: the current marker was validated and written.'
+    # A confirmed backup is deferred cleanup, not an active transaction. A
+    # scanner/indexer lock must not make the otherwise healthy app fail its
+    # readiness milestone.
+    $normalProbe = Join-Path $testRoot 'normal-start-probe.exe'
+    $normalBackup = "$normalProbe.old"
+    Copy-Item -LiteralPath $BinaryPath -Destination $normalProbe
+    [IO.File]::WriteAllText($normalBackup, 'previous version', [Text.Encoding]::UTF8)
+    $lock = [IO.File]::Open(
+        $normalBackup,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None
+    )
+    try {
+        $normalEnvironment = @{
+            'APPDATA' = (Join-Path $testRoot 'NormalRoaming')
+            'LOCALAPPDATA' = (Join-Path $testRoot 'NormalLocal')
+            'GENGCHOU_UPDATE_TEST_READY_DIR' = $readyDir
+        }
+        $normalExitCode = Invoke-ReadyProbe `
+            -Environment $normalEnvironment `
+            -ProbeBinary $normalProbe
+        if ($normalExitCode -ne 0) {
+            throw "Normal readiness probe with locked backup exited with $normalExitCode."
+        }
+        if (-not (Test-Path -LiteralPath $normalBackup -PathType Leaf)) {
+            throw 'The locked confirmed backup was unexpectedly removed.'
+        }
+    }
+    finally {
+        $lock.Dispose()
+    }
+
+    $cleanupExitCode = Invoke-ReadyProbe `
+        -Environment $normalEnvironment `
+        -ProbeBinary $normalProbe
+    if ($cleanupExitCode -ne 0) {
+        throw "Normal readiness cleanup probe exited with $cleanupExitCode."
+    }
+    if (Test-Path -LiteralPath $normalBackup) {
+        throw 'The confirmed backup was not removed after its lock was released.'
+    }
+
+    Write-Output 'Updater inbound E2E passed: active readiness and locked confirmed-backup cleanup are correct.'
 }
 finally {
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)

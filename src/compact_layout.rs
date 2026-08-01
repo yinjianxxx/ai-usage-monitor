@@ -39,15 +39,16 @@ pub(crate) enum ColorKey {
     PillBgWarn,
     PillText,
     PillAlertText,
+    PillAuxText,
     AuxText,
     CanvasWarnPrimary,
-    CanvasWarnSecondary,
     NeutralText,
     GaugeTrack,
     GaugeAccent(TrayIconKind),
     GaugeWarn,
     Separator,
     HighContrastText,
+    StaleText,
     ErrorText,
 }
 
@@ -103,8 +104,8 @@ pub(crate) struct Metrics {
     pub(crate) badge_right_pad: i32,
     pub(crate) badge_text_gap: i32,
     pub(crate) border_w: i32,
-    pub(crate) status_w: i32,
     pub(crate) status_gap: i32,
+    pub(crate) status_content_gap: i32,
     pub(crate) chip20: i32,
     pub(crate) group_chip_gap: i32,
     pub(crate) label_min_w: i32,
@@ -135,8 +136,8 @@ impl Metrics {
             badge_right_pad: 8,
             badge_text_gap: 3,
             border_w: 1,
-            status_w: 8,
-            status_gap: 2,
+            status_gap: 3,
+            status_content_gap: 3,
             chip20: 20,
             group_chip_gap: 5,
             label_min_w: 16,
@@ -192,18 +193,42 @@ pub(crate) fn layout_badges(
         let label_w = label
             .map(|text| measure(FontKey::Data12, text) + m.label_gap)
             .unwrap_or(0);
-        let context = match provider.attention {
-            Attention::Warn => selected
-                .filter(|window| !window.countdown.is_empty())
-                .map(|window| window.countdown.as_str()),
-            Attention::Degraded => Some("~"),
-            Attention::Error => Some("!"),
-            Attention::Normal => None,
+        let status = match provider.attention {
+            Attention::Stale => Some(ColorKey::StaleText),
+            Attention::ActionRequired => Some(ColorKey::ErrorText),
+            Attention::Normal | Attention::Warn => None,
         };
+        let status_w = status
+            .map(|_| measure(FontKey::Data12, "!"))
+            .unwrap_or_default();
+        let status_space = status.map(|_| m.status_gap + status_w).unwrap_or(0);
+        let content_gap = if status.is_some() {
+            m.status_content_gap
+        } else {
+            m.chip_gap
+        };
+        let quota_warn = selected.is_some_and(|window| window.severity == Severity::Warn);
+        let context = selected
+            .filter(|window| !window.countdown.is_empty())
+            .map(|window| {
+                let countdown = window
+                    .countdown
+                    .strip_prefix('\u{00b7}')
+                    .unwrap_or(&window.countdown)
+                    .trim_start();
+                format!("\u{00b7} {countdown}")
+            });
         let context_w = context
+            .as_deref()
             .map(|text| m.badge_text_gap + measure(FontKey::Data12, text))
             .unwrap_or(0);
-        let pill_w = m.pill_pad_x * 2 + identity_w + m.chip_gap + label_w + value_w + context_w;
+        let pill_w = m.pill_pad_x * 2
+            + identity_w
+            + status_space
+            + content_gap
+            + label_w
+            + value_w
+            + context_w;
         let pill = Rect {
             x,
             y: pill_y,
@@ -214,10 +239,9 @@ pub(crate) fn layout_badges(
             kind: provider.kind,
             rect: pill,
         });
-        // Provider errors describe data freshness; quota severity still comes
-        // from the selected window. A cached 51% should stay neutral, while a
-        // cached 92% remains visibly near its limit and also carries `!`.
-        let quota_warn = selected.is_some_and(|window| window.severity == Severity::Warn);
+        // Provider attention and quota severity are independent. A stale 51%
+        // keeps the neutral pill plus a subtle `!`; a stale 92% remains visibly
+        // near its limit and carries both the marker and reset countdown.
         cmds.push(DrawCmd::RoundRect {
             rect: pill,
             color: if quota_warn {
@@ -265,7 +289,25 @@ pub(crate) fn layout_badges(
                 size: TileSize::Chip16,
             });
         }
-        let content_x = identity_x + identity_w + m.chip_gap;
+        let identity_right = identity_x + identity_w;
+        if let Some(color) = status {
+            cmds.push(DrawCmd::Text {
+                rect: Rect {
+                    x: identity_right + m.status_gap,
+                    y: pill_y,
+                    w: status_w,
+                    h: m.pill_h,
+                },
+                text: "!".to_string(),
+                font: FontKey::Data12,
+                color: if high_contrast && quota_warn {
+                    ColorKey::PillAlertText
+                } else {
+                    color
+                },
+            });
+        }
+        let content_x = identity_right + status_space + content_gap;
         if let Some(label) = label {
             cmds.push(DrawCmd::Text {
                 rect: Rect {
@@ -283,7 +325,7 @@ pub(crate) fn layout_badges(
                         ColorKey::HighContrastText
                     }
                 } else {
-                    ColorKey::AuxText
+                    ColorKey::PillAuxText
                 },
             });
         }
@@ -300,7 +342,7 @@ pub(crate) fn layout_badges(
             color: if quota_warn {
                 ColorKey::PillAlertText
             } else if provider.placeholder.is_some() {
-                ColorKey::AuxText
+                ColorKey::PillAuxText
             } else {
                 ColorKey::PillText
             },
@@ -313,16 +355,12 @@ pub(crate) fn layout_badges(
                     w: context_w - m.badge_text_gap,
                     h: m.pill_h,
                 },
-                text: context.to_string(),
+                text: context,
                 font: FontKey::Data12,
                 color: if quota_warn {
                     ColorKey::PillAlertText
                 } else {
-                    match provider.attention {
-                        Attention::Error => ColorKey::ErrorText,
-                        Attention::Degraded | Attention::Warn => ColorKey::PillAlertText,
-                        Attention::Normal => ColorKey::PillText,
-                    }
+                    ColorKey::PillText
                 },
             });
         }
@@ -400,28 +438,34 @@ pub(crate) fn layout_provider_rows(
         }
         let identity_right = chip_x + identity_w;
         let status = match provider.attention {
-            Attention::Degraded => Some(("~", ColorKey::PillAlertText)),
-            Attention::Error => Some(("!", ColorKey::ErrorText)),
+            Attention::Stale => Some(("!", ColorKey::StaleText)),
+            Attention::ActionRequired => Some(("!", ColorKey::ErrorText)),
             Attention::Normal | Attention::Warn => None,
         };
         let status_space = if let Some((status, color)) = status {
             let status_x = identity_right + m.status_gap;
+            let status_w = measure(FontKey::Data12, status);
             cmds.push(DrawCmd::Text {
                 rect: Rect {
                     x: status_x,
                     y: 0,
-                    w: m.status_w,
+                    w: status_w,
                     h: m.floating_h,
                 },
                 text: status.to_string(),
                 font: FontKey::Data12,
                 color,
             });
-            m.status_gap + m.status_w
+            m.status_gap + status_w
         } else {
             0
         };
-        let content_x = identity_right + status_space + m.group_chip_gap;
+        let content_gap = if status.is_some() {
+            m.status_content_gap
+        } else {
+            m.group_chip_gap
+        };
+        let content_x = identity_right + status_space + content_gap;
 
         let content_w = if let Some(placeholder) = &provider.placeholder {
             let placeholder_w = measure(FontKey::Data12, placeholder);
@@ -495,9 +539,9 @@ pub(crate) fn layout_provider_rows(
                         text: "\u{00b7}".to_string(),
                         font: FontKey::Data12,
                         color: if warn {
-                            ColorKey::CanvasWarnSecondary
+                            ColorKey::CanvasWarnPrimary
                         } else {
-                            ColorKey::AuxText
+                            ColorKey::NeutralText
                         },
                     });
                     cmds.push(DrawCmd::Text {
@@ -510,9 +554,9 @@ pub(crate) fn layout_provider_rows(
                         text: countdown.to_string(),
                         font: FontKey::Data12,
                         color: if warn {
-                            ColorKey::CanvasWarnSecondary
+                            ColorKey::CanvasWarnPrimary
                         } else {
-                            ColorKey::AuxText
+                            ColorKey::NeutralText
                         },
                     });
                 }
@@ -669,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn badge_width_tracks_one_line_attention_context() {
+    fn badge_width_tracks_reset_countdown_and_attention_context() {
         let m = Metrics::logical();
         let model = |attention, severity| CompactViewModel {
             providers: vec![provider(
@@ -690,30 +734,23 @@ mod tests {
             false,
             &fake_measure,
         );
-        let degraded = layout_badges(
-            &model(Attention::Degraded, Severity::Normal),
+        let stale = layout_badges(
+            &model(Attention::Stale, Severity::Normal),
             &m,
             false,
             &fake_measure,
         );
-        let error = layout_badges(
-            &model(Attention::Error, Severity::Normal),
+        let action_required = layout_badges(
+            &model(Attention::ActionRequired, Severity::Normal),
             &m,
             false,
             &fake_measure,
         );
-        assert_eq!(
-            warn.width - normal.width,
-            m.badge_text_gap + fake_measure(FontKey::Data12, "\u{00b7}4d")
-        );
-        assert_eq!(
-            degraded.width - normal.width,
-            m.badge_text_gap + fake_measure(FontKey::Data12, "~")
-        );
-        assert_eq!(
-            error.width - normal.width,
-            m.badge_text_gap + fake_measure(FontKey::Data12, "!")
-        );
+        assert_eq!(warn.width, normal.width);
+        let attention_width =
+            m.status_gap + fake_measure(FontKey::Data12, "!") + m.status_content_gap - m.chip_gap;
+        assert_eq!(stale.width - normal.width, attention_width);
+        assert_eq!(action_required.width - normal.width, attention_width);
         let pill_y = (m.taskbar_h - m.pill_h) / 2;
         for rect in warn.cmds.iter().filter_map(|cmd| match cmd {
             DrawCmd::Text { rect, .. } => Some(*rect),
@@ -722,6 +759,22 @@ mod tests {
             assert_eq!(rect.y, pill_y);
             assert_eq!(rect.h, m.pill_h);
         }
+        assert!(normal.cmds.iter().any(|cmd| matches!(
+            cmd,
+            DrawCmd::Text {
+                text,
+                color: ColorKey::PillText,
+                ..
+            } if text == "\u{00b7} 4d"
+        )));
+        assert!(warn.cmds.iter().any(|cmd| matches!(
+            cmd,
+            DrawCmd::Text {
+                text,
+                color: ColorKey::PillAlertText,
+                ..
+            } if text == "\u{00b7} 4d"
+        )));
     }
 
     #[test]
@@ -744,20 +797,82 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(texts.contains(&"92%"));
-        assert!(texts.contains(&"\u{00b7}4d"));
+        assert!(texts.contains(&"\u{00b7} 4d"));
         assert!(texts.contains(&"7d"));
         assert_eq!(scene.badge_hits.len(), 1);
         assert_eq!(scene.badge_hits[0].kind, TrayIconKind::Claude);
     }
 
     #[test]
-    fn error_badge_stays_neutral_and_floating_marker_follows_identity() {
+    fn normal_compact_surfaces_keep_labels_subtle_and_values_prominent() {
+        let m = Metrics::logical();
+        let model = CompactViewModel {
+            providers: vec![provider(
+                TrayIconKind::Claude,
+                vec![window("7d", 51.0, "·6d", Severity::Normal)],
+                Attention::Normal,
+            )],
+        };
+        let badge = layout_badges(&model, &m, false, &fake_measure);
+
+        assert!(badge.cmds.iter().any(|cmd| matches!(
+            cmd,
+            DrawCmd::Text {
+                text,
+                color: ColorKey::PillAuxText,
+                ..
+            } if text == "7d"
+        )));
+        for expected in ["51%", "· 6d"] {
+            assert!(badge.cmds.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::Text { text, color: ColorKey::PillText, .. }
+                    if text == expected
+            )));
+        }
+
+        let floating = layout_provider_rows(&model, &m, false, &fake_measure);
+        assert!(floating.cmds.iter().any(|cmd| matches!(
+            cmd,
+            DrawCmd::Text { text, color: ColorKey::AuxText, .. }
+                if text == "7d"
+        )));
+        for expected in ["51%", "·", "6d"] {
+            assert!(floating.cmds.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::Text { text, color: ColorKey::NeutralText, .. }
+                    if text == expected
+            )));
+        }
+
+        let placeholder = CompactViewModel {
+            providers: vec![ProviderView {
+                kind: TrayIconKind::Claude,
+                badge: None,
+                windows: Vec::new(),
+                placeholder: Some("--".to_string()),
+                attention: Attention::Normal,
+            }],
+        };
+        let badge = layout_badges(&placeholder, &m, false, &fake_measure);
+        assert!(badge.cmds.iter().any(|cmd| matches!(
+            cmd,
+            DrawCmd::Text {
+                text,
+                color: ColorKey::PillAuxText,
+                ..
+            } if text == "--"
+        )));
+    }
+
+    #[test]
+    fn action_marker_follows_identity_on_both_compact_surfaces() {
         let m = Metrics::logical();
         let model = CompactViewModel {
             providers: vec![provider(
                 TrayIconKind::Codex,
                 vec![window("7d", 51.0, "\u{00b7}6d", Severity::Normal)],
-                Attention::Error,
+                Attention::ActionRequired,
             )],
         };
         let badge = layout_badges(&model, &m, false, &fake_measure);
@@ -784,6 +899,27 @@ mod tests {
             }
         )));
 
+        let badge_chip = badge.cmds.iter().find_map(|cmd| match cmd {
+            DrawCmd::ProviderTile { rect, .. } => Some(*rect),
+            _ => None,
+        });
+        let badge_marker = badge.cmds.iter().find_map(|cmd| match cmd {
+            DrawCmd::Text { rect, text, .. } if text == "!" => Some(*rect),
+            _ => None,
+        });
+        let badge_label = badge.cmds.iter().find_map(|cmd| match cmd {
+            DrawCmd::Text { rect, text, .. } if text == "7d" => Some(*rect),
+            _ => None,
+        });
+        let badge_chip = badge_chip.unwrap();
+        let badge_marker = badge_marker.unwrap();
+        let badge_label = badge_label.unwrap();
+        assert_eq!(badge_marker.x - (badge_chip.x + badge_chip.w), m.status_gap);
+        assert_eq!(
+            badge_label.x - (badge_marker.x + badge_marker.w),
+            m.status_content_gap
+        );
+
         let floating = layout_provider_rows(&model, &m, false, &fake_measure);
         let chip = floating.cmds.iter().find_map(|cmd| match cmd {
             DrawCmd::ProviderTile { rect, .. } => Some(*rect),
@@ -800,18 +936,18 @@ mod tests {
         let chip = chip.unwrap();
         let marker = marker.unwrap();
         let label = label.unwrap();
-        assert!(chip.x + chip.w <= marker.x);
-        assert!(marker.x + marker.w <= label.x);
+        assert_eq!(marker.x - (chip.x + chip.w), m.status_gap);
+        assert_eq!(label.x - (marker.x + marker.w), m.status_content_gap);
     }
 
     #[test]
-    fn degraded_provider_uses_a_subtle_marker_on_both_compact_surfaces() {
+    fn stale_provider_uses_a_subtle_exclamation_on_both_compact_surfaces() {
         let m = Metrics::logical();
         let model = CompactViewModel {
             providers: vec![provider(
                 TrayIconKind::Codex,
                 vec![window("7d", 51.0, "\u{00b7}6d", Severity::Normal)],
-                Attention::Degraded,
+                Attention::Stale,
             )],
         };
 
@@ -821,7 +957,11 @@ mod tests {
         ] {
             assert!(scene.cmds.iter().any(|cmd| matches!(
                 cmd,
-                DrawCmd::Text { text, color: ColorKey::PillAlertText, .. } if text == "~"
+                DrawCmd::Text { text, color: ColorKey::StaleText, .. } if text == "!"
+            )));
+            assert!(!scene.cmds.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::Text { text, .. } if text == "~"
             )));
             assert!(!scene.cmds.iter().any(|cmd| matches!(
                 cmd,
@@ -840,7 +980,7 @@ mod tests {
             providers: vec![provider(
                 TrayIconKind::Claude,
                 vec![window("7d", 92.0, "\u{00b7}4d", Severity::Warn)],
-                Attention::Error,
+                Attention::ActionRequired,
             )],
         };
         let badge = layout_badges(&model, &m, true, &fake_measure);
@@ -851,13 +991,28 @@ mod tests {
                 ..
             }
         )));
-        for text in ["CL", "92%", "!"] {
+        for text in ["CL", "92%", "!", "\u{00b7} 4d"] {
             assert!(badge.cmds.iter().any(|cmd| matches!(
                 cmd,
                 DrawCmd::Text { text: actual, color: ColorKey::PillAlertText, .. }
                     if actual == text
             )));
         }
+        let text_rect = |expected: &str| {
+            badge.cmds.iter().find_map(|cmd| match cmd {
+                DrawCmd::Text { rect, text, .. } if text == expected => Some(*rect),
+                _ => None,
+            })
+        };
+        let identity = text_rect("CL").unwrap();
+        let marker = text_rect("!").unwrap();
+        let label = text_rect("7d").unwrap();
+        let value = text_rect("92%").unwrap();
+        let countdown = text_rect("\u{00b7} 4d").unwrap();
+        assert!(identity.x + identity.w <= marker.x);
+        assert!(marker.x + marker.w <= label.x);
+        assert!(label.x + label.w <= value.x);
+        assert!(value.x + value.w <= countdown.x);
     }
 
     #[test]
@@ -871,7 +1026,7 @@ mod tests {
             )],
         };
         let badge = layout_badges(&model, &m, true, &fake_measure);
-        for text in ["CL", "7d", "92%", "\u{00b7}4d"] {
+        for text in ["CL", "7d", "92%", "\u{00b7} 4d"] {
             assert!(badge.cmds.iter().any(|cmd| matches!(
                 cmd,
                 DrawCmd::Text { text: actual, color: ColorKey::PillAlertText, .. }
@@ -888,7 +1043,7 @@ mod tests {
         for expected in ["\u{00b7}", "4d"] {
             assert!(floating.cmds.iter().any(|cmd| matches!(
                 cmd,
-                DrawCmd::Text { text, color: ColorKey::CanvasWarnSecondary, .. }
+                DrawCmd::Text { text, color: ColorKey::CanvasWarnPrimary, .. }
                     if text == expected
             )));
         }

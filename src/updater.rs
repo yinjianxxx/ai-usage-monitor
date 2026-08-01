@@ -153,7 +153,7 @@ pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
     }
 }
 
-pub fn begin_winget_update() -> Result<(), String> {
+pub fn begin_winget_update(expected_version: &str) -> Result<(), String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     let current_dir = current_exe
@@ -163,6 +163,7 @@ pub fn begin_winget_update() -> Result<(), String> {
         std::process::id(),
         &current_exe.to_string_lossy(),
         &current_dir.to_string_lossy(),
+        expected_version,
     );
 
     Command::new("powershell.exe")
@@ -174,6 +175,16 @@ pub fn begin_winget_update() -> Result<(), String> {
         .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
 
     Ok(())
+}
+
+pub fn winget_failure_notice(args: &[String]) -> Option<String> {
+    const PREFIX: &str = "--winget-update-failed=";
+    let code = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix(PREFIX))?
+        .parse::<i32>()
+        .ok()?;
+    (code != 0).then(|| format!("WinGet update failed with exit code {code}."))
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
@@ -352,30 +363,45 @@ fn inbound_ready_request() -> Option<PathBuf> {
     std::env::var_os(UPDATE_READY_ENV).map(PathBuf::from)
 }
 
+fn cleanup_confirmed_backup_on_normal_start(current_exe: io::Result<PathBuf>) {
+    match current_exe {
+        Ok(current_exe) => {
+            let backup = backup_path_for(&current_exe);
+            if let Err(error) = remove_file_if_exists(&backup) {
+                crate::diagnose::log(format!(
+                    "confirmed update backup cleanup deferred path={} error={error}",
+                    backup.display()
+                ));
+            }
+        }
+        Err(error) => crate::diagnose::log(format!(
+            "confirmed update backup cleanup skipped; unable to locate running app: {error}"
+        )),
+    }
+}
+
 pub fn confirm_update_ready() -> Result<(), String> {
     if UPDATE_READY_CONFIRMED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
 
-    let result = (|| {
-        if let Some(marker) = inbound_ready_request() {
+    let result = if let Some(marker) = inbound_ready_request() {
+        (|| {
             validate_ready_marker_path(&marker)?;
             write_ready_marker(&marker)?;
             // Do not let a later helper inherit a marker for this transaction.
             std::env::remove_var(UPDATE_READY_ENV);
-            return Ok(());
-        }
-
-        let current_exe = std::env::current_exe()
-            .map_err(|error| format!("Unable to locate the running app: {error}"))?;
-        let backup = backup_path_for(&current_exe);
-        remove_file_if_exists(&backup).map_err(|error| {
-            format!(
-                "Unable to clean up the confirmed update backup at {}: {error}",
-                backup.display()
-            )
-        })
-    })();
+            Ok(())
+        })()
+    } else {
+        // A readiness request belongs to an active update transaction: failing
+        // it must stop startup so the helper can roll back. A plain launch has
+        // no such transaction. Its `.old` file is only deferred cleanup from a
+        // previously confirmed update, so a lock held by antivirus/indexing
+        // must never make an otherwise healthy app refuse to start.
+        cleanup_confirmed_backup_on_normal_start(std::env::current_exe());
+        Ok(())
+    };
 
     if result.is_err() {
         UPDATE_READY_CONFIRMED.store(false, Ordering::SeqCst);
@@ -391,7 +417,7 @@ struct PreparedBinary {
 fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
     let (owner, repo) = github_repo()?;
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-    let agent = build_agent()?;
+    let agent = build_agent(&url)?;
 
     let response = agent
         .get(&url)
@@ -437,17 +463,13 @@ fn release_asset_named<'a>(assets: &'a [GitHubAsset], name: &str) -> Option<&'a 
         .find(|asset| asset.name.eq_ignore_ascii_case(name))
 }
 
-fn build_agent() -> Result<ureq::Agent, String> {
-    let tls = native_tls::TlsConnector::new()
-        .map_err(|e| format!("Unable to initialize TLS support for update checks: {e}"))?;
-    Ok(ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .tls_connector(std::sync::Arc::new(tls))
-        .build())
+fn build_agent(url: &str) -> Result<ureq::Agent, String> {
+    crate::http_client::build_agent(url, Duration::from_secs(30))
+        .map_err(|e| format!("Unable to initialize TLS support for update checks: {e}"))
 }
 
 fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> Result<(), String> {
-    let agent = build_agent()?;
+    let agent = build_agent(url)?;
     let response = agent
         .get(url)
         .set("User-Agent", user_agent())
@@ -526,7 +548,7 @@ fn verify_download_checksum(
         )
     })?;
 
-    let agent = build_agent()?;
+    let agent = build_agent(checksums_url)?;
     let manifest_response = agent
         .get(checksums_url)
         .set("User-Agent", user_agent())
@@ -1279,9 +1301,15 @@ fn updater_ui_disabled_for_tests() -> bool {
     }
 }
 
-fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
+fn winget_upgrade_command(
+    pid: u32,
+    target: &str,
+    working_dir: &str,
+    expected_version: &str,
+) -> String {
     let target = powershell_single_quoted(target);
     let working_dir = powershell_single_quoted(working_dir);
+    let expected_version = powershell_single_quoted(expected_version);
     let package_id = WINGET_PACKAGE_ID;
 
     format!(
@@ -1290,6 +1318,7 @@ fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
             "$pidToWait = {pid}; ",
             "$target = '{target}'; ",
             "$workingDir = '{working_dir}'; ",
+            "$expectedVersion = '{expected_version}'; ",
             "$running = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue; ",
             "if ($null -ne $running) {{ ",
             "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} ",
@@ -1298,30 +1327,35 @@ fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
             "if ($null -ne $running) {{ Write-Error 'Timed out waiting for Gengchou to exit; WinGet was not started.'; exit 20 }} ",
             "}} ",
             "}}; ",
-            "winget upgrade --id {package_id} --exact; ",
-            "$exitCode = $LASTEXITCODE; ",
+            "$running = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue; ",
+            "if ($null -ne $running) {{ Write-Error 'Gengchou is still running; WinGet was not started.'; exit 20 }}; ",
+            "$exitCode = 23; ",
+            "try {{ & winget upgrade --id {package_id} --exact; $exitCode = $LASTEXITCODE }} catch {{ $exitCode = 23 }}; ",
+            "if ($null -eq $exitCode) {{ $exitCode = 23 }}; ",
             "if ($exitCode -eq 0) {{ ",
             "Start-Sleep -Seconds 2; ",
-            "$installed = Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; ",
-            "if ($null -ne $installed) {{ ",
-            "$restartTarget = $installed.Source; ",
-            "$restartDir = Split-Path -Parent $restartTarget ",
-            "}} elseif (Test-Path -LiteralPath $target -PathType Leaf) {{ ",
-            "$restartTarget = $target; $restartDir = $workingDir ",
-            "}} else {{ ",
-            "Write-Error 'WinGet completed, but the updated Gengchou command could not be located.'; exit 21 ",
+            "if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {{ ",
+            "Write-Error 'WinGet completed, but the confirmed Gengchou install target no longer exists.'; exit 21 ",
             "}}; ",
-            "Start-Process -FilePath $restartTarget -WorkingDirectory $restartDir; ",
+            "$actualVersion = (Get-Item -LiteralPath $target).VersionInfo.ProductVersion; ",
+            "if ($expectedVersion -ne '' -and ($null -eq $actualVersion -or -not $actualVersion.Equals($expectedVersion, [System.StringComparison]::OrdinalIgnoreCase))) {{ ",
+            "$failureArg = '--winget-update-failed=22'; ",
+            "Start-Process -FilePath $target -WorkingDirectory $workingDir -ArgumentList @($failureArg); ",
+            "exit 22 ",
+            "}}; ",
+            "Start-Process -FilePath $target -WorkingDirectory $workingDir; ",
             "exit 0 ",
             "}}; ",
-            "Write-Host ''; ",
-            "Write-Host 'WinGet update failed with exit code' $exitCode; ",
-            "Read-Host 'Press Enter to close'; ",
+            "if (Test-Path -LiteralPath $target -PathType Leaf) {{ ",
+            "$failureArg = '--winget-update-failed=' + $exitCode; ",
+            "Start-Process -FilePath $target -WorkingDirectory $workingDir -ArgumentList @($failureArg) ",
+            "}}; ",
             "exit $exitCode"
         ),
         pid = pid,
         target = target,
         working_dir = working_dir,
+        expected_version = expected_version,
         package_id = package_id,
     )
 }
@@ -1509,6 +1543,7 @@ fn wide_str(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -1563,6 +1598,32 @@ mod tests {
             expected_checksum_from_manifest(manifest, RELEASE_ASSET_NAME).as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn locked_confirmed_backup_never_blocks_a_normal_start() {
+        let dir = TestDir::new("locked-confirmed-backup");
+        let target = dir.join("gengchou.exe");
+        let backup = backup_path_for(&target);
+        std::fs::write(&target, b"current").unwrap();
+        std::fs::write(&backup, b"previous").unwrap();
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&backup)
+            .expect("test backup should be exclusively lockable");
+
+        cleanup_confirmed_backup_on_normal_start(Ok(target));
+        assert!(
+            backup.exists(),
+            "locked backup should be deferred, not fatal"
+        );
+
+        drop(lock);
+        remove_file_if_exists(&backup).expect("deferred cleanup should succeed after unlock");
+        assert!(!backup.exists());
     }
 
     #[test]
@@ -1856,7 +1917,7 @@ mod tests {
 
     #[test]
     fn winget_wait_is_strict_when_parent_is_still_running() {
-        let command = winget_upgrade_command(123, r"C:\app.exe", r"C:\");
+        let command = winget_upgrade_command(123, r"C:\app.exe", r"C:\", "2.3.3");
         assert!(command.contains("Get-Process -Id $pidToWait"));
         assert!(command.contains("Wait-Process -Id $pidToWait -Timeout 30"));
         assert!(command.contains("exit 20"));
@@ -1864,14 +1925,29 @@ mod tests {
     }
 
     #[test]
-    fn winget_restart_uses_only_the_published_gengchou_command_alias() {
-        let command = winget_upgrade_command(123, r"C:\old-version\app.exe", r"C:\old-version");
-        assert!(command.contains(
-            "Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue"
-        ));
-        assert!(command.contains("$restartTarget = $installed.Source"));
+    fn winget_restart_uses_only_the_confirmed_target_and_expected_version() {
+        let command =
+            winget_upgrade_command(123, r"C:\confirmed\gengchou.exe", r"C:\confirmed", "2.3.3");
+        assert!(!command.contains("Get-Command"));
         assert!(command.contains("Test-Path -LiteralPath $target -PathType Leaf"));
-        assert!(command.contains("Start-Process -FilePath $restartTarget"));
+        assert!(command.contains("$actualVersion.Equals($expectedVersion"));
+        assert!(command.contains("Start-Process -FilePath $target"));
+        assert!(command.contains("--winget-update-failed="));
+        assert!(command.contains("catch { $exitCode = 23 }"));
         assert!(command.contains("exit 21"));
+        assert!(command.contains("exit 22"));
+    }
+
+    #[test]
+    fn winget_failure_notice_is_one_shot_cli_state() {
+        let args = vec![
+            "gengchou.exe".to_string(),
+            "--winget-update-failed=-1978335189".to_string(),
+        ];
+        assert_eq!(
+            winget_failure_notice(&args).as_deref(),
+            Some("WinGet update failed with exit code -1978335189.")
+        );
+        assert_eq!(winget_failure_notice(&["gengchou.exe".to_string()]), None);
     }
 }

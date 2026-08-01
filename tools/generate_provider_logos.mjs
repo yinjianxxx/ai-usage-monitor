@@ -14,8 +14,9 @@ const downsampleScript = path.join(root, 'tools', 'downsample_provider_tile.py')
 const supersample = 8;
 
 // Each compact surface gets a native logical-size class. Every class is
-// rendered independently at each supported Windows DPI bucket so GDI never
-// has to resize a 28dp detail-popup tile at runtime.
+// rendered independently at each standard Windows DPI bucket, so normal scale
+// steps stay pixel-exact. Uncommon custom DPIs use only a small final resize
+// from the nearest bucket.
 const sizeClasses = [
   {
     suffix: '',
@@ -25,6 +26,11 @@ const sizeClasses = [
       { dpi: 144, chip: 42, radius: 11, inset: 2, logo: 29 },
       { dpi: 168, chip: 49, radius: 12, inset: 2, logo: 33 },
       { dpi: 192, chip: 56, radius: 14, inset: 2, logo: 38 },
+      { dpi: 216, chip: 63, radius: 16, inset: 2, logo: 43 },
+      { dpi: 240, chip: 70, radius: 18, inset: 3, logo: 48 },
+      { dpi: 288, chip: 84, radius: 21, inset: 3, logo: 57 },
+      { dpi: 336, chip: 98, radius: 25, inset: 4, logo: 67 },
+      { dpi: 384, chip: 112, radius: 28, inset: 4, logo: 76 },
     ],
   },
   {
@@ -35,6 +41,11 @@ const sizeClasses = [
       { dpi: 144, chip: 30, radius: 8, inset: 2, logo: 21 },
       { dpi: 168, chip: 35, radius: 9, inset: 2, logo: 25 },
       { dpi: 192, chip: 40, radius: 10, inset: 2, logo: 28 },
+      { dpi: 216, chip: 45, radius: 11, inset: 2, logo: 32 },
+      { dpi: 240, chip: 50, radius: 13, inset: 3, logo: 35 },
+      { dpi: 288, chip: 60, radius: 15, inset: 3, logo: 42 },
+      { dpi: 336, chip: 70, radius: 18, inset: 4, logo: 49 },
+      { dpi: 384, chip: 80, radius: 20, inset: 4, logo: 56 },
     ],
   },
   {
@@ -45,9 +56,18 @@ const sizeClasses = [
       { dpi: 144, chip: 24, radius: 6, inset: 2, logo: 17 },
       { dpi: 168, chip: 28, radius: 7, inset: 2, logo: 19 },
       { dpi: 192, chip: 32, radius: 8, inset: 2, logo: 22 },
+      { dpi: 216, chip: 36, radius: 9, inset: 2, logo: 25 },
+      { dpi: 240, chip: 40, radius: 10, inset: 3, logo: 28 },
+      { dpi: 288, chip: 48, radius: 12, inset: 3, logo: 33 },
+      { dpi: 336, chip: 56, radius: 14, inset: 4, logo: 39 },
+      { dpi: 384, chip: 64, radius: 16, inset: 4, logo: 44 },
     ],
   },
 ];
+const viewportSize =
+  Math.max(...sizeClasses.flatMap(({ buckets }) => buckets.map(({ chip }) => chip))) *
+    supersample +
+  32;
 
 // Render the complete provider tile offline. This keeps the SVG mark and the
 // rounded tile on one antialiasing grid instead of combining a PNG with a
@@ -98,7 +118,9 @@ const browser = await chromium.launch({ executablePath, headless: true });
 const context = await browser.newContext({
   colorScheme: 'dark',
   deviceScaleFactor: 1,
-  viewport: { width: 512, height: 512 },
+  // Derive this from the largest 8x tile so new DPI buckets cannot silently
+  // outgrow the page and get clipped by locator screenshots.
+  viewport: { width: viewportSize, height: viewportSize },
 });
 const page = await context.newPage();
 

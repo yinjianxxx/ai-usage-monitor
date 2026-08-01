@@ -21,8 +21,8 @@ pub(crate) enum Severity {
 pub(crate) enum Attention {
     Normal,
     Warn,
-    Degraded,
-    Error,
+    Stale,
+    ActionRequired,
 }
 
 #[derive(Clone, Debug)]
@@ -39,9 +39,9 @@ pub(crate) struct WindowView {
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderView {
     pub(crate) kind: TrayIconKind,
-    /// Surface-specific taskbar payload. Kept separate from `windows`, whose
-    /// top-two selection is optimized for the floating monitor.
+    /// Canonical headline window shared by every compact surface.
     pub(crate) badge: Option<WindowView>,
+    /// Headline first, then the most urgent remaining window (at most two).
     pub(crate) windows: Vec<WindowView>,
     pub(crate) placeholder: Option<String>,
     pub(crate) attention: Attention,
@@ -115,6 +115,18 @@ pub(crate) fn placeholder_model(
     CompactViewModel { providers }
 }
 
+/// Keep the cached compact surfaces in the same provider order as the tray.
+/// Sorting the existing rows preserves their current values and attention
+/// states even while provider polling is paused or failing.
+pub(crate) fn reorder_providers(model: &mut CompactViewModel, order: &[TrayIconKind]) {
+    model.providers.sort_by_key(|provider| {
+        order
+            .iter()
+            .position(|kind| *kind == provider.kind)
+            .unwrap_or(order.len())
+    });
+}
+
 pub(crate) fn worst_window(provider: &ProviderView) -> Option<&WindowView> {
     provider.windows.iter().reduce(|best, candidate| {
         if candidate.display_percent > best.display_percent
@@ -175,23 +187,32 @@ fn provider_view(
     let windows = usage
         .filter(|usage| !usage.is_empty())
         .map(|usage| {
-            selected_usage_windows(usage)
+            compact_usage_windows(usage)
                 .into_iter()
                 .map(|window| window_view(window, strings))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let placeholder = windows.is_empty().then(|| "--".to_string());
+    let quota_attention = if windows
+        .iter()
+        .any(|window| window.severity == Severity::Warn)
+    {
+        Attention::Warn
+    } else {
+        Attention::Normal
+    };
     let attention = match error {
-        Some(ProviderStatus::RateLimited | ProviderStatus::RequestFailed) => Attention::Degraded,
-        Some(ProviderStatus::AuthRequired) => Attention::Error,
-        None if windows
-            .iter()
-            .any(|window| window.severity == Severity::Warn) =>
-        {
-            Attention::Warn
-        }
-        None => Attention::Normal,
+        Some(ProviderStatus::AuthenticationFailed) => Attention::ActionRequired,
+        // A single rate limit or request failure is handled by automatic retry.
+        // The application layer promotes it to `Stale` only after the value's
+        // freshness or the consecutive-failure count crosses the UI threshold.
+        Some(
+            ProviderStatus::RateLimited
+            | ProviderStatus::NetworkUnavailable
+            | ProviderStatus::RequestFailed,
+        )
+        | None => quota_attention,
     };
     ProviderView {
         kind,
@@ -203,6 +224,13 @@ fn provider_view(
 }
 
 fn badge_usage_window(usage: &UsageData, strings: Strings) -> Option<WindowView> {
+    headline_usage_window(usage).map(|window| window_view(window, strings))
+}
+
+/// One canonical primary value for the taskbar badge, tray icon number,
+/// widget, and floating monitor. A warned window takes priority; otherwise the
+/// five-hour window stays stable, falling back to the shortest known window.
+pub(crate) fn headline_usage_window(usage: &UsageData) -> Option<&UsageWindow> {
     let worst = usage.windows.iter().reduce(|best, candidate| {
         let best_percent = display_percent(best.percentage);
         let candidate_percent = display_percent(candidate.percentage);
@@ -215,10 +243,8 @@ fn badge_usage_window(usage: &UsageData, strings: Strings) -> Option<WindowView>
             best
         }
     });
-    if let Some(warned) = worst.filter(|window| {
-        display_percent(window.percentage.clamp(0.0, 100.0)) >= WARN_THRESHOLD_PERCENT
-    }) {
-        return Some(window_view(warned, strings));
+    if let Some(warned) = worst.filter(|window| display_percent_warns(window.percentage)) {
+        return Some(warned);
     }
 
     usage
@@ -235,30 +261,25 @@ fn badge_usage_window(usage: &UsageData, strings: Strings) -> Option<WindowView>
                 .iter()
                 .min_by_key(|window| duration_rank(window.duration_seconds))
         })
-        .map(|window| window_view(window, strings))
 }
 
 fn window_view(window: &UsageWindow, strings: Strings) -> WindowView {
     let percent = window.percentage.clamp(0.0, 100.0);
     let shown = display_percent(percent);
-    let countdown = if shown == 0 {
+    let countdown = poller::format_countdown(window.resets_at);
+    let countdown = if countdown.is_empty() {
         String::new()
     } else {
-        let countdown = poller::format_countdown(window.resets_at);
-        if countdown.is_empty() {
-            String::new()
-        } else {
-            format!("\u{00b7}{countdown}")
-        }
+        format!("\u{00b7}{countdown}")
     };
     WindowView {
         label: compact_usage_window_label(window, strings),
         percent: Some(percent),
         display_percent: shown,
-        percent_text: format!("{shown}%"),
+        percent_text: display_percent_text(percent),
         countdown,
         duration_seconds: window.duration_seconds,
-        severity: if shown >= WARN_THRESHOLD_PERCENT {
+        severity: if display_percent_warns(percent) {
             Severity::Warn
         } else {
             Severity::Normal
@@ -272,6 +293,14 @@ pub(crate) fn display_percent(percent: f64) -> i32 {
     } else {
         0
     }
+}
+
+pub(crate) fn display_percent_text(percent: f64) -> String {
+    format!("{}%", display_percent(percent))
+}
+
+pub(crate) fn display_percent_warns(percent: f64) -> bool {
+    display_percent(percent) >= WARN_THRESHOLD_PERCENT
 }
 
 pub(crate) fn approximately(actual: u64, expected: u64) -> bool {
@@ -307,17 +336,31 @@ pub(crate) fn compact_usage_window_label(window: &UsageWindow, strings: Strings)
         .unwrap_or_else(|| strings.quota_window.to_string())
 }
 
-pub(crate) fn selected_usage_windows(usage: &UsageData) -> Vec<&UsageWindow> {
-    let mut selected: Vec<&UsageWindow> = usage.windows.iter().collect();
-    if selected.len() > 2 {
-        selected.sort_by(|left, right| {
-            right
-                .percentage
-                .partial_cmp(&left.percentage)
-                .unwrap_or(std::cmp::Ordering::Equal)
+pub(crate) fn compact_usage_windows(usage: &UsageData) -> Vec<&UsageWindow> {
+    let Some(headline) = headline_usage_window(usage) else {
+        return Vec::new();
+    };
+
+    let mut selected = vec![headline];
+    let secondary = usage
+        .windows
+        .iter()
+        .filter(|window| !std::ptr::eq(*window, headline))
+        .reduce(|best, candidate| {
+            let best_percent = display_percent(best.percentage);
+            let candidate_percent = display_percent(candidate.percentage);
+            if candidate_percent > best_percent
+                || (candidate_percent == best_percent
+                    && duration_rank(candidate.duration_seconds)
+                        < duration_rank(best.duration_seconds))
+            {
+                candidate
+            } else {
+                best
+            }
         });
-        selected.truncate(2);
-        selected.sort_by_key(|window| window.duration_seconds.unwrap_or(u64::MAX));
+    if let Some(secondary) = secondary {
+        selected.push(secondary);
     }
     selected
 }
@@ -349,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn warning_and_zero_countdown_rules_are_shared() {
+    fn zero_percent_keeps_a_known_reset_countdown() {
         let strings = LanguageId::English.strings();
         let resets = SystemTime::now().checked_add(Duration::from_secs(4 * 86_400));
         let data = data_with_claude(usage(vec![
@@ -358,12 +401,37 @@ mod tests {
         ]));
         let vm = build(Some(&data), strings, &ORDER, true, false, false);
         assert_eq!(vm.providers[0].attention, Attention::Warn);
-        assert!(vm.providers[0].windows[0].countdown.is_empty());
-        assert_eq!(vm.providers[0].windows[1].severity, Severity::Warn);
+        assert_eq!(vm.providers[0].windows[0].severity, Severity::Warn);
+        assert_eq!(vm.providers[0].windows[0].label, "7d");
+        assert_eq!(
+            vm.providers[0]
+                .windows
+                .iter()
+                .find(|window| window.label == "5h")
+                .unwrap()
+                .countdown,
+            "\u{00b7}4d"
+        );
     }
 
     #[test]
-    fn provider_errors_remain_visible_with_and_without_cached_usage() {
+    fn displayed_percentage_is_the_single_text_and_warning_boundary() {
+        for (raw, shown, text, warns) in [
+            (f64::NAN, 0, "0%", false),
+            (-1.0, 0, "0%", false),
+            (89.4, 89, "89%", false),
+            (89.6, 90, "90%", true),
+            (90.5, 91, "91%", true),
+            (100.4, 100, "100%", true),
+        ] {
+            assert_eq!(display_percent(raw), shown);
+            assert_eq!(display_percent_text(raw), text);
+            assert_eq!(display_percent_warns(raw), warns);
+        }
+    }
+
+    #[test]
+    fn transient_provider_errors_stay_quiet_until_the_application_promotes_them() {
         let strings = LanguageId::English.strings();
         let cached = AppUsageData {
             codex: Some(usage(vec![UsageWindow::new(
@@ -375,7 +443,7 @@ mod tests {
             ..Default::default()
         };
         let vm = build(Some(&cached), strings, &ORDER, false, true, false);
-        assert_eq!(vm.providers[0].attention, Attention::Degraded);
+        assert_eq!(vm.providers[0].attention, Attention::Normal);
         assert_eq!(vm.providers[0].windows[0].percent_text, "51%");
 
         let transient = AppUsageData {
@@ -383,15 +451,27 @@ mod tests {
             ..Default::default()
         };
         let vm = build(Some(&transient), strings, &ORDER, false, true, false);
-        assert_eq!(vm.providers[0].attention, Attention::Degraded);
+        assert_eq!(vm.providers[0].attention, Attention::Normal);
         assert_eq!(vm.providers[0].placeholder.as_deref(), Some("--"));
 
+        let warned_transient = AppUsageData {
+            codex: Some(usage(vec![UsageWindow::new(
+                92.0,
+                None,
+                Some(ONE_WEEK_SECONDS),
+            )])),
+            codex_error: Some(ProviderStatus::RequestFailed),
+            ..Default::default()
+        };
+        let vm = build(Some(&warned_transient), strings, &ORDER, false, true, false);
+        assert_eq!(vm.providers[0].attention, Attention::Warn);
+
         let unavailable = AppUsageData {
-            codex_error: Some(ProviderStatus::AuthRequired),
+            codex_error: Some(ProviderStatus::AuthenticationFailed),
             ..Default::default()
         };
         let vm = build(Some(&unavailable), strings, &ORDER, false, true, false);
-        assert_eq!(vm.providers[0].attention, Attention::Error);
+        assert_eq!(vm.providers[0].attention, Attention::ActionRequired);
         assert_eq!(vm.providers[0].placeholder.as_deref(), Some("--"));
     }
 
@@ -477,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn badge_keeps_five_hour_window_even_when_floating_top_two_omit_it() {
+    fn compact_windows_keep_the_badge_window_as_the_primary_row() {
         let strings = LanguageId::English.strings();
         let data = data_with_claude(usage(vec![
             UsageWindow::new(10.0, None, Some(FIVE_HOURS_SECONDS)),
@@ -488,8 +568,26 @@ mod tests {
         let provider = &vm.providers[0];
 
         assert_eq!(provider.windows.len(), 2);
-        assert!(provider.windows.iter().all(|window| window.label != "5h"));
+        assert_eq!(provider.windows[0].label, "5h");
+        assert_eq!(provider.windows[1].label, "7d");
         assert_eq!(badge_window(provider).unwrap().label, "5h");
+    }
+
+    #[test]
+    fn warned_headline_window_is_first_on_every_compact_surface() {
+        let strings = LanguageId::English.strings();
+        let data = data_with_claude(usage(vec![
+            UsageWindow::new(10.0, None, Some(FIVE_HOURS_SECONDS)),
+            UsageWindow::new(70.0, None, Some(24 * 60 * 60)),
+            UsageWindow::new(92.0, None, Some(ONE_WEEK_SECONDS)),
+        ]));
+        let vm = build(Some(&data), strings, &ORDER, true, false, false);
+        let provider = &vm.providers[0];
+
+        assert_eq!(provider.windows.len(), 2);
+        assert_eq!(provider.windows[0].label, "7d");
+        assert_eq!(provider.windows[1].label, "1d");
+        assert_eq!(badge_window(provider).unwrap().label, "7d");
     }
 
     #[test]
@@ -518,5 +616,40 @@ mod tests {
             .providers
             .iter()
             .all(|provider| provider.placeholder.as_deref() == Some("--")));
+    }
+
+    #[test]
+    fn provider_reorder_preserves_cached_payload_and_attention() {
+        let mut vm = placeholder_model("--", &ORDER, true, true, true);
+        let codex = vm
+            .providers
+            .iter_mut()
+            .find(|provider| provider.kind == TrayIconKind::Codex)
+            .unwrap();
+        codex.placeholder = Some("cached Codex".to_string());
+        codex.attention = Attention::ActionRequired;
+
+        reorder_providers(
+            &mut vm,
+            &[
+                TrayIconKind::Antigravity,
+                TrayIconKind::Codex,
+                TrayIconKind::Claude,
+            ],
+        );
+
+        assert_eq!(
+            vm.providers
+                .iter()
+                .map(|provider| provider.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TrayIconKind::Antigravity,
+                TrayIconKind::Codex,
+                TrayIconKind::Claude,
+            ]
+        );
+        assert_eq!(vm.providers[1].placeholder.as_deref(), Some("cached Codex"));
+        assert_eq!(vm.providers[1].attention, Attention::ActionRequired);
     }
 }

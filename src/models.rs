@@ -68,9 +68,22 @@ impl UsageData {
 /// for the detail popup's per-provider status badges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderStatus {
-    AuthRequired,
+    /// Missing, unusable, expired, revoked, or server-rejected credentials.
+    AuthenticationFailed,
     RateLimited,
+    NetworkUnavailable,
     RequestFailed,
+}
+
+impl ProviderStatus {
+    pub fn needs_credentials(self) -> bool {
+        self == Self::AuthenticationFailed
+    }
+
+    #[cfg(test)]
+    pub fn needs_visible_user_action(self) -> bool {
+        self.needs_credentials()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,8 +97,11 @@ pub struct AppUsageData {
     pub claude_code_error: Option<ProviderStatus>,
     pub codex_error: Option<ProviderStatus>,
     pub antigravity_error: Option<ProviderStatus>,
-    pub rate_limited: bool,
-    pub rate_limit_retry_after_ms: Option<u32>,
+    pub claude_code_retry_after_ms: Option<u32>,
+    pub codex_retry_after_ms: Option<u32>,
+    pub antigravity_retry_after_ms: Option<u32>,
+    /// At least one provider returned a remote 401/403 in this poll pass.
+    pub remote_auth_rejection: bool,
 }
 
 #[cfg(test)]
