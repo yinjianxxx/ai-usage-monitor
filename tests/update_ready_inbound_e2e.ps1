@@ -88,7 +88,16 @@ function Invoke-ReadyProbe {
     }
     finally {
         foreach ($name in $previous.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
+            $value = $previous[$name]
+            if ($null -eq $value) {
+                # pwsh 7 leaves a present-but-empty variable behind when it is
+                # assigned $null, which the next probe would then inherit as a
+                # real value. Removing it from the Env: drive works on both
+                # Windows PowerShell 5.1 and PowerShell 7.
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+            }
         }
     }
 }
