@@ -276,7 +276,9 @@ enum UpdateStatus {
     /// Enough to label the menu entry, not enough to install: the release's
     /// download URL was not kept because a stored one goes stale. Acting on
     /// this runs a fresh check, which then offers the update as usual.
-    AvailableRemembered { version: String },
+    AvailableRemembered {
+        version: String,
+    },
 }
 
 /// Rebuild the display state from what the previous run's last check found.
@@ -4234,7 +4236,12 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
 /// it fires, so a user who grants access later still gets swept.
 fn schedule_provider_detection(hwnd: HWND) {
     unsafe {
-        SetTimer(hwnd, TIMER_PROVIDER_DETECT, PROVIDER_DETECT_INTERVAL_MS, None);
+        SetTimer(
+            hwnd,
+            TIMER_PROVIDER_DETECT,
+            PROVIDER_DETECT_INTERVAL_MS,
+            None,
+        );
     }
 }
 
@@ -13279,8 +13286,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     render_layered();
                     refresh_floating_monitor();
                 }
-                IDM_NOTIFY_SESSION_RESET
-                | IDM_NOTIFY_WEEKLY_RESET => {
+                IDM_NOTIFY_SESSION_RESET | IDM_NOTIFY_WEEKLY_RESET => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -14473,7 +14479,9 @@ mod reset_notification_tests {
             codex_error: Some(ProviderStatus::RateLimited),
             ..Default::default()
         };
-        assert!(!all_shown_providers_need_auth(&transient, false, true, false));
+        assert!(!all_shown_providers_need_auth(
+            &transient, false, true, false
+        ));
     }
 
     /// Only a rejected credential earns a balloon, and the flag it leaves
@@ -14551,10 +14559,7 @@ mod reset_notification_tests {
     /// launch, even though the answer from yesterday was still valid.
     #[test]
     fn the_last_update_result_survives_a_restart() {
-        assert!(matches!(
-            remembered_update_status(None),
-            UpdateStatus::Idle
-        ));
+        assert!(matches!(remembered_update_status(None), UpdateStatus::Idle));
         assert!(matches!(
             remembered_update_status(Some(&settings::LastUpdateOutcome::UpToDate)),
             UpdateStatus::UpToDate
