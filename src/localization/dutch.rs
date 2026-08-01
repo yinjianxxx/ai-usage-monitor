@@ -84,7 +84,8 @@ pub(super) const STRINGS: Strings = Strings {
     detail_badge_near_limit: "Bijna limiet",
     detail_badge_limit_reached: "Limiet bereikt",
     detail_badge_not_signed_in: "Niet gedetecteerd",
-    detail_not_signed_in_action: "Wordt automatisch gedetecteerd nadat u zich bij {provider} aanmeldt",
+    detail_not_signed_in_action:
+        "Wordt automatisch gedetecteerd nadat u zich bij {provider} aanmeldt",
     detail_access_revoked_hint: "Toegang tot {provider} geweigerd",
     detail_access_revoked_outcome: "Schakel deze weer in via het contextmenu",
     provider_detected_title: "{provider} gedetecteerd",

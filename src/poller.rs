@@ -3738,10 +3738,7 @@ mod tests {
             failure.data.claude_code_error,
             Some(ProviderStatus::AuthenticationFailed)
         );
-        assert_eq!(
-            failure.data.codex_error,
-            Some(ProviderStatus::NotSignedIn)
-        );
+        assert_eq!(failure.data.codex_error, Some(ProviderStatus::NotSignedIn));
         assert_eq!(
             failure.data.antigravity_error,
             Some(ProviderStatus::AuthenticationFailed)
