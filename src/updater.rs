@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -360,7 +361,18 @@ fn apply_update(
 /// at that same healthy milestone they may remove a backup orphaned by a
 /// helper that was interrupted after a previous successful replacement.
 fn inbound_ready_request() -> Option<PathBuf> {
-    std::env::var_os(UPDATE_READY_ENV).map(PathBuf::from)
+    inbound_ready_request_from(std::env::var_os(UPDATE_READY_ENV))
+}
+
+/// An empty value is not a transaction.
+///
+/// Only a real marker path means an update helper is waiting on this process.
+/// A present-but-empty variable would otherwise be taken for a transaction and
+/// fail path validation, which aborts an otherwise healthy start - and some
+/// shells leave an empty string behind where the variable was meant to be
+/// cleared. The same guard is applied to `LOCALAPPDATA` in `diagnose.rs`.
+fn inbound_ready_request_from(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 fn cleanup_confirmed_backup_on_normal_start(current_exe: io::Result<PathBuf>) {
@@ -1573,6 +1585,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// A shell that clears the variable by assigning an empty string leaves
+    /// it present-but-empty. Treating that as a transaction made the app fail
+    /// its readiness milestone and refuse to start.
+    #[test]
+    fn an_empty_ready_variable_is_not_an_inbound_transaction() {
+        assert_eq!(inbound_ready_request_from(None), None);
+        assert_eq!(inbound_ready_request_from(Some(OsString::new())), None);
+        assert_eq!(
+            inbound_ready_request_from(Some(OsString::from(r"C:\marker"))),
+            Some(PathBuf::from(r"C:\marker"))
+        );
     }
 
     #[test]
