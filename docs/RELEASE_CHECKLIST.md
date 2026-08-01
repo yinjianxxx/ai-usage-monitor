@@ -33,18 +33,40 @@ with a short note in the release runbook.
   popup opens without a second resident process.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
-- On a fresh profile and on an upgrade from settings without permission
-  fields, confirm each visible provider prompts before any credential read,
-  credential watch, or quota request. The prompt must name the provider,
-  explain that local login state is used only for usage queries without model
-  calls, appear only after an app surface is visible, default to No, minimize
-  and restore without granting access, and persist either decision without
-  prompting again at the next launch.
-- Grant one provider under Provider access and confirm only that provider
-  polls. Rotate its original file or Credential Manager entry and confirm the
-  new credential is picked up without Gengchou storing a token. Revoke access,
-  confirm pending results are discarded and future reads/polls stop, then
-  confirm settings, usage cache, and diagnostics contain no token.
+- On a fresh profile, confirm exactly one permission prompt appears, covering
+  every provider, before any credential read, credential watch, or quota
+  request. It must explain that the access is used only to query usage,
+  consumes no model allowance, and stores no sign-in information; appear only
+  after an app surface is visible; default to No; minimize and restore without
+  granting access; and persist either decision without prompting again at the
+  next launch. Repeat with Common Controls v6 unavailable and confirm the
+  standard Yes/No fallback dialog appears instead of a failed start.
+- After granting on a fresh profile, confirm Gengchou detects the signed-in
+  providers and shows exactly those. On a machine where nothing is signed in,
+  confirm one polled placeholder row remains so the credential watch still
+  notices the first sign-in. After declining, confirm nothing is read or
+  polled.
+- On an upgrade from settings that predate the one-time prompt, confirm no
+  prompt appears and the existing provider selection and permissions are
+  preserved exactly. Repeat from settings that had declined every provider.
+- Sign in to a provider that was not previously detected and confirm
+  **Provider access → Detect providers again** picks it up immediately. Confirm
+  the periodic sweep notifies once per provider and never changes what is
+  displayed on its own, and stays quiet about providers the user turned off.
+- With Codex and Antigravity credentials only inside WSL, confirm they are read
+  from a **running** distribution (`$CODEX_HOME/auth.json` and
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`) and that a stopped
+  distribution is never started by the scheduled check.
+- Confirm a provider with no credential shows **Not detected** with the
+  automatic-recognition note and raises no notification, while an expired or
+  rejected credential still shows **Authentication failed**. Both must park
+  polling and recover automatically once a credential appears.
+- Grant access, then confirm only the shown providers poll. Rotate a provider's
+  original file or Credential Manager entry and confirm the new credential is
+  picked up without Gengchou storing a token. Revoke that one provider under
+  Provider access, confirm the others keep polling, pending results are
+  discarded and future reads/polls stop, then confirm settings, usage cache,
+  and diagnostics contain no token.
 - Confirm Refresh is one submenu whose first item is Refresh now, followed by a
   separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
   minutes); exercise Refresh now and each interval once. While a slow manual
@@ -73,6 +95,11 @@ with a short note in the release runbook.
   and the startup readiness error. While each modal dialog is open, verify the
   Start button, taskbar app buttons, and notification area remain enabled and
   a second update action cannot start behind the prompt.
+- After a check reports up to date, restart and confirm the version menu entry
+  still states it instead of resetting to Check for updates. Repeat with an
+  available update: the restarted entry must name the version and, when acted
+  on, re-check before offering the download. Confirm a failed check clears the
+  remembered answer rather than leaving a stale claim on screen.
 - Restart Explorer and confirm the widget and tray icons recover once, without
   duplicate icons or processes.
 - Lock/unlock Windows and, when available, disconnect/reconnect RDP; confirm no
@@ -100,7 +127,10 @@ with a short note in the release runbook.
   use only `d`/`h`/`m`/`s`/`now`, while detail-popup prose remains localized.
   Sweep all 11 languages for English reset-notification remnants, truncated
   authentication badges, provider/menu terminology, and locale-correct dates;
-  Chinese polling text must not contain an unintended space after “每”.
+  Chinese polling text must not contain an unintended space after “每”. Confirm
+  the in-app brand reads 更筹 in Simplified Chinese and 更籌 in Traditional
+  Chinese, and Gengchou everywhere else, while quota surfaces say Claude and
+  only CLI-specific actions say Claude Code.
 - Drag the detailed tray icons into a different order and confirm the taskbar
   widget and floating window change together after the short stability delay
   (normally about 120ms), without showing an intermediate order or waiting for
@@ -188,8 +218,9 @@ with a short note in the release runbook.
   Desktop first and sign out/in only if needed; use `claude auth login` for the
   standalone CLI.
 - Verify credential-only recovery is silent. When the recovery also changes the
-  CLI version, exactly one notification appears if enabled and none appears if
-  the notification setting is disabled.
+  CLI version, exactly one notification always appears; confirm no setting can
+  suppress it and that no such item remains in the menu. Repeat with
+  `DISABLE_UPDATES=1` and confirm neither the update nor the notification runs.
 - Confirm initial loading, cached data, automatic recovery, and fresh 429/5xx
   or transient request failures show no status badge. A persistent transport
   or request failure (three consecutive failures or stale for the configured

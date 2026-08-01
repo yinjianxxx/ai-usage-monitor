@@ -97,7 +97,7 @@ cargo build --release --locked
 ## 视图之外
 
 - 配额数据来自各服务商实际返回的窗口和重置时间，不做猜测或外推
-- 新安装默认只显示 Codex；Claude、Codex、Google Antigravity 可任意组合启用
+- 新安装只显示在本机探测到的服务商；此后 Claude、Codex、Google Antigravity 可任意组合启用或关闭
 - 高对比度模式下使用 Windows 系统颜色
 - 可选的重置通知（默认关闭）
 - 在 `explorer.exe` 重启和 RDP/锁屏切换后自动恢复；锁屏期间仍按既定间隔轮询，恢复时只重建本地界面，不额外发送请求

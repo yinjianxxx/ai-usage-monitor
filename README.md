@@ -151,8 +151,8 @@ Release maintainers should also follow the
 
 - Quota data comes from what each provider actually reports — windows and
   reset times are never guessed or extrapolated
-- New installations show Codex only; enable any combination of Claude, Codex,
-  and Google Antigravity
+- A new installation shows whichever of Claude, Codex, and Google Antigravity
+  it detects on this machine; enable or disable any combination afterwards
 - Windows system colours in High Contrast mode
 - Optional reset notifications (off by default)
 - Survives `explorer.exe` restarts and RDP / lock-screen transitions; polling
@@ -218,10 +218,11 @@ switch that matters is `DISABLE_UPDATES=1`, which stops the update itself.
 Credential-only recovery and Desktop session selection stay silent. If no
 usable session remains, non-renewable and server-rejected credentials appear as
 **Authentication failed** and ask the user to sign in to Claude again; a
-provider with no credential at all reports **Not detected** instead. In Claude Desktop, send a message first to let the normal
-session flow refresh its credentials; if monitoring still does not recover,
-sign out and back in. In Claude Code CLI, run `claude auth login`. Credential
-watching resumes monitoring automatically after sign-in.
+provider with no credential at all reports **Not detected** instead. In Claude
+Desktop, send a message first to let the normal session flow refresh its
+credentials; if monitoring still does not recover, sign out and back in. In
+Claude Code CLI, run `claude auth login`. Credential watching resumes
+monitoring automatically after sign-in.
 
 The popup reserves badges for four conditions, in priority order:
 **Authentication failed**, **Refresh failed**, **Near limit**, and **Limit
