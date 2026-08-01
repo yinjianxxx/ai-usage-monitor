@@ -23,6 +23,42 @@ $readyDir = Join-Path $testRoot 'ready'
 $marker = Join-Path $readyDir 'update-ready-e2e.marker'
 New-Item -ItemType Directory -Path $readyDir -Force | Out-Null
 
+# What the last probe actually inherited. A failing probe deletes its own
+# evidence with $testRoot, so capture the inputs while they still exist.
+$script:LastProbeEnvironment = '(no probe has run yet)'
+
+$InterestingEnvNames = @(
+    'GENGCHOU_UPDATE_READY_FILE',
+    'GENGCHOU_UPDATE_TEST_READY_DIR',
+    'APPDATA',
+    'LOCALAPPDATA'
+)
+
+function Get-ProbeFailureReport {
+    param(
+        [hashtable]$Environment,
+        [int]$ExitCode
+    )
+
+    $log = '(probe environment has no LOCALAPPDATA)'
+    if ($Environment.ContainsKey('LOCALAPPDATA')) {
+        $logPath = Join-Path ([string]$Environment['LOCALAPPDATA']) 'Gengchou\diagnose.log'
+        if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+            $log = Get-Content -LiteralPath $logPath -Raw
+        } else {
+            $log = "(no diagnose.log at $logPath)"
+        }
+    }
+
+    @"
+exit code: $ExitCode
+environment the probe inherited:
+$script:LastProbeEnvironment
+probe diagnose.log:
+$log
+"@
+}
+
 function Invoke-ReadyProbe {
     param(
         [hashtable]$Environment,
@@ -34,6 +70,10 @@ function Invoke-ReadyProbe {
         $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
     }
+    $script:LastProbeEnvironment = ($InterestingEnvNames | ForEach-Object {
+            $value = [Environment]::GetEnvironmentVariable($_, 'Process')
+            if ($null -eq $value) { "  $_ = (unset)" } else { "  $_ = $value" }
+        }) -join [Environment]::NewLine
     try {
         $process = Start-Process -FilePath $ProbeBinary `
             -ArgumentList '--confirm-update-ready-test' `
@@ -62,7 +102,7 @@ try {
     }
     $exitCode = Invoke-ReadyProbe -Environment $environment
     if ($exitCode -ne 0) {
-        throw "Inbound readiness probe exited with $exitCode."
+        throw "Inbound readiness probe failed.`n$(Get-ProbeFailureReport -Environment $environment -ExitCode $exitCode)"
     }
     $content = [IO.File]::ReadAllText($marker, [Text.Encoding]::UTF8)
     if ($content -ne "Gengchou update ready`n") {
@@ -92,7 +132,7 @@ try {
             -Environment $normalEnvironment `
             -ProbeBinary $normalProbe
         if ($normalExitCode -ne 0) {
-            throw "Normal readiness probe with locked backup exited with $normalExitCode."
+            throw "Normal readiness probe with locked backup failed.`n$(Get-ProbeFailureReport -Environment $normalEnvironment -ExitCode $normalExitCode)"
         }
         if (-not (Test-Path -LiteralPath $normalBackup -PathType Leaf)) {
             throw 'The locked confirmed backup was unexpectedly removed.'
@@ -106,7 +146,7 @@ try {
         -Environment $normalEnvironment `
         -ProbeBinary $normalProbe
     if ($cleanupExitCode -ne 0) {
-        throw "Normal readiness cleanup probe exited with $cleanupExitCode."
+        throw "Normal readiness cleanup probe failed.`n$(Get-ProbeFailureReport -Environment $normalEnvironment -ExitCode $cleanupExitCode)"
     }
     if (Test-Path -LiteralPath $normalBackup) {
         throw 'The confirmed backup was not removed after its lock was released.'
