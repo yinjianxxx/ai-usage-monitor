@@ -671,8 +671,11 @@ fn poll_claude_code(force_refresh: bool) -> Result<UsageData, PollError> {
             if let Some(result) = try_claude_desktop(force_refresh) {
                 return result;
             }
-            clear_claude_auth_rejection();
-            return Err(PollError::NoCredentials);
+            let poll_error = claude_credential_problem_poll_error(problem);
+            if matches!(poll_error, PollError::NoCredentials) {
+                clear_claude_auth_rejection();
+            }
+            return Err(poll_error);
         }
     };
 
@@ -1089,9 +1092,7 @@ pub fn detect_signed_in_providers() -> DetectedProviders {
         claude_windows: windows_credential_source()
             .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
         claude_desktop: claude_desktop::enabled()
-            && claude_desktop::credential_watch_paths()
-                .iter()
-                .any(|path| path.exists()),
+            && claude_desktop::read_candidates(now_unix_millis()).is_ok(),
         claude_wsl,
         codex_windows: read_windows_codex_credentials().is_some(),
         codex_wsl: !running.is_empty() && read_codex_credentials_from_wsl(&running).is_some(),
@@ -2250,6 +2251,17 @@ impl ClaudeCredentialProblem {
     }
 }
 
+fn claude_credential_problem_poll_error(problem: ClaudeCredentialProblem) -> PollError {
+    match problem {
+        ClaudeCredentialProblem::Missing => PollError::NoCredentials,
+        ClaudeCredentialProblem::Unreadable
+        | ClaudeCredentialProblem::InvalidJson
+        | ClaudeCredentialProblem::UnsupportedShape
+        | ClaudeCredentialProblem::RefreshMissing
+        | ClaudeCredentialProblem::RefreshExpired => PollError::AuthRequired,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClaudeCredentialLifecycle {
     Usable,
@@ -2528,11 +2540,16 @@ pub fn claude_auth_diagnostics_report() -> String {
 }
 
 fn codex_home() -> Option<PathBuf> {
-    if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        return Some(codex_home);
-    }
+    codex_home_from(
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
 
-    Some(dirs::home_dir()?.join(".codex"))
+fn codex_home_from(configured: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    configured
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| home.map(|home| home.join(".codex")))
 }
 
 fn codex_direct_keyring_target_from_path(path: &str) -> Option<String> {
@@ -3063,6 +3080,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_ignores_an_empty_override() {
+        let home = PathBuf::from(r"C:\Users\Example");
+        let configured = PathBuf::from(r"D:\CodexProfile");
+        assert_eq!(
+            codex_home_from(Some(configured.clone()), Some(home.clone())),
+            Some(configured)
+        );
+        assert_eq!(
+            codex_home_from(Some(PathBuf::new()), Some(home.clone())),
+            Some(home.join(".codex"))
+        );
+        assert_eq!(codex_home_from(None, None), None);
+    }
+
+    #[test]
     fn wsl_read_watch_and_diagnostics_share_the_supported_config_resolution() {
         for script in [WSL_CREDENTIAL_READ_SCRIPT, WSL_CREDENTIAL_PATH_SCRIPT] {
             assert!(script.contains("${CLAUDE_CONFIG_DIR:-$HOME/.claude}"));
@@ -3095,6 +3127,26 @@ mod tests {
             parse_credentials(r#"{"claudeAiOauth":{}}"#, source),
             Err(ClaudeCredentialProblem::UnsupportedShape)
         ));
+    }
+
+    #[test]
+    fn claude_credential_problems_distinguish_missing_from_unusable_credentials() {
+        assert_eq!(
+            claude_credential_problem_poll_error(ClaudeCredentialProblem::Missing),
+            PollError::NoCredentials
+        );
+        for problem in [
+            ClaudeCredentialProblem::Unreadable,
+            ClaudeCredentialProblem::InvalidJson,
+            ClaudeCredentialProblem::UnsupportedShape,
+            ClaudeCredentialProblem::RefreshMissing,
+            ClaudeCredentialProblem::RefreshExpired,
+        ] {
+            assert_eq!(
+                claude_credential_problem_poll_error(problem),
+                PollError::AuthRequired
+            );
+        }
     }
 
     #[test]

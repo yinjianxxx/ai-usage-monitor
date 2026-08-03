@@ -247,11 +247,13 @@ On first start Gengchou asks once for permission, explaining that the access is
 used only to query usage, consumes no model allowance, and stores no sign-in
 information. Permission defaults to **No**, and no credential is read before it
 is granted. Once granted, Gengchou checks which providers are signed in on this
-machine and shows only those. Permission is granted once for every provider,
-but revoking stays per provider: use **Provider access** in the context menu to
-turn any single one off at any time. Gengchou re-reads the original file or
-Windows Credential Manager entry as needed, so provider-side token refresh
-continues to work without copying the token into Gengchou.
+machine and shows those providers. If none are detected, it keeps a locally
+polled Codex placeholder visible so the first sign-in can be recognized without
+changing the user's provider selection. Permission is granted once for every
+provider, but revoking stays per provider: use **Provider access** in the
+context menu to turn any single one off at any time. Gengchou re-reads the
+original file or Windows Credential Manager entry as needed, so provider-side
+token refresh continues to work without copying the token into Gengchou.
 
 Upgrading from an earlier version does not show the prompt again and keeps the
 existing provider selection and permissions as they are. To pick up a newly

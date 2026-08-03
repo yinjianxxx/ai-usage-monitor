@@ -1472,7 +1472,14 @@ fn is_winget_install_path(path: &Path) -> bool {
     winget_install_roots()
         .into_iter()
         .map(|root| normalize_path(&root))
-        .any(|root| normalized_path.starts_with(&root))
+        .any(|root| normalized_path_is_within_root(&normalized_path, &root))
+}
+
+fn normalized_path_is_within_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
 fn winget_install_roots() -> Vec<PathBuf> {
@@ -1961,6 +1968,20 @@ mod tests {
         assert!(command.contains("catch { $exitCode = 23 }"));
         assert!(command.contains("exit 21"));
         assert!(command.contains("exit 22"));
+    }
+
+    #[test]
+    fn winget_root_matching_requires_a_path_component_boundary() {
+        let root = r"c:\users\example\appdata\local\microsoft\winget\packages";
+        assert!(normalized_path_is_within_root(
+            r"c:\users\example\appdata\local\microsoft\winget\packages\ynjmxn.gengchou\gengchou.exe",
+            root
+        ));
+        assert!(normalized_path_is_within_root(root, root));
+        assert!(!normalized_path_is_within_root(
+            r"c:\users\example\appdata\local\microsoft\winget\packagesbackup\gengchou.exe",
+            root
+        ));
     }
 
     #[test]
