@@ -7,8 +7,9 @@ use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
     ExtractIconExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO,
-    NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS,
-    NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+    NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_LARGE_ICON, NIIF_NONE, NIIF_NOSOUND, NIIF_USER,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT,
+    NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4, NOTIFY_ICON_INFOTIP_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -507,22 +508,68 @@ pub fn create_icon(
     }
 }
 
+/// How much a balloon is asking of the user. This is the same distinction the
+/// detail window already draws between a degraded badge and an action-required
+/// one: the system warning glyph is reserved for the notifications that stop
+/// monitoring until the user does something, so that seeing it still means
+/// something by the time one arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BalloonTone {
+    /// Reports something that already happened - a finished CLI update, an
+    /// elapsed quota window, a newly detected provider. Carries the app icon
+    /// and no sound.
+    Info,
+    /// Monitoring is stopped until the user acts, currently only a credential
+    /// that the provider rejected.
+    ActionRequired,
+}
+
+/// Balloon icon and sound for a tone. `has_custom_icon` reports whether an app
+/// icon was actually loaded for `hBalloonIcon`.
+fn balloon_info_flags(tone: BalloonTone, has_custom_icon: bool) -> NOTIFY_ICON_INFOTIP_FLAGS {
+    match tone {
+        BalloonTone::Info if has_custom_icon => NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND,
+        // NIIF_USER without a handle falls back to the notification area icon,
+        // which here is a live percentage read-out that is unreadable at
+        // balloon size. Leave the slot empty rather than show that.
+        BalloonTone::Info => NIIF_NONE | NIIF_NOSOUND,
+        BalloonTone::ActionRequired => NIIF_WARNING,
+    }
+}
+
 /// Show a Windows balloon notification from the tray icon.
-/// Used to alert the user when re-authentication is required.
-pub fn notify_balloon(hwnd: HWND, kind: TrayIconKind, title: &str, message: &str) {
+pub fn notify_balloon(
+    hwnd: HWND,
+    kind: TrayIconKind,
+    tone: BalloonTone,
+    title: &str,
+    message: &str,
+) {
     unsafe {
+        let balloon_icon = match tone {
+            BalloonTone::Info => load_embedded_app_icon_of_size(hwnd, true),
+            BalloonTone::ActionRequired => HICON::default(),
+        };
+        let info_flags = balloon_info_flags(tone, !balloon_icon.is_invalid());
         let mut nid = notify_icon_data(hwnd, kind);
         nid.uFlags |= NIF_INFO;
-        nid.dwInfoFlags = NIIF_WARNING;
+        nid.dwInfoFlags = info_flags;
+        nid.hBalloonIcon = balloon_icon;
         copy_wide(title, &mut nid.szInfoTitle);
         copy_wide_256(message, &mut nid.szInfo);
         if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
             let mut app_nid = app_notify_icon_data(hwnd);
             app_nid.uFlags |= NIF_INFO;
-            app_nid.dwInfoFlags = NIIF_WARNING;
+            app_nid.dwInfoFlags = info_flags;
+            app_nid.hBalloonIcon = balloon_icon;
             copy_wide(title, &mut app_nid.szInfoTitle);
             copy_wide_256(message, &mut app_nid.szInfo);
             let _ = Shell_NotifyIconW(NIM_MODIFY, &app_nid);
+        }
+        // The shell takes its own copy while Shell_NotifyIconW runs, as it
+        // does for the tray icon handle in `ensure`.
+        if !balloon_icon.is_invalid() {
+            let _ = DestroyIcon(balloon_icon);
         }
     }
 }
@@ -663,11 +710,22 @@ pub fn ensure(hwnd: HWND, kind: TrayIconKind, percents: &[f64], tooltip: &str) {
 }
 
 fn load_embedded_app_icon(hwnd: HWND) -> HICON {
+    load_embedded_app_icon_of_size(hwnd, false)
+}
+
+/// `want_large` asks for the 32px-class icon a balloon's custom icon slot
+/// expects; the notification area itself wants the small one.
+fn load_embedded_app_icon_of_size(hwnd: HWND, want_large: bool) -> HICON {
     unsafe {
         let dpi = GetDpiForWindow(hwnd);
         let dpi = if dpi == 0 { 96 } else { dpi };
-        let width = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
-        let height = GetSystemMetricsForDpi(SM_CYSMICON, dpi);
+        let (cx, cy) = if want_large {
+            (SM_CXICON, SM_CYICON)
+        } else {
+            (SM_CXSMICON, SM_CYSMICON)
+        };
+        let width = GetSystemMetricsForDpi(cx, dpi);
+        let height = GetSystemMetricsForDpi(cy, dpi);
         if width > 0 && height > 0 {
             if let Ok(module) = GetModuleHandleW(PCWSTR::null()) {
                 let resource = PCWSTR::from_raw(APP_ICON_RESOURCE_ID as *const u16);
@@ -701,13 +759,18 @@ fn load_embedded_app_icon(hwnd: HWND) -> HICON {
         {
             return HICON::default();
         }
-        if !small.is_invalid() {
-            if !large.is_invalid() {
-                let _ = DestroyIcon(large);
-            }
-            small
+        let (preferred, other) = if want_large {
+            (large, small)
         } else {
-            large
+            (small, large)
+        };
+        if !preferred.is_invalid() {
+            if !other.is_invalid() {
+                let _ = DestroyIcon(other);
+            }
+            preferred
+        } else {
+            other
         }
     }
 }
@@ -921,6 +984,29 @@ mod tests {
         assert_eq!(
             (rounded_warning.r, rounded_warning.g, rounded_warning.b),
             (0xE5, 0x48, 0x4D)
+        );
+    }
+
+    /// The warning glyph is the app's only "you have to do something" marker
+    /// in the notification area. Routine disclosures must not spend it, or it
+    /// stops meaning anything by the time a credential actually fails.
+    #[test]
+    fn only_action_required_balloons_carry_the_system_warning_glyph() {
+        assert_eq!(
+            balloon_info_flags(BalloonTone::ActionRequired, false),
+            NIIF_WARNING
+        );
+        assert_eq!(
+            balloon_info_flags(BalloonTone::ActionRequired, true),
+            NIIF_WARNING
+        );
+        assert_eq!(
+            balloon_info_flags(BalloonTone::Info, true),
+            NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND
+        );
+        assert_eq!(
+            balloon_info_flags(BalloonTone::Info, false),
+            NIIF_NONE | NIIF_NOSOUND
         );
     }
 

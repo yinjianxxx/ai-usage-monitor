@@ -4226,7 +4226,13 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
             .provider_detected_title
             .replace("{provider}", provider);
         diagnose::log(format!("detected newly available provider {provider}"));
-        tray_icon::notify_balloon(main_hwnd, kind, &title, strings.provider_detected_body);
+        tray_icon::notify_balloon(
+            main_hwnd,
+            kind,
+            tray_icon::BalloonTone::Info,
+            &title,
+            strings.provider_detected_body,
+        );
     }
 }
 
@@ -11743,6 +11749,7 @@ fn notify_claude_cli_update_if_needed(hwnd: HWND) {
     tray_icon::notify_balloon(
         hwnd,
         tray_icon::TrayIconKind::Claude,
+        tray_icon::BalloonTone::Info,
         strings.claude_cli_updated_title,
         &body,
     );
@@ -11961,6 +11968,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     tray_icon::notify_balloon(
                         main_hwnd,
                         notification.kind,
+                        tray_icon::BalloonTone::Info,
                         &notification.title,
                         &notification.body,
                     );
@@ -12048,7 +12056,13 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     })
                 };
                 if let Some((title, body)) = balloon {
-                    tray_icon::notify_balloon(main_hwnd, kind, &title, &body);
+                    tray_icon::notify_balloon(
+                        main_hwnd,
+                        kind,
+                        tray_icon::BalloonTone::ActionRequired,
+                        &title,
+                        &body,
+                    );
                 }
             }
 
@@ -12283,7 +12297,13 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     })
                 };
                 if let Some((title, body)) = balloon {
-                    tray_icon::notify_balloon(main_hwnd, kind, &title, &body);
+                    tray_icon::notify_balloon(
+                        main_hwnd,
+                        kind,
+                        tray_icon::BalloonTone::ActionRequired,
+                        &title,
+                        &body,
+                    );
                 }
             }
 
