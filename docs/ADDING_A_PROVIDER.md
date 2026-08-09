@@ -3,6 +3,11 @@
 Working notes for the cost of adding a fourth quota provider, plus the
 OpenCode Go research that prompted them.
 
+Any implementation must preserve the release-blocking constraints in
+[`docs/INVARIANTS.md`](INVARIANTS.md), especially explicit credential access,
+credential-free persistence and diagnostics, bounded provider responses, and
+the stable package/data/update identities.
+
 > **This document is a snapshot taken on 2026-08-06. Re-verify before acting
 > on any of it.**
 >
@@ -117,6 +122,11 @@ simplification of existing duplication, have unit-test coverage already, and
 touch neither the UI nor persisted state. Stop there unless a fourth provider is
 actually landing.
 
+Decision reaffirmed on 2026-08-09: do not split `window.rs` merely to reduce its
+line count. Reconsider a responsibility split when a fourth provider is
+approved for implementation or when the file grows materially again; keep any
+such change separate from provider behavior and settings migration.
+
 ### 2.1 If a balance-style measure is ever added
 
 A prepaid balance (for example a Zen credit balance) is not a quota window: it
@@ -202,9 +212,9 @@ particular:
 
 Its automatic browser-cookie extraction (DPAPI decryption of Chromium cookie
 databases) is deliberately **not** recommended here: it is a much larger step
-than reading an AI CLI's own credential file, and conflicts with both this
-repository's stated credential policy and `AGENTS.md`'s rule against persisting
-cookies or session data.
+than reading an AI CLI's own credential file, and conflicts with this
+repository's tracked credential policy in
+[`docs/INVARIANTS.md`](INVARIANTS.md).
 
 ### 3.4 Decision recorded on 2026-08-06
 

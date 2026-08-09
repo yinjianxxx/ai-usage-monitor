@@ -4,11 +4,18 @@ Use this checklist before creating a version tag. Automated checks remain the
 release gate; unavailable hardware-specific rows may be marked not applicable
 with a short note in the release runbook.
 
+Read [`INVARIANTS.md`](INVARIANTS.md) before changing a release candidate. If a
+release comparison crosses v2.3.2-v2.4.0, use the anchors in
+[`RELEASE_HISTORY.md`](RELEASE_HISTORY.md) instead of a raw tag range.
+
 ## Automated
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --locked`
+- The immediately preceding official version tag is an ancestor of the release
+  commit; the release workflow enforces this and published tags are never moved
+  to repair a failure.
 - RustSec `audit-check` passes against the committed `Cargo.lock`, with informational
   warnings denied by `.cargo/audit.toml`
 - `tools\check-retired-identity.ps1`
@@ -20,6 +27,13 @@ with a short note in the release runbook.
 - Confirm tests cover settings that predate provider permissions, the
   default-deny permission state, and the hard poll gate that requires both
   visibility and explicit provider permission.
+- Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
+  snapshot rejection, and diagnostic-log runtime/external rotation.
+- Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
+  and principal dependencies and record whether an upgrade is justified.
+  Between minor releases, review them immediately only for a security advisory,
+  upstream end-of-support notice, or a reproduced compatibility problem; do
+  not destabilize a patch release solely to follow the newest version.
 - Confirm the built file is `target/release/gengchou.exe`; inspect PE properties
   for ProductName `Gengchou`, version/tag agreement, retained upstream
   copyright/Comments, and the unchanged v2.1.0 application icon.
@@ -57,16 +71,26 @@ with a short note in the release runbook.
   from a **running** distribution (`$CODEX_HOME/auth.json` and
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`) and that a stopped
   distribution is never started by the scheduled check.
+- Force a WSL credential probe spawn failure, timeout, and unexpected exit;
+  each must follow the transient request-failure path and must not show an
+  authentication warning. A concrete credential file that is present but
+  unreadable (including the WSL exit-45 path), malformed, expired, or rejected
+  must still use **Authentication failed** and the sign-in recovery.
 - Confirm a provider with no credential shows **Not detected** with the
-  automatic-recognition note and raises no notification, while an expired or
-  rejected credential still shows **Authentication failed**. Both must park
-  polling and recover automatically once a credential appears.
+  automatic-recognition note and raises no notification, while a concrete but
+  unusable credential shows **Authentication failed**. Both credential states
+  must park polling and recover automatically once a credential appears.
 - Grant access, then confirm only the shown providers poll. Rotate a provider's
   original file or Credential Manager entry and confirm the new credential is
   picked up without Gengchou storing a token. Revoke that one provider under
   Provider access, confirm the others keep polling, pending results are
   discarded and future reads/polls stop, then confirm settings, usage cache,
   and diagnostics contain no token.
+- Drive diagnostics past 1 MB without restarting. Confirm rotation happens
+  during the run, later lines continue in `diagnose.log`, and only that file
+  plus `diagnose.log.old` remain. Rename the current file externally, create a
+  replacement, and confirm the next line follows the replacement rather than
+  the renamed file.
 - Confirm Refresh is one submenu whose first item is Refresh now, followed by a
   separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
   minutes); exercise Refresh now and each interval once. While a slow manual
@@ -143,8 +167,13 @@ with a short note in the release runbook.
 - Disable Provider tray icons and confirm the three provider icons are replaced
   by one app icon matching the executable; re-enable it and confirm all enabled
   provider icons return without duplicates. At each tested DPI, confirm the app
-  icon fills the Shell slot without clipping. Exercise a notification in both
-  modes.
+  icon fills the Shell slot without clipping. Exercise this notification
+  matrix in both tray-icon modes:
+  - provider detection, quota reset, and Claude Code update: Gengchou app icon,
+    silent, no Windows warning glyph;
+  - current unusable/rejected credential: Windows warning glyph and sound;
+  - simulated app-icon load failure for a routine event: silent with an empty
+    icon slot, never the percentage tray icon and never a warning glyph.
 - Hover each provider icon and confirm its title and quota windows use separate
   lines with reset timing in parentheses. Disable Provider tray icons and
   confirm the app icon uses one compact line per provider without mid-line
@@ -268,8 +297,13 @@ with a short note in the release runbook.
 - Publish and re-download the final GitHub release before preparing any WinGet
   manifest; use the public `gengchou-windows-x64.zip` URL and its released
   SHA-256, never a draft or local build.
-- Submit or update `ynjmxn.Gengchou` only after the matching GitHub release is
-  public, then wait for the WinGet validation pipeline and review.
+- Generate the update with `wingetcreate update ynjmxn.Gengchou --version
+  <version> --urls <public-zip-url> --out manifests`; do not use
+  `update --submit`. In the generated locale manifest set `Author` exactly to
+  `ynjmxn, lvfeinan and contributors`, keep Publisher and Copyright unchanged,
+  run manifest validation, and inspect the complete diff before submitting.
+- Submit `ynjmxn.Gengchou` only after the matching GitHub release is public,
+  then wait for the WinGet validation pipeline and review.
 - After the WinGet pull request is merged, install the public package on a
   clean Windows profile, confirm the installed command is `gengchou`, and test
   launch, update detection, and uninstall.

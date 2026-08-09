@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v2.*"
+      - "v*"
 
 permissions:
   contents: write
@@ -19,6 +19,38 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify previous release ancestry
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "Release tag has an unsupported version shape: $env:GITHUB_REF_NAME"
+          }
+          $currentVersion = [version]$Matches.version
+          $priorTags = @(
+            git tag --list |
+              ForEach-Object {
+                if ($_ -match '^v(?<version>\d+\.\d+\.\d+)$') {
+                  [pscustomobject]@{
+                    Tag = $_
+                    Version = [version]$Matches.version
+                  }
+                }
+              } |
+              Where-Object {
+                $_.Version.Major -ge 2 -and $_.Version -lt $currentVersion
+              } |
+              Sort-Object Version -Descending
+          )
+          $previous = $priorTags | Select-Object -First 1
+          if ($null -eq $previous) {
+            throw "No preceding official v2-or-later release tag was found."
+          }
+          git merge-base --is-ancestor $previous.Tag HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Previous release tag $($previous.Tag) is not an ancestor of $env:GITHUB_REF_NAME. Do not move tags or rewrite published history."
+          }
 
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0

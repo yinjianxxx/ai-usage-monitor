@@ -1,18 +1,63 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Threading::{
+    CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
+};
 
-/// Rotate the log once it grows past this size; one previous generation is
-/// kept as `diagnose.log.old`.
+/// Rotate before a write would grow the current log past this size; one
+/// previous generation is kept as `diagnose.log.old`.
 const MAX_LOG_BYTES: u64 = 1_000_000;
 const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
+const DIAGNOSTIC_LOG_MUTEX_NAME: &str = "Global\\Gengchou-DiagnosticLog-v1";
 
 struct DiagnoseState {
-    file: Mutex<File>,
+    path: PathBuf,
+    local_writer: Mutex<()>,
+    cross_process_mutex: HANDLE,
+}
+
+// Windows synchronization handles may be waited on and released from any
+// thread. `local_writer` serializes this process and the named mutex
+// serializes all cooperating processes before the handle is used.
+unsafe impl Send for DiagnoseState {}
+unsafe impl Sync for DiagnoseState {}
+
+impl Drop for DiagnoseState {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.cross_process_mutex);
+        }
+    }
+}
+
+impl DiagnoseState {
+    fn write_line(&self, line: &str) -> Result<(), String> {
+        let _local_writer = self
+            .local_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _cross_process_writer = acquire_log_mutex(self.cross_process_mutex)?;
+        write_log_line_at_path(&self.path, line)
+    }
+}
+
+struct LogMutexGuard(HANDLE);
+
+impl Drop for LogMutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+        }
+    }
 }
 
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
@@ -37,7 +82,31 @@ fn log_path() -> Result<PathBuf, String> {
     Ok(base.join("Gengchou").join("diagnose.log"))
 }
 
+fn create_log_mutex() -> Result<HANDLE, String> {
+    let name: Vec<u16> = OsStr::new(DIAGNOSTIC_LOG_MUTEX_NAME)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe { CreateMutexW(None, false, PCWSTR::from_raw(name.as_ptr())) }
+        .map_err(|error| format!("Unable to create diagnostic log mutex: {error}"))
+}
+
+fn acquire_log_mutex(handle: HANDLE) -> Result<LogMutexGuard, String> {
+    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if result == WAIT_OBJECT_0 || result == WAIT_ABANDONED {
+        Ok(LogMutexGuard(handle))
+    } else {
+        Err(format!(
+            "Unable to acquire diagnostic log mutex: wait result {result:?}"
+        ))
+    }
+}
+
 pub fn init() -> Result<PathBuf, String> {
+    if let Some(state) = DIAGNOSE_STATE.get() {
+        return Ok(state.path.clone());
+    }
+
     let path = log_path()?;
     let parent = path
         .parent()
@@ -49,61 +118,22 @@ pub fn init() -> Result<PathBuf, String> {
         )
     })?;
     validate_regular_directory(parent)?;
-    validate_regular_file_if_exists(&path)?;
 
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        if metadata.len() > MAX_LOG_BYTES {
-            let old = path.with_extension("log.old");
-            validate_regular_file_if_exists(&old)?;
-            match std::fs::remove_file(&old) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "Unable to remove rotated diagnostic log {}: {error}",
-                        old.display()
-                    ))
-                }
-            }
-            std::fs::rename(&path, &old).map_err(|error| {
-                format!(
-                    "Unable to rotate diagnostic log {}: {error}",
-                    path.display()
-                )
-            })?;
-        }
-    }
-
-    // Append (never truncate): relaunched instances share the file, and the
-    // record of why a previous instance died must survive its successor.
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("Unable to open diagnostic log file {}: {e}", path.display()))?;
-    let opened_metadata = file.metadata().map_err(|error| {
-        format!(
-            "Unable to verify opened diagnostic log {}: {error}",
-            path.display()
-        )
-    })?;
-    if !opened_metadata.is_file()
-        || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
-    {
-        return Err(format!(
-            "Refusing non-regular diagnostic log {}.",
-            path.display()
-        ));
-    }
-
-    let _ = DIAGNOSE_STATE.set(DiagnoseState {
-        file: Mutex::new(file),
-    });
-
-    log(format!(
-        "--- diagnostic logging started v{} ---",
+    let state = DiagnoseState {
+        path: path.clone(),
+        local_writer: Mutex::new(()),
+        cross_process_mutex: create_log_mutex()?,
+    };
+    state.write_line(&format!(
+        "[{} pid={}] --- diagnostic logging started v{} ---\n",
+        timestamp(),
+        std::process::id(),
         env!("CARGO_PKG_VERSION")
-    ));
+    ))?;
+
+    // A concurrent second init can only have installed an equivalent state.
+    // Dropping this one closes its extra handle while preserving the winner.
+    let _ = DIAGNOSE_STATE.set(state);
     Ok(path)
 }
 
@@ -122,10 +152,10 @@ fn validate_regular_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_regular_file_if_exists(path: &Path) -> Result<(), String> {
+fn regular_file_length_if_exists(path: &Path) -> Result<Option<u64>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("Unable to inspect {}: {error}", path.display())),
     };
     if !metadata.is_file()
@@ -137,7 +167,72 @@ fn validate_regular_file_if_exists(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    Ok(Some(metadata.len()))
+}
+
+fn validate_opened_log(file: &File, path: &Path) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "Unable to verify opened diagnostic log {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0 {
+        return Err(format!(
+            "Refusing non-regular diagnostic log {}.",
+            path.display()
+        ));
+    }
     Ok(())
+}
+
+fn rotate_log(path: &Path) -> Result<(), String> {
+    let old = path.with_extension("log.old");
+    let _ = regular_file_length_if_exists(&old)?;
+    match std::fs::remove_file(&old) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Unable to remove rotated diagnostic log {}: {error}",
+                old.display()
+            ))
+        }
+    }
+    std::fs::rename(path, &old).map_err(|error| {
+        format!(
+            "Unable to rotate diagnostic log {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Caller must hold both the in-process writer lock and the named mutex.
+fn write_log_line_at_path(path: &Path, line: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Diagnostic log path has no parent directory.".to_string())?;
+    validate_regular_directory(parent)?;
+
+    let current_length = regular_file_length_if_exists(path)?.unwrap_or(0);
+    let incoming_length = u64::try_from(line.len()).unwrap_or(u64::MAX);
+    if current_length > 0 && current_length.saturating_add(incoming_length) > MAX_LOG_BYTES {
+        rotate_log(path)?;
+    }
+
+    // Reopen the current pathname for every write. If another process or a
+    // support tool rotated it, this prevents a long-lived handle from
+    // continuing to append to the renamed `.old` file.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("Unable to open diagnostic log {}: {error}", path.display()))?;
+    validate_opened_log(&file, path)?;
+    file.write_all(line.as_bytes())
+        .map_err(|error| format!("Unable to write diagnostic log {}: {error}", path.display()))?;
+    file.flush()
+        .map_err(|error| format!("Unable to flush diagnostic log {}: {error}", path.display()))
 }
 
 fn timestamp() -> String {
@@ -152,22 +247,121 @@ pub fn log(message: impl AsRef<str>) {
     let Some(state) = DIAGNOSE_STATE.get() else {
         return;
     };
-
-    // Recover a poisoned lock: the panic hook logs from panicking threads.
-    let mut file = match state.file.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let _ = writeln!(
-        file,
-        "[{} pid={}] {}",
+    let _ = state.write_line(&format!(
+        "[{} pid={}] {}\n",
         timestamp(),
         std::process::id(),
         message.as_ref()
-    );
-    let _ = file.flush();
+    ));
 }
 
 pub fn log_error(context: &str, error: impl std::fmt::Display) {
     log(format!("{context}: {error}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "gengchou-diagnose-test-{}-{name}-{id}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("unable to create test directory: {error}"),
+                }
+            }
+        }
+
+        fn log_path(&self) -> PathBuf {
+            self.0.join("diagnose.log")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn runtime_write_rotates_before_crossing_the_limit() {
+        let directory = TestDirectory::new("runtime-rotation");
+        let path = directory.log_path();
+        let old = path.with_extension("log.old");
+        let original = vec![b'x'; MAX_LOG_BYTES as usize - 2];
+        std::fs::write(&path, &original).expect("large current log");
+
+        write_log_line_at_path(&path, "new\n").expect("rotating write");
+
+        assert_eq!(std::fs::read(&old).expect("rotated log"), original);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("current log"),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn reopening_each_write_follows_an_external_rotation() {
+        let directory = TestDirectory::new("external-rotation");
+        let path = directory.log_path();
+        let external = directory.0.join("external.log");
+        write_log_line_at_path(&path, "first\n").expect("first write");
+        std::fs::rename(&path, &external).expect("external rotation");
+        std::fs::write(&path, "replacement\n").expect("external replacement");
+
+        write_log_line_at_path(&path, "second\n").expect("second write");
+
+        assert_eq!(
+            std::fs::read_to_string(&external).expect("external archive"),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("replacement current log"),
+            "replacement\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn repeated_runtime_rotation_keeps_only_current_and_one_old_generation() {
+        let directory = TestDirectory::new("two-generations");
+        let path = directory.log_path();
+        let old = path.with_extension("log.old");
+        std::fs::write(&old, "stale generation\n").expect("stale old log");
+
+        std::fs::write(&path, vec![b'a'; MAX_LOG_BYTES as usize])
+            .expect("first oversized current log");
+        write_log_line_at_path(&path, "first\n").expect("first rotation");
+        std::fs::write(&path, vec![b'b'; MAX_LOG_BYTES as usize])
+            .expect("second oversized current log");
+        write_log_line_at_path(&path, "second\n").expect("second rotation");
+
+        let mut names = std::fs::read_dir(&directory.0)
+            .expect("diagnostic directory")
+            .map(|entry| entry.expect("diagnostic entry").file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                OsStr::new("diagnose.log").to_os_string(),
+                OsStr::new("diagnose.log.old").to_os_string(),
+            ]
+        );
+        assert_eq!(std::fs::read(&old).expect("latest old log")[0], b'b');
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("latest current log"),
+            "second\n"
+        );
+    }
 }
