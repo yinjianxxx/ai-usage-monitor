@@ -95,11 +95,6 @@ impl ProviderStatus {
     pub fn warrants_credential_alert(self) -> bool {
         self == Self::AuthenticationFailed
     }
-
-    #[cfg(test)]
-    pub fn needs_visible_user_action(self) -> bool {
-        self.needs_credentials()
-    }
 }
 
 #[derive(Clone, Debug, Default)]

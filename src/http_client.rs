@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
 use windows::Win32::Networking::WinHttp::{
@@ -18,6 +20,11 @@ const PROXY_ENV_VARS: &[&str] = &[
     "HTTP_PROXY",
     "http_proxy",
 ];
+
+/// Provider quota payloads and GitHub release metadata are normally well
+/// below one MiB. Keep a generous fixed ceiling so a broken endpoint cannot
+/// make this long-running desktop process allocate an unbounded JSON body.
+pub const MAX_JSON_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 struct WindowsUserProxyConfig {
     auto_detect: bool,
@@ -51,6 +58,51 @@ pub fn build_agent(url: &str, timeout: Duration) -> Result<ureq::Agent, String> 
         builder = builder.proxy(proxy);
     }
     Ok(builder.build())
+}
+
+/// Read and deserialize a JSON response with a hard limit on the decoded body.
+///
+/// `Content-Length` is only an early rejection hint: proxies and chunked
+/// responses can omit or misstate it, so the bounded read remains the source
+/// of truth.
+pub fn response_json_limited<T: DeserializeOwned>(
+    response: ureq::Response,
+    description: &str,
+) -> Result<T, String> {
+    response_json_limited_with(response, MAX_JSON_RESPONSE_BYTES, description)
+}
+
+fn response_json_limited_with<T: DeserializeOwned>(
+    response: ureq::Response,
+    max_bytes: u64,
+    description: &str,
+) -> Result<T, String> {
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(format!(
+            "{description} exceeds the {} byte safety limit",
+            max_bytes
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("unable to read {description}: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{description} exceeds the {} byte safety limit",
+            max_bytes
+        ));
+    }
+
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("unable to parse {description}: {error}"))
 }
 
 fn proxy_selection(url: &str) -> ProxySelection {
@@ -232,6 +284,16 @@ fn log_proxy_warning_once(key: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct TestPayload {
+        ok: bool,
+    }
+
+    fn response(body: &str) -> ureq::Response {
+        ureq::Response::new(200, "OK", body).expect("synthetic response")
+    }
 
     #[test]
     fn selects_generic_windows_proxy() {
@@ -269,5 +331,40 @@ mod tests {
             Some("127.0.0.1:7897".to_string())
         );
         assert_eq!(normalize_windows_proxy("DIRECT"), None);
+    }
+
+    #[test]
+    fn bounded_json_accepts_a_body_at_the_exact_limit() {
+        let body = r#"{"ok":true}"#;
+        assert_eq!(
+            response_json_limited_with::<TestPayload>(
+                response(body),
+                body.len() as u64,
+                "test response",
+            )
+            .expect("body at the limit"),
+            TestPayload { ok: true }
+        );
+    }
+
+    #[test]
+    fn bounded_json_rejects_a_body_one_byte_over_the_limit() {
+        let body = r#"{"ok":true}"#;
+        let error = response_json_limited_with::<TestPayload>(
+            response(body),
+            body.len() as u64 - 1,
+            "test response",
+        )
+        .expect_err("oversized response");
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn bounded_json_rejects_an_oversized_declared_length_before_parsing() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n{\"ok\":true}";
+        let response: ureq::Response = raw.parse().expect("synthetic response with header");
+        let error = response_json_limited_with::<TestPayload>(response, 12, "test response")
+            .expect_err("oversized declared length");
+        assert!(error.contains("exceeds"));
     }
 }

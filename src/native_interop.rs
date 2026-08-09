@@ -414,16 +414,23 @@ pub struct Color {
 }
 
 impl Color {
-    #[allow(dead_code)]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
     pub fn from_hex(hex: &str) -> Self {
-        let hex = hex.trim_start_matches('#');
-        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+        let hex = hex.strip_prefix('#').unwrap_or(hex);
+        if hex.len() != 6 || !hex.bytes().all(|value| value.is_ascii_hexdigit()) {
+            return Self::new(0, 0, 0);
+        }
+        let channel = |range| {
+            hex.get(range)
+                .and_then(|value| u8::from_str_radix(value, 16).ok())
+                .unwrap_or(0)
+        };
+        let r = channel(0..2);
+        let g = channel(2..4);
+        let b = channel(4..6);
         Self { r, g, b }
     }
 
@@ -469,5 +476,19 @@ mod tests {
         assert_eq!(Color::from_colorref(color.to_colorref()).r, 12);
         assert_eq!(Color::from_colorref(color.to_colorref()).g, 34);
         assert_eq!(Color::from_colorref(color.to_colorref()).b, 56);
+    }
+
+    #[test]
+    fn color_from_hex_accepts_exact_rgb_and_rejects_invalid_input() {
+        let prefixed = Color::from_hex("#0c2238");
+        let plain = Color::from_hex("0C2238");
+        for color in [prefixed, plain] {
+            assert_eq!((color.r, color.g, color.b), (12, 34, 56));
+        }
+
+        for invalid in ["#fff", "#GG0000", "é00000", "##FFFFFF"] {
+            let color = Color::from_hex(invalid);
+            assert_eq!((color.r, color.g, color.b), (0, 0, 0));
+        }
     }
 }

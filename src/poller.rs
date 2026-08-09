@@ -989,23 +989,37 @@ fn clear_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>) {
     }
 }
 
-/// Spawn a command and wait up to `timeout` for it to finish.
-/// Returns None if the process fails to start or exceeds the deadline.
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
-    let mut child = cmd.spawn().ok()?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandRunError {
+    SpawnFailed,
+    TimedOut,
+    WaitFailed,
+}
+
+/// Spawn a command and wait up to `timeout` for it to finish while preserving
+/// the distinction between an unavailable probe and a completed command.
+fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, CommandRunError> {
+    let mut child = cmd.spawn().map_err(|_| CommandRunError::SpawnFailed)?;
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|_| CommandRunError::WaitFailed)
+            }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(CommandRunError::TimedOut);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => return None,
+            Err(_) => return Err(CommandRunError::WaitFailed),
         }
     }
 }
@@ -1227,13 +1241,13 @@ fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialPr
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
     )
-    .ok_or(ClaudeCredentialProblem::Unreadable)?;
+    .map_err(|_| ClaudeCredentialProblem::ProbeUnavailable)?;
 
     match output.status.code() {
         Some(WSL_CREDENTIAL_MISSING_EXIT) => Err(ClaudeCredentialProblem::Missing),
         Some(WSL_CREDENTIAL_UNREADABLE_EXIT) => Err(ClaudeCredentialProblem::Unreadable),
         _ if output.status.success() => Ok(output.stdout),
-        _ => Err(ClaudeCredentialProblem::Unreadable),
+        _ => Err(ClaudeCredentialProblem::ProbeUnavailable),
     }
 }
 
@@ -1277,7 +1291,8 @@ fn read_wsl_script_output(distro: &str, script: &'static str) -> Option<Vec<u8>>
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
-    )?;
+    )
+    .ok()?;
     output.status.success().then_some(output.stdout)
 }
 
@@ -1342,7 +1357,8 @@ fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
-    )?;
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1446,13 +1462,14 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         }
     };
 
-    let response: UsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error("unable to parse Claude usage endpoint response", error);
-            return Ok(None);
-        }
-    };
+    let response: UsageResponse =
+        match crate::http_client::response_json_limited(resp, "Claude usage endpoint response") {
+            Ok(response) => response,
+            Err(error) => {
+                diagnose::log_error("unable to parse Claude usage endpoint response", error);
+                return Ok(None);
+            }
+        };
     let mut windows = Vec::new();
 
     if let Some(bucket) = &response.five_hour {
@@ -1640,13 +1657,14 @@ fn fetch_codex_usage_once(
         }
     };
 
-    let response: CodexUsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error("unable to parse Codex usage response", error);
-            return Err(CodexAttemptError::Final(PollError::RequestFailed));
-        }
-    };
+    let response: CodexUsageResponse =
+        match crate::http_client::response_json_limited(resp, "Codex usage response") {
+            Ok(response) => response,
+            Err(error) => {
+                diagnose::log_error("unable to parse Codex usage response", error);
+                return Err(CodexAttemptError::Final(PollError::RequestFailed));
+            }
+        };
 
     codex_usage_from_response(response).ok_or_else(|| {
         diagnose::log("Codex usage response did not contain a usable quota window");
@@ -1773,7 +1791,10 @@ fn fetch_antigravity_user_quota(
         }
     };
 
-    let response: AntigravityUserQuotaResponse = match resp.into_json() {
+    let response: AntigravityUserQuotaResponse = match crate::http_client::response_json_limited(
+        resp,
+        "Antigravity retrieveUserQuota response",
+    ) {
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error(
@@ -1819,7 +1840,10 @@ fn fetch_antigravity_project(
         }
     };
 
-    let response: AntigravityLoadResponse = match resp.into_json() {
+    let response: AntigravityLoadResponse = match crate::http_client::response_json_limited(
+        resp,
+        "Antigravity loadCodeAssist response",
+    ) {
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error("unable to parse Antigravity loadCodeAssist response", error);
@@ -1862,7 +1886,10 @@ fn fetch_antigravity_model_quota(
         }
     };
 
-    let response: AntigravityModelsResponse = match resp.into_json() {
+    let response: AntigravityModelsResponse = match crate::http_client::response_json_limited(
+        resp,
+        "Antigravity fetchAvailableModels response",
+    ) {
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error(
@@ -1912,7 +1939,10 @@ fn fetch_antigravity_quota_summary(
         }
     };
 
-    let response: AntigravityQuotaSummaryResponse = match resp.into_json() {
+    let response: AntigravityQuotaSummaryResponse = match crate::http_client::response_json_limited(
+        resp,
+        "Antigravity retrieveUserQuotaSummary response",
+    ) {
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error(
@@ -2223,6 +2253,7 @@ impl CredentialSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClaudeCredentialProblem {
     Missing,
+    ProbeUnavailable,
     Unreadable,
     InvalidJson,
     UnsupportedShape,
@@ -2234,6 +2265,7 @@ impl ClaudeCredentialProblem {
     fn code(self) -> &'static str {
         match self {
             Self::Missing => "missing",
+            Self::ProbeUnavailable => "probe_unavailable",
             Self::Unreadable => "unreadable",
             Self::InvalidJson => "invalid_json",
             Self::UnsupportedShape => "unsupported_shape",
@@ -2245,8 +2277,9 @@ impl ClaudeCredentialProblem {
     fn priority(self) -> u8 {
         match self {
             Self::Missing => 0,
-            Self::Unreadable | Self::InvalidJson | Self::UnsupportedShape => 1,
-            Self::RefreshMissing | Self::RefreshExpired => 2,
+            Self::ProbeUnavailable => 1,
+            Self::Unreadable | Self::InvalidJson | Self::UnsupportedShape => 2,
+            Self::RefreshMissing | Self::RefreshExpired => 3,
         }
     }
 }
@@ -2254,6 +2287,7 @@ impl ClaudeCredentialProblem {
 fn claude_credential_problem_poll_error(problem: ClaudeCredentialProblem) -> PollError {
     match problem {
         ClaudeCredentialProblem::Missing => PollError::NoCredentials,
+        ClaudeCredentialProblem::ProbeUnavailable => PollError::RequestFailed,
         ClaudeCredentialProblem::Unreadable
         | ClaudeCredentialProblem::InvalidJson
         | ClaudeCredentialProblem::UnsupportedShape
@@ -2422,6 +2456,7 @@ fn run_diagnostic_command(program: &str, args: &[&str]) -> Option<std::process::
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(10),
     )
+    .ok()
 }
 
 /// User-triggered, read-only Claude login diagnostics. The report deliberately
@@ -2477,13 +2512,13 @@ pub fn claude_auth_diagnostics_report() -> String {
                 ));
             }
             Err(problem) => {
-                let file = if problem == ClaudeCredentialProblem::Missing {
-                    "missing"
-                } else {
-                    "unusable"
+                let (file, state) = match problem {
+                    ClaudeCredentialProblem::Missing => ("missing", "login_required"),
+                    ClaudeCredentialProblem::ProbeUnavailable => ("unknown", "probe_unavailable"),
+                    _ => ("unusable", "login_required"),
                 };
                 lines.push(format!("Source[{index}].File: {file}"));
-                lines.push(format!("Source[{index}].State: login_required"));
+                lines.push(format!("Source[{index}].State: {state}"));
                 lines.push(format!("Source[{index}].Reason: {}", problem.code()));
             }
         }
@@ -2754,7 +2789,7 @@ fn enumerate_wsl_distros() -> Vec<String> {
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
     ) {
-        Some(output) if output.status.success() => output,
+        Ok(output) if output.status.success() => output,
         _ => {
             diagnose::log("unable to enumerate WSL distros");
             return Vec::new();
@@ -2786,7 +2821,7 @@ fn list_running_wsl_distros() -> Vec<String> {
             .stderr(std::process::Stdio::null()),
         Duration::from_secs(5),
     ) {
-        Some(output) if output.status.success() => output,
+        Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
 
@@ -3147,6 +3182,47 @@ mod tests {
                 PollError::AuthRequired
             );
         }
+    }
+
+    #[test]
+    fn unavailable_claude_probe_is_transient_and_never_an_authentication_warning() {
+        let error = claude_credential_problem_poll_error(ClaudeCredentialProblem::ProbeUnavailable);
+
+        assert_eq!(error, PollError::RequestFailed);
+        assert_eq!(provider_status(error), ProviderStatus::RequestFailed);
+        assert!(!provider_status(error).warrants_credential_alert());
+    }
+
+    #[test]
+    fn command_runner_distinguishes_spawn_failure_from_timeout() {
+        let missing_program = std::env::temp_dir().join(format!(
+            "gengchou-missing-command-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut missing_command = Command::new(missing_program);
+        assert!(matches!(
+            run_with_timeout(&mut missing_command, Duration::from_millis(10)),
+            Err(CommandRunError::SpawnFailed)
+        ));
+
+        assert!(matches!(
+            run_with_timeout(
+                Command::new("powershell.exe")
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Start-Sleep -Seconds 30",
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                Duration::from_millis(10),
+            ),
+            Err(CommandRunError::TimedOut)
+        ));
     }
 
     #[test]

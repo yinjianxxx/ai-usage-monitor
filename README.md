@@ -224,6 +224,10 @@ credentials; if monitoring still does not recover, sign out and back in. In
 Claude Code CLI, run `claude auth login`. Credential watching resumes
 monitoring automatically after sign-in.
 
+Routine provider-detection, quota-reset, and Claude Code update notifications
+use the Gengchou app icon and are silent. Only a current credential problem
+that needs user action uses the Windows warning glyph and notification sound.
+
 The popup reserves badges for four conditions, in priority order:
 **Authentication failed**, **Refresh failed**, **Near limit**, and **Limit
 reached**. A network or request failure becomes **Refresh failed** after three
@@ -264,8 +268,11 @@ signed-in provider; it never changes what is displayed on its own.
 A provider with no credential on this machine shows **Not detected** in the
 detail popup along with a note that it is recognized automatically after
 sign-in, and raises no notification — a provider that was never signed in has
-nothing to sign in to *again*. **Authentication failed** is reserved for
-credentials that do exist but expired or were rejected.
+nothing to sign in to *again*. **Authentication failed** means a concrete
+credential source exists but is unreadable, malformed, expired, rejected, or
+otherwise unusable; these cases share the same simple recovery: sign in again.
+If a WSL probe itself cannot start or finish, Gengchou treats that as a
+temporary refresh failure instead and never raises an authentication warning.
 
 ## Data & privacy
 
@@ -273,7 +280,7 @@ credentials that do exist but expired or were rejected.
 | --- | --- |
 | Settings — including provider permission flags; never tokens | `%APPDATA%\Gengchou\settings.json` |
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
-| Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
+| Diagnostics (append-only within each generation; rotated while running; current plus one `.old`) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
 If `%APPDATA%` is unavailable, settings and the usage cache fall back to the
 Windows configuration directory and then `%LOCALAPPDATA%`. If no durable path

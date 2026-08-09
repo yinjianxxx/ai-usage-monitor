@@ -439,9 +439,9 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         .call()
         .map_err(|e| format!("Unable to check GitHub releases: {e}"))?;
 
-    let release: GitHubRelease = response
-        .into_json()
-        .map_err(|e| format!("Unable to parse GitHub release data: {e}"))?;
+    let release: GitHubRelease =
+        crate::http_client::response_json_limited(response, "GitHub release metadata")
+            .map_err(|e| format!("Unable to parse GitHub release data: {e}"))?;
 
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
     if !is_version_newer(&latest_version, env!("CARGO_PKG_VERSION")) {

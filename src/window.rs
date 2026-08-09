@@ -465,6 +465,47 @@ static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// lock/disconnect interval without stopping provider polling.
 static SESSION_INACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Serializes writes to one persisted snapshot and rejects an older snapshot
+/// if a newer state revision was captured before it reached the writer.
+struct PersistenceCoordinator {
+    latest_revision: AtomicU64,
+    writer: Mutex<()>,
+}
+
+impl PersistenceCoordinator {
+    const fn new() -> Self {
+        Self {
+            latest_revision: AtomicU64::new(0),
+            writer: Mutex::new(()),
+        }
+    }
+
+    /// Call only while holding `STATE`, at the same time the value to persist
+    /// is cloned. That makes revision order identical to AppState order.
+    fn next_revision(&self) -> u64 {
+        self.latest_revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn write_if_latest<E>(
+        &self,
+        revision: u64,
+        write: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let _writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.latest_revision.load(Ordering::Acquire) != revision {
+            return Ok(false);
+        }
+        write()?;
+        Ok(true)
+    }
+}
+
+static SETTINGS_PERSISTENCE: PersistenceCoordinator = PersistenceCoordinator::new();
+static USAGE_CACHE_PERSISTENCE: PersistenceCoordinator = PersistenceCoordinator::new();
+
 struct PollCoordinator {
     in_flight: AtomicBool,
     pending: AtomicBool,
@@ -1350,6 +1391,30 @@ struct UsageCacheFile {
     antigravity: Option<UsageCacheProvider>,
 }
 
+struct RevisionedSnapshot<T> {
+    revision: u64,
+    value: T,
+}
+
+struct UsageCacheSnapshot {
+    saved_unix: u64,
+    data: AppUsageData,
+}
+
+/// Must be called while `STATE` is locked so the revision and cloned data are
+/// one ordered snapshot.
+fn capture_usage_cache_snapshot(
+    state: &AppState,
+) -> Option<RevisionedSnapshot<UsageCacheSnapshot>> {
+    state.data.clone().map(|data| RevisionedSnapshot {
+        revision: USAGE_CACHE_PERSISTENCE.next_revision(),
+        value: UsageCacheSnapshot {
+            saved_unix: now_unix_secs(),
+            data,
+        },
+    })
+}
+
 fn usage_window_to_cache(window: &UsageWindow) -> UsageCacheWindow {
     UsageCacheWindow {
         percent: window.percentage,
@@ -1426,9 +1491,10 @@ fn fresh_cached_provider(
     })
 }
 
-fn save_usage_cache(data: &AppUsageData) {
+fn write_usage_cache(snapshot: &UsageCacheSnapshot) -> std::io::Result<()> {
+    let data = &snapshot.data;
     let file = UsageCacheFile {
-        saved_unix: now_unix_secs(),
+        saved_unix: snapshot.saved_unix,
         claude_code: data
             .claude_code
             .as_ref()
@@ -1442,29 +1508,23 @@ fn save_usage_cache(data: &AppUsageData) {
             .as_ref()
             .map(|usage| usage_provider_to_cache(usage, data.antigravity_updated_unix)),
     };
-    let path = match usage_cache_path() {
-        Ok(path) => path,
+    let path = usage_cache_path()?;
+    let json = serde_json::to_string(&file).map_err(std::io::Error::other)?;
+    settings::write_file_atomic(&path, &json).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("path={}: {error}", path.display()))
+    })
+}
+
+fn save_usage_cache(snapshot: &RevisionedSnapshot<UsageCacheSnapshot>) {
+    match USAGE_CACHE_PERSISTENCE
+        .write_if_latest(snapshot.revision, || write_usage_cache(&snapshot.value))
+    {
+        Ok(_) => {}
         Err(error) => {
-            settings::record_persistence_warning(
-                "Unable to locate the usage cache directory",
-                &error,
-            );
+            settings::record_persistence_warning("Unable to save the usage cache", &error);
+            diagnose::log_error("usage cache save failed", &error);
             post_persistence_warning();
-            return;
         }
-    };
-    match serde_json::to_string(&file) {
-        Ok(json) => {
-            if let Err(error) = settings::write_file_atomic(&path, &json) {
-                settings::record_persistence_warning("Unable to save the usage cache", &error);
-                diagnose::log_error(
-                    &format!("usage cache write failed path={}", path.display()),
-                    &error,
-                );
-                post_persistence_warning();
-            }
-        }
-        Err(error) => diagnose::log_error("usage cache serialization failed", error),
     }
 }
 
@@ -1534,66 +1594,74 @@ fn load_usage_cache() -> Option<(AppUsageData, u64)> {
 fn save_state_settings() {
     let snapshot = {
         let state = lock_state();
-        state.as_ref().map(|s| SettingsFile {
-            placement_schema_version: PLACEMENT_SCHEMA_VERSION,
-            widget_placement: (!s.widget_placement_needs_migration)
-                .then(|| s.widget_placement.clone()),
-            floating_placement: (!s.floating_placement_needs_migration)
-                .then(|| s.floating_placement.clone()),
-            // Legacy geometry remains readable for one compatibility window,
-            // and is retained until that surface can be migrated safely.
-            tray_offset: if s.widget_placement_needs_migration {
-                s.tray_offset
-            } else {
-                0
+        state.as_ref().map(|s| RevisionedSnapshot {
+            revision: SETTINGS_PERSISTENCE.next_revision(),
+            value: SettingsFile {
+                placement_schema_version: PLACEMENT_SCHEMA_VERSION,
+                widget_placement: (!s.widget_placement_needs_migration)
+                    .then(|| s.widget_placement.clone()),
+                floating_placement: (!s.floating_placement_needs_migration)
+                    .then(|| s.floating_placement.clone()),
+                // Legacy geometry remains readable for one compatibility window,
+                // and is retained until that surface can be migrated safely.
+                tray_offset: if s.widget_placement_needs_migration {
+                    s.tray_offset
+                } else {
+                    0
+                },
+                taskbar_index: if s.widget_placement_needs_migration {
+                    s.preferred_taskbar_index
+                } else {
+                    0
+                },
+                widget_default_position: s.widget_default_position,
+                poll_interval_ms: s.poll_interval_ms,
+                language: s
+                    .language_override
+                    .map(|language| language.code().to_string()),
+                last_update_check_unix: s.last_update_check_unix,
+                last_update_outcome: s.last_update_outcome.clone(),
+                widget_visible: s.widget_visible,
+                floating_visible: s.floating_visible,
+                detailed_tray_icons: s.detailed_tray_icons,
+                detail_pinned: s.detail_pinned,
+                floating_x: s
+                    .floating_placement_needs_migration
+                    .then_some(s.floating_x)
+                    .flatten(),
+                floating_y: s
+                    .floating_placement_needs_migration
+                    .then_some(s.floating_y)
+                    .flatten(),
+                floating_default_position: s.floating_default_position,
+                show_claude_code: s.show_claude_code,
+                show_codex: s.show_codex,
+                show_antigravity: s.show_antigravity,
+                allow_claude_credentials: s.allow_claude_credentials,
+                allow_codex_credentials: s.allow_codex_credentials,
+                allow_antigravity_credentials: s.allow_antigravity_credentials,
+                credential_consent_granted: s.credential_consent_granted,
+                credential_consent_decided: s.credential_consent_decided,
+                consent_schema_version: settings::CONSENT_SCHEMA_VERSION,
+                claude_credential_access_decided: s.claude_credential_access_decided,
+                codex_credential_access_decided: s.codex_credential_access_decided,
+                antigravity_credential_access_decided: s.antigravity_credential_access_decided,
+                provider_order: s.provider_order.clone(),
+                notify_session_reset: s.notify_session_reset,
+                notify_weekly_reset: s.notify_weekly_reset,
             },
-            taskbar_index: if s.widget_placement_needs_migration {
-                s.preferred_taskbar_index
-            } else {
-                0
-            },
-            widget_default_position: s.widget_default_position,
-            poll_interval_ms: s.poll_interval_ms,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
-            last_update_check_unix: s.last_update_check_unix,
-            last_update_outcome: s.last_update_outcome.clone(),
-            widget_visible: s.widget_visible,
-            floating_visible: s.floating_visible,
-            detailed_tray_icons: s.detailed_tray_icons,
-            detail_pinned: s.detail_pinned,
-            floating_x: s
-                .floating_placement_needs_migration
-                .then_some(s.floating_x)
-                .flatten(),
-            floating_y: s
-                .floating_placement_needs_migration
-                .then_some(s.floating_y)
-                .flatten(),
-            floating_default_position: s.floating_default_position,
-            show_claude_code: s.show_claude_code,
-            show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
-            allow_claude_credentials: s.allow_claude_credentials,
-            allow_codex_credentials: s.allow_codex_credentials,
-            allow_antigravity_credentials: s.allow_antigravity_credentials,
-            credential_consent_granted: s.credential_consent_granted,
-            credential_consent_decided: s.credential_consent_decided,
-            consent_schema_version: settings::CONSENT_SCHEMA_VERSION,
-            claude_credential_access_decided: s.claude_credential_access_decided,
-            codex_credential_access_decided: s.codex_credential_access_decided,
-            antigravity_credential_access_decided: s.antigravity_credential_access_decided,
-            provider_order: s.provider_order.clone(),
-            notify_session_reset: s.notify_session_reset,
-            notify_weekly_reset: s.notify_weekly_reset,
         })
     };
     if let Some(snapshot) = snapshot {
-        if let Err(error) = settings::save(&snapshot) {
-            settings::record_persistence_warning("Unable to save settings", &error);
-            diagnose::log_error("settings save failed", &error);
-            post_persistence_warning();
+        match SETTINGS_PERSISTENCE
+            .write_if_latest(snapshot.revision, || settings::save(&snapshot.value))
+        {
+            Ok(_) => {}
+            Err(error) => {
+                settings::record_persistence_warning("Unable to save settings", &error);
+                diagnose::log_error("settings save failed", &error);
+                post_persistence_warning();
+            }
         }
     }
 }
@@ -1832,7 +1900,7 @@ fn first_provider_credential_issue(
                 .and_then(|data| data.antigravity_error)
                 .or(global_status),
         };
-        if let Some(status) = status.filter(|status| status.needs_visible_user_action()) {
+        if let Some(status) = status.filter(|status| status.needs_credentials()) {
             return Some((kind, status));
         }
     }
@@ -3707,9 +3775,6 @@ enum PollTimerAction {
 fn poll_failure_needs_auth_rejection_recheck(
     error: poller::PollError,
     data: &AppUsageData,
-    _show_claude_code: bool,
-    _show_codex: bool,
-    _show_antigravity: bool,
 ) -> bool {
     matches!(
         error,
@@ -3968,7 +4033,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
             // therefore never win the gap between changing permission and
             // invalidating an in-flight result.
             POLL_COORDINATOR.invalidate_pending();
-            s.data.clone()
+            capture_usage_cache_snapshot(s)
         })
     };
 
@@ -4068,7 +4133,7 @@ fn set_credential_consent(granted: bool) {
             }
             set_widget_placeholders(s, "...");
             POLL_COORDINATOR.invalidate_pending();
-            s.data.clone()
+            capture_usage_cache_snapshot(s)
         })
     };
     save_state_settings();
@@ -11380,7 +11445,7 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                     s.last_poll_ok = true;
                     s.last_success_unix = Some(saved_unix);
                     refresh_usage_texts(s);
-                    s.data.clone()
+                    capture_usage_cache_snapshot(s)
                 })
             };
             if let Some(snapshot) = filtered_cache.as_ref() {
@@ -11891,8 +11956,9 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 show_codex,
                 show_antigravity,
             );
-            let post_poll_snapshot = (needs_auth && watch_mode.is_some())
-                .then(|| poller::credential_watch_snapshot(watch_mode.unwrap()));
+            let post_poll_snapshot = watch_mode
+                .filter(|_| needs_auth)
+                .map(poller::credential_watch_snapshot);
             let watch_decision = auth_watch_decision(
                 needs_auth,
                 pre_poll_snapshot.as_ref(),
@@ -12031,7 +12097,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
 
             // Persist the snapshot outside the lock so the next start can
             // show these numbers immediately.
-            let cache_snapshot = state.as_ref().and_then(|s| s.data.clone());
+            let cache_snapshot = state.as_ref().and_then(capture_usage_cache_snapshot);
             drop(state);
             if let Some(snapshot) = cache_snapshot.as_ref() {
                 save_usage_cache(snapshot);
@@ -12098,13 +12164,8 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // every provider needs user action. Inspect the exact provider
             // errors too, otherwise a remote 401 can be hidden by another
             // provider's local "not signed in" result and never be rechecked.
-            let needs_auth_rejection_recheck = poll_failure_needs_auth_rejection_recheck(
-                e,
-                &failed_data,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            );
+            let needs_auth_rejection_recheck =
+                poll_failure_needs_auth_rejection_recheck(e, &failed_data);
             // Same race as the success path: sampling only now would arm the
             // baseline with credentials that were refreshed while the poll was
             // in flight. Compare against the pre-poll sample instead.
@@ -14019,6 +14080,69 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod reset_notification_tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn persistence_coordinator_drops_an_older_snapshot_that_arrives_last() {
+        let coordinator = Arc::new(PersistenceCoordinator::new());
+        let older_revision = coordinator.next_revision();
+        let newer_revision = coordinator.next_revision();
+        let newer_committed = Arc::new(Barrier::new(2));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+
+        let older_writer = {
+            let coordinator = Arc::clone(&coordinator);
+            let newer_committed = Arc::clone(&newer_committed);
+            let writes = Arc::clone(&writes);
+            std::thread::spawn(move || {
+                newer_committed.wait();
+                coordinator
+                    .write_if_latest(older_revision, || {
+                        writes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push("older");
+                        Ok::<(), ()>(())
+                    })
+                    .expect("older write decision")
+            })
+        };
+
+        assert!(coordinator
+            .write_if_latest(newer_revision, || {
+                writes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("newer");
+                Ok::<(), ()>(())
+            })
+            .expect("newer write"));
+        newer_committed.wait();
+
+        assert!(!older_writer.join().expect("older writer thread"));
+        assert_eq!(
+            *writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["newer"]
+        );
+    }
+
+    #[test]
+    fn settings_and_usage_cache_revision_streams_are_independent() {
+        let settings = PersistenceCoordinator::new();
+        let usage_cache = PersistenceCoordinator::new();
+        let stale_settings_revision = settings.next_revision();
+        let current_cache_revision = usage_cache.next_revision();
+        let _current_settings_revision = settings.next_revision();
+
+        assert!(!settings
+            .write_if_latest(stale_settings_revision, || Ok::<(), ()>(()))
+            .expect("stale settings decision"));
+        assert!(usage_cache
+            .write_if_latest(current_cache_revision, || Ok::<(), ()>(()))
+            .expect("current cache write"));
+    }
 
     #[test]
     fn update_prompt_is_a_busy_state_until_the_modal_choice_returns() {
@@ -14826,9 +14950,6 @@ mod reset_notification_tests {
         assert!(poll_failure_needs_auth_rejection_recheck(
             poller::PollError::NoCredentials,
             &data,
-            true,
-            true,
-            false,
         ));
         assert!(!poll_failure_needs_auth_rejection_recheck(
             poller::PollError::NoCredentials,
@@ -14836,9 +14957,6 @@ mod reset_notification_tests {
                 remote_auth_rejection: false,
                 ..data
             },
-            true,
-            false,
-            false,
         ));
     }
 

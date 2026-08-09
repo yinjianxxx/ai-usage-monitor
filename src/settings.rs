@@ -1,4 +1,5 @@
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -619,7 +620,13 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    if let Err(error) = std::fs::write(&tmp, contents) {
+    let write_result = (|| {
+        let mut file = File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
         match std::fs::remove_file(&tmp) {
             Ok(()) => {}
             Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
