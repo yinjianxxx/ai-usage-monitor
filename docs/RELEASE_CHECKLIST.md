@@ -29,8 +29,10 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   visibility and explicit provider permission.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
-- Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
-  and principal dependencies and record whether an upgrade is justified.
+- Before each Gengchou minor release (`vX.Y.0`), or at least once every six
+  months when no minor release occurs (whichever comes first), review the
+  pinned Rust toolchain and principal dependencies and record whether an
+  upgrade is justified.
   Between minor releases, review them immediately only for a security advisory,
   upstream end-of-support notice, or a reproduced compatibility problem; do
   not destabilize a patch release solely to follow the newest version.
