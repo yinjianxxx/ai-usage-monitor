@@ -172,6 +172,6 @@ Codex、Antigravity 与 Grok 的 WSL 凭据只在发行版**已经在运行**时
 
 ## 致谢与许可证
 
-更筹原名 **AI Usage Monitor**，最初派生自 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) v1.4.8（提交 `9b29972`），现已独立开发（[项目起源](PROVENANCE.md)）。托盘图标的呈现方式，以及部分 Claude 用量轮询、缓存、冷却和速率限制处理，改编自或参考了 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)。本项目与 Code Zeno Pty Ltd、Anthropic、OpenAI 或 Google 不存在从属、认可或赞助关系。产品名仅用于说明兼容性；所有商标归各自权利人所有。
+更筹原名 **AI Usage Monitor**，最初派生自 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) v1.4.8（提交 `9b29972`），现已独立开发（[项目起源](PROVENANCE.md)）。托盘图标的呈现方式，以及部分 Claude 用量轮询、缓存、冷却和速率限制处理，改编自或参考了 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)。本项目与 Code Zeno Pty Ltd、Anthropic、OpenAI、Google 或 xAI 不存在从属、认可或赞助关系。产品名仅用于说明兼容性；所有商标归各自权利人所有。
 
 MIT License。保留的许可与归属声明见 [LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [DEPENDENCY_LICENSES.md](DEPENDENCY_LICENSES.md)。

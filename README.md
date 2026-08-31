@@ -359,7 +359,7 @@ usage polling, caching, cooldown, and rate-limit handling were adapted from or
 informed by
 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude).
 This project is not affiliated with, endorsed by, or sponsored by Code Zeno
-Pty Ltd, Anthropic, OpenAI, or Google. Product names are used only to
+Pty Ltd, Anthropic, OpenAI, Google, or xAI. Product names are used only to
 describe compatibility; all trademarks belong to their respective owners.
 
 MIT License — see [LICENSE](LICENSE),
