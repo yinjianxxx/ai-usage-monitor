@@ -189,7 +189,7 @@ each provider's own account rules:
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` in a **running** WSL
   distribution is read next
 - **Grok** — a signed-in grok CLI session. Windows resolves
-  `%GROK_HOME%uth.json` (normally `%USERPROFILE%\.grokuth.json`); if that
+  `%GROK_HOME%\auth.json` (normally `%USERPROFILE%\.grok\auth.json`); if that
   is unavailable, `$GROK_HOME/auth.json` (default `$HOME/.grok/auth.json`) in a
   **running** WSL distribution is read next. `auth.json` can hold sign-ins from
   several identity providers; only an entry issued by xAI itself is used, and
@@ -308,9 +308,9 @@ bridge twice and complete its verification before moving to v2.3.0 or later.
 To uninstall: disable **Start with Windows** if you enabled it, then delete
 the executable, `%APPDATA%\Gengchou`, and `%LOCALAPPDATA%\Gengchou`.
 
-Network traffic goes directly to the enabled and explicitly authorized providers (Anthropic,
-ChatGPT/Codex, Google) for read-only usage queries, plus GitHub for update
-checks and user-approved update downloads. The app never:
+Network traffic goes directly to the enabled and explicitly authorized
+providers (Anthropic, ChatGPT/Codex, Google, xAI) for read-only usage queries,
+plus GitHub for update checks and user-approved update downloads. The app never:
 
 - collects analytics or telemetry, or uploads any files;
 - sends credentials anywhere except the provider that issued them;

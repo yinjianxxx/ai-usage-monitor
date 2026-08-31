@@ -117,6 +117,15 @@ impl ProviderRefreshStates {
         }
     }
 
+    fn state_mut(&mut self, kind: tray_icon::TrayIconKind) -> &mut ProviderRefreshState {
+        match kind {
+            tray_icon::TrayIconKind::Claude => &mut self.claude_code,
+            tray_icon::TrayIconKind::Codex => &mut self.codex,
+            tray_icon::TrayIconKind::Antigravity => &mut self.antigravity,
+            tray_icon::TrayIconKind::Grok => &mut self.grok,
+        }
+    }
+
     fn reset_hidden(
         &mut self,
         show_claude_code: bool,
@@ -3332,61 +3341,56 @@ fn update_provider_refresh_states(
     now_unix: u64,
     now: Instant,
 ) -> Vec<tray_icon::TrayIconKind> {
-    let claude_has_history =
-        provider_has_history(state.data.as_ref(), tray_icon::TrayIconKind::Claude)
-            || provider_has_history(Some(data), tray_icon::TrayIconKind::Claude);
-    let codex_has_history =
-        provider_has_history(state.data.as_ref(), tray_icon::TrayIconKind::Codex)
-            || provider_has_history(Some(data), tray_icon::TrayIconKind::Codex);
-    let antigravity_has_history =
-        provider_has_history(state.data.as_ref(), tray_icon::TrayIconKind::Antigravity)
-            || provider_has_history(Some(data), tray_icon::TrayIconKind::Antigravity);
-    let poll_interval_ms = state.poll_interval_ms;
+    let previous = state.data.clone();
+    update_refresh_states_for_pass(
+        &mut state.provider_refresh_states,
+        previous.as_ref(),
+        state.poll_interval_ms,
+        plan,
+        data,
+        now_unix,
+        now,
+    )
+}
+
+/// Advance the per-provider failure-recovery state for one poll pass.
+///
+/// Takes the pieces rather than the whole `AppState` so the pass can be tested
+/// without building a window: a provider silently missing from here still
+/// polls and still shows its error, but records no cooldown, counts no
+/// consecutive failures, never goes stale, and never raises its one
+/// authentication balloon.
+#[allow(clippy::too_many_arguments)]
+fn update_refresh_states_for_pass(
+    states: &mut ProviderRefreshStates,
+    previous: Option<&AppUsageData>,
+    poll_interval_ms: u32,
+    plan: PollPassPlan,
+    data: &AppUsageData,
+    now_unix: u64,
+    now: Instant,
+) -> Vec<tray_icon::TrayIconKind> {
+    let shown = plan.shown_flags();
     let mut transitions = Vec::new();
 
-    if update_provider_refresh_state(
-        &mut state.provider_refresh_states.claude_code,
-        "Claude",
-        plan.show_claude_code,
-        plan.poll_claude_code,
-        data.error(tray_icon::TrayIconKind::Claude),
-        claude_has_history,
-        data.provider(tray_icon::TrayIconKind::Claude)
-            .retry_after_ms,
-        poll_interval_ms,
-        now_unix,
-        now,
-    ) {
-        transitions.push(tray_icon::TrayIconKind::Claude);
-    }
-    if update_provider_refresh_state(
-        &mut state.provider_refresh_states.codex,
-        "Codex",
-        plan.show_codex,
-        plan.poll_codex,
-        data.error(tray_icon::TrayIconKind::Codex),
-        codex_has_history,
-        data.provider(tray_icon::TrayIconKind::Codex).retry_after_ms,
-        poll_interval_ms,
-        now_unix,
-        now,
-    ) {
-        transitions.push(tray_icon::TrayIconKind::Codex);
-    }
-    if update_provider_refresh_state(
-        &mut state.provider_refresh_states.antigravity,
-        "Antigravity",
-        plan.show_antigravity,
-        plan.poll_antigravity,
-        data.error(tray_icon::TrayIconKind::Antigravity),
-        antigravity_has_history,
-        data.provider(tray_icon::TrayIconKind::Antigravity)
-            .retry_after_ms,
-        poll_interval_ms,
-        now_unix,
-        now,
-    ) {
-        transitions.push(tray_icon::TrayIconKind::Antigravity);
+    for kind in tray_icon::TrayIconKind::ALL {
+        let has_history =
+            provider_has_history(previous, kind) || provider_has_history(Some(data), kind);
+        let refresh_state = states.state_mut(kind);
+        if update_provider_refresh_state(
+            refresh_state,
+            kind.diagnostic_label(),
+            shown[kind.index()],
+            plan.polled(kind),
+            data.error(kind),
+            has_history,
+            data.provider(kind).retry_after_ms,
+            poll_interval_ms,
+            now_unix,
+            now,
+        ) {
+            transitions.push(kind);
+        }
     }
 
     transitions
@@ -3613,6 +3617,28 @@ impl PollPassPlan {
         }
     }
 
+    /// Per-provider visibility and poll decisions, indexed the same way as
+    /// `AppUsageData`. Every consumer that used to spell out three providers
+    /// reads these instead, so a new provider cannot be left out of one branch
+    /// of the failure handling while being present in another.
+    fn shown_flags(self) -> [bool; tray_icon::TrayIconKind::COUNT] {
+        [
+            self.show_claude_code,
+            self.show_codex,
+            self.show_antigravity,
+            self.show_grok,
+        ]
+    }
+
+    fn polled(self, kind: tray_icon::TrayIconKind) -> bool {
+        [
+            self.poll_claude_code,
+            self.poll_codex,
+            self.poll_antigravity,
+            self.poll_grok,
+        ][kind.index()]
+    }
+
     fn has_poll_target(self) -> bool {
         self.poll_claude_code || self.poll_codex || self.poll_antigravity || self.poll_grok
     }
@@ -3725,44 +3751,31 @@ fn credential_watch_mode_for_shown(
 /// "sign in" marker until the next poll interval (up to an hour) even though
 /// the user re-authenticated seconds later.
 fn shown_provider_needs_auth(
-    claude_code_error: Option<ProviderStatus>,
-    codex_error: Option<ProviderStatus>,
-    antigravity_error: Option<ProviderStatus>,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
+    data: &AppUsageData,
+    shown: [bool; tray_icon::TrayIconKind::COUNT],
 ) -> bool {
-    let needs_auth = |shown: bool, status: Option<ProviderStatus>| {
-        shown && status.is_some_and(ProviderStatus::needs_credentials)
-    };
-    needs_auth(show_claude_code, claude_code_error)
-        || needs_auth(show_codex, codex_error)
-        || needs_auth(show_antigravity, antigravity_error)
+    tray_icon::TrayIconKind::ALL.into_iter().any(|kind| {
+        shown[kind.index()]
+            && data
+                .error(kind)
+                .is_some_and(ProviderStatus::needs_credentials)
+    })
 }
 
 fn all_shown_providers_need_auth(
     data: &AppUsageData,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
+    shown: [bool; tray_icon::TrayIconKind::COUNT],
 ) -> bool {
-    let shown_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
     // Both credential states park a provider until the user supplies a login,
     // so either one counts here: pausing the poll and watching the credential
     // sources is exactly as correct for "never signed in" as for "rejected".
-    shown_count > 0
-        && (!show_claude_code
-            || data
-                .error(tray_icon::TrayIconKind::Claude)
-                .is_some_and(ProviderStatus::needs_credentials))
-        && (!show_codex
-            || data
-                .error(tray_icon::TrayIconKind::Codex)
-                .is_some_and(ProviderStatus::needs_credentials))
-        && (!show_antigravity
-            || data
-                .error(tray_icon::TrayIconKind::Antigravity)
-                .is_some_and(ProviderStatus::needs_credentials))
+    shown.iter().any(|shown| *shown)
+        && tray_icon::TrayIconKind::ALL.into_iter().all(|kind| {
+            !shown[kind.index()]
+                || data
+                    .error(kind)
+                    .is_some_and(ProviderStatus::needs_credentials)
+        })
 }
 
 /// What to do with the credential watch once a poll has been evaluated.
@@ -11506,14 +11519,14 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 let mut state = lock_state();
                 state.as_mut().and_then(|s| {
                     s.data = Some(cached_data);
-                    if !s.allow_claude_credentials {
-                        clear_provider_usage(s, tray_icon::TrayIconKind::Claude);
-                    }
-                    if !s.allow_codex_credentials {
-                        clear_provider_usage(s, tray_icon::TrayIconKind::Codex);
-                    }
-                    if !s.allow_antigravity_credentials {
-                        clear_provider_usage(s, tray_icon::TrayIconKind::Antigravity);
+                    // A cached value for a provider whose access is not
+                    // granted must not come back from disk. Checks the same
+                    // predicate the poll gate uses, so a revoked provider
+                    // cannot be restored by the one-time consent alone.
+                    for kind in tray_icon::TrayIconKind::ALL {
+                        if !provider_has_credential_access(s, kind) {
+                            clear_provider_usage(s, kind);
+                        }
                     }
                     s.data_is_cached = true;
                     s.last_poll_ok = true;
@@ -12027,14 +12040,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // Resolve the watch before taking the lock: building a snapshot
             // can shell out to WSL, which must not happen while the state is
             // held (nor on the UI thread - this runs on the poll worker).
-            let needs_auth = shown_provider_needs_auth(
-                data.error(tray_icon::TrayIconKind::Claude),
-                data.error(tray_icon::TrayIconKind::Codex),
-                data.error(tray_icon::TrayIconKind::Antigravity),
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            );
+            let needs_auth = shown_provider_needs_auth(&data, plan.shown_flags());
             let post_poll_snapshot = watch_mode
                 .filter(|_| needs_auth)
                 .map(poller::credential_watch_snapshot);
@@ -12227,21 +12233,13 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
         Err(failure) => {
             let e = failure.error;
             let failed_data = *failure.data;
-            let has_transient_failure = (plan.poll_claude_code
-                && matches!(
-                    failed_data.error(tray_icon::TrayIconKind::Claude),
-                    Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
-                ))
-                || (plan.poll_codex
+            let has_transient_failure = tray_icon::TrayIconKind::ALL.into_iter().any(|kind| {
+                plan.polled(kind)
                     && matches!(
-                        failed_data.error(tray_icon::TrayIconKind::Codex),
+                        failed_data.error(kind),
                         Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
-                    ))
-                || (plan.poll_antigravity
-                    && matches!(
-                        failed_data.error(tray_icon::TrayIconKind::Antigravity),
-                        Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
-                    ));
+                    )
+            });
             // The aggregate error is only the first credential failure when
             // every provider needs user action. Inspect the exact provider
             // errors too, otherwise a remote 401 can be hidden by another
@@ -12251,20 +12249,8 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // Same race as the success path: sampling only now would arm the
             // baseline with credentials that were refreshed while the poll was
             // in flight. Compare against the pre-poll sample instead.
-            let needs_watch = shown_provider_needs_auth(
-                failed_data.error(tray_icon::TrayIconKind::Claude),
-                failed_data.error(tray_icon::TrayIconKind::Codex),
-                failed_data.error(tray_icon::TrayIconKind::Antigravity),
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            );
-            let pause_for_auth = all_shown_providers_need_auth(
-                &failed_data,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            );
+            let needs_watch = shown_provider_needs_auth(&failed_data, plan.shown_flags());
+            let pause_for_auth = all_shown_providers_need_auth(&failed_data, plan.shown_flags());
             let post_poll_snapshot = watch_mode
                 .filter(|_| needs_watch)
                 .map(poller::credential_watch_snapshot);
@@ -12507,38 +12493,25 @@ fn schedule_countdown_timer() {
         .filter_map(|window| poller::time_until_display_change(window.resets_at))
         .min();
     let now_unix = now_unix_secs();
-    let stale_transition_delay = [
-        (
-            data.error(tray_icon::TrayIconKind::Claude),
-            s.provider_refresh_states
-                .for_kind(tray_icon::TrayIconKind::Claude),
-            data.provider(tray_icon::TrayIconKind::Claude).updated_unix,
-        ),
-        (
-            data.error(tray_icon::TrayIconKind::Codex),
-            s.provider_refresh_states
-                .for_kind(tray_icon::TrayIconKind::Codex),
-            data.provider(tray_icon::TrayIconKind::Codex).updated_unix,
-        ),
-        (
-            data.error(tray_icon::TrayIconKind::Antigravity),
-            s.provider_refresh_states
-                .for_kind(tray_icon::TrayIconKind::Antigravity),
-            data.provider(tray_icon::TrayIconKind::Antigravity)
-                .updated_unix,
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(status, refresh_state, updated_unix)| {
-        provider_stale_transition_delay(
-            status,
-            refresh_state,
-            updated_unix,
-            s.poll_interval_ms,
-            now_unix,
-        )
-    })
-    .min();
+    let stale_transition_delay = tray_icon::TrayIconKind::ALL
+        .map(|kind| {
+            (
+                data.error(kind),
+                s.provider_refresh_states.for_kind(kind),
+                data.provider(kind).updated_unix,
+            )
+        })
+        .into_iter()
+        .filter_map(|(status, refresh_state, updated_unix)| {
+            provider_stale_transition_delay(
+                status,
+                refresh_state,
+                updated_unix,
+                s.poll_interval_ms,
+                now_unix,
+            )
+        })
+        .min();
     let min_delay = usage_display_delay
         .into_iter()
         .chain(stale_transition_delay)
@@ -14732,14 +14705,13 @@ mod reset_notification_tests {
     fn never_signed_in_still_pauses_polling_and_arms_the_watch() {
         let data = AppUsageData::default()
             .with_error(tray_icon::TrayIconKind::Codex, ProviderStatus::NotSignedIn);
-        assert!(all_shown_providers_need_auth(&data, false, true, false));
+        assert!(all_shown_providers_need_auth(
+            &data,
+            [false, true, false, false]
+        ));
         assert!(shown_provider_needs_auth(
-            None,
-            Some(ProviderStatus::NotSignedIn),
-            None,
-            false,
-            true,
-            false
+            &data,
+            [false, true, false, false]
         ));
 
         let mixed = AppUsageData::default()
@@ -14748,18 +14720,83 @@ mod reset_notification_tests {
                 tray_icon::TrayIconKind::Codex,
                 ProviderStatus::AuthenticationFailed,
             );
-        assert!(all_shown_providers_need_auth(&mixed, true, true, false));
+        assert!(all_shown_providers_need_auth(
+            &mixed,
+            [true, true, false, false]
+        ));
 
         // A provider that is merely rate limited is not waiting on the user.
         let transient = AppUsageData::default()
             .with_error(tray_icon::TrayIconKind::Codex, ProviderStatus::RateLimited);
         assert!(!all_shown_providers_need_auth(
-            &transient, false, true, false
+            &transient,
+            [false, true, false, false]
         ));
     }
 
     /// Only a rejected credential earns a balloon, and the flag it leaves
     /// behind decides whether a later rejection can still raise one.
+    /// Every provider must reach the failure-recovery state machine, not just
+    /// the ones that were wired when it was written. A provider left out of it
+    /// still polls and still shows an error, but never records a rate-limit
+    /// cooldown, never counts consecutive failures, never goes stale, and never
+    /// raises the one authentication balloon it owes the user - all silently.
+    #[test]
+    fn every_provider_reaches_the_refresh_state_machine() {
+        let plan = PollPassPlan {
+            show_claude_code: true,
+            show_codex: true,
+            show_antigravity: true,
+            show_grok: true,
+            poll_claude_code: true,
+            poll_codex: true,
+            poll_antigravity: true,
+            poll_grok: true,
+            claude_cooldown_ms: None,
+            codex_cooldown_ms: None,
+            antigravity_cooldown_ms: None,
+            grok_cooldown_ms: None,
+        };
+        let now = Instant::now();
+        let mut states = ProviderRefreshStates::default();
+
+        let mut rejected = AppUsageData::default();
+        for kind in tray_icon::TrayIconKind::ALL {
+            rejected.provider_mut(kind).error = Some(ProviderStatus::AuthenticationFailed);
+        }
+
+        let transitions =
+            update_refresh_states_for_pass(&mut states, None, POLL_5_MIN, plan, &rejected, 0, now);
+        assert_eq!(
+            transitions,
+            tray_icon::TrayIconKind::ALL.to_vec(),
+            "a rejected credential owes every provider exactly one balloon"
+        );
+        for kind in tray_icon::TrayIconKind::ALL {
+            assert!(
+                states.for_kind(kind).auth_failure_active,
+                "{kind:?} did not reach the state machine"
+            );
+        }
+
+        // A rate limit must land in the same per-provider cooldown for all of
+        // them, which is what keeps the next pass from re-polling immediately.
+        let mut limited = AppUsageData::default();
+        for kind in tray_icon::TrayIconKind::ALL {
+            let slot = limited.provider_mut(kind);
+            slot.error = Some(ProviderStatus::RateLimited);
+            slot.retry_after_ms = Some(60_000);
+        }
+        let mut states = ProviderRefreshStates::default();
+        update_refresh_states_for_pass(&mut states, None, POLL_5_MIN, plan, &limited, 0, now);
+        for kind in tray_icon::TrayIconKind::ALL {
+            assert!(
+                provider_cooldown_remaining_ms(states.for_kind(kind), now).is_some(),
+                "{kind:?} recorded no rate-limit cooldown"
+            );
+        }
+    }
+
     #[test]
     fn never_signed_in_raises_no_balloon_but_leaves_the_next_one_possible() {
         let mut state = ProviderRefreshState::default();
@@ -14916,44 +14953,58 @@ mod reset_notification_tests {
         // The regression: a healthy provider keeps the poll "successful", so
         // the signed-out one must still be noticed - otherwise its "sign in"
         // marker survives until the next poll interval (up to an hour).
+        let claude_rejected = AppUsageData::default().with_error(
+            tray_icon::TrayIconKind::Claude,
+            ProviderStatus::AuthenticationFailed,
+        );
+        let codex_rejected = AppUsageData::default().with_error(
+            tray_icon::TrayIconKind::Codex,
+            ProviderStatus::AuthenticationFailed,
+        );
         assert!(shown_provider_needs_auth(
-            Some(ProviderStatus::AuthenticationFailed),
-            None,
-            None,
-            true,
-            true,
-            false,
+            &claude_rejected,
+            [true, true, false, false]
         ));
         assert!(shown_provider_needs_auth(
-            None,
-            Some(ProviderStatus::AuthenticationFailed),
-            None,
-            true,
-            true,
-            false,
+            &codex_rejected,
+            [true, true, false, false]
         ));
         // A provider the user turned off must not arm a watch...
         assert!(!shown_provider_needs_auth(
-            Some(ProviderStatus::AuthenticationFailed),
-            None,
-            None,
-            false,
-            true,
-            false,
+            &claude_rejected,
+            [false, true, false, false]
         ));
         // ...and transient failures are not something signing in would fix.
         for status in [ProviderStatus::RateLimited, ProviderStatus::RequestFailed] {
+            let transient =
+                AppUsageData::default().with_error(tray_icon::TrayIconKind::Claude, status);
             assert!(!shown_provider_needs_auth(
-                Some(status),
-                None,
-                None,
-                true,
-                false,
-                false,
+                &transient,
+                [true, false, false, false]
             ));
         }
         assert!(!shown_provider_needs_auth(
-            None, None, None, true, true, true
+            &AppUsageData::default(),
+            [true, true, true, true]
+        ));
+
+        // The fourth provider goes through the same predicate rather than a
+        // branch that stops at the third.
+        let grok_rejected = AppUsageData::default().with_error(
+            tray_icon::TrayIconKind::Grok,
+            ProviderStatus::AuthenticationFailed,
+        );
+        assert!(shown_provider_needs_auth(
+            &grok_rejected,
+            [true, true, true, true]
+        ));
+        assert!(!shown_provider_needs_auth(
+            &grok_rejected,
+            [true, true, true, false]
+        ));
+        assert!(all_shown_providers_need_auth(
+            &grok_rejected,
+            [false, false, false, true]
         ));
     }
 

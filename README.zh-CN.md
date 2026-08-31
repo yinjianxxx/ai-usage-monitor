@@ -112,7 +112,7 @@ cargo build --release --locked
 - **Claude**：已登录 Windows 或 WSL 中的 Claude Code，或者已登录 Windows Claude Desktop；Desktop 存在受支持的本地会话时无需安装 CLI。Claude Code 凭据会同时检查 Windows 和所有已知可用 WSL 发行版。Windows 默认读取 `%USERPROFILE%\.claude\.credentials.json`，设置 `CLAUDE_CONFIG_DIR` 后改读该目录下的 `.credentials.json`；每个 WSL 发行版按其自身的 `CLAUDE_CONFIG_DIR` 或 `$HOME/.claude` 解析
 - **Codex**：已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持的本地会话，无需另外安装 CLI。Windows 侧读取 `%CODEX_HOME%\auth.json`（默认 `%USERPROFILE%\.codex\auth.json`）或 Windows 凭据管理器中的 Codex 条目；如均不可用，再读取**正在运行的** WSL 发行版中的 `$CODEX_HOME/auth.json`（默认 `$HOME/.codex/auth.json`）
 - **Antigravity**：已登录的 Antigravity 会话（IDE 与 CLI 共用同一条凭据）。Windows 侧读取凭据管理器中的 `gemini:antigravity`；如不可用，再读取**正在运行的** WSL 发行版中的 `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`
-- **Grok**：已登录的 grok CLI 会话。Windows 侧读取 `%GROK_HOME%uth.json`（默认 `%USERPROFILE%\.grokuth.json`）；如不可用，再读取**正在运行的** WSL 发行版中的 `$GROK_HOME/auth.json`（默认 `$HOME/.grok/auth.json`）。`auth.json` 可能同时保存来自多个身份提供方的登录条目，更筹只使用由 xAI 自己签发的条目，且该令牌只会发往 xAI。环境变量 `XAI_API_KEY` 不是会话登录态，不会被读取
+- **Grok**：已登录的 grok CLI 会话。Windows 侧读取 `%GROK_HOME%\auth.json`（默认 `%USERPROFILE%\.grok\auth.json`）；如不可用，再读取**正在运行的** WSL 发行版中的 `$GROK_HOME/auth.json`（默认 `$HOME/.grok/auth.json`）。`auth.json` 可能同时保存来自多个身份提供方的登录条目，更筹只使用由 xAI 自己签发的条目，且该令牌只会发往 xAI。环境变量 `XAI_API_KEY` 不是会话登录态，不会被读取
 
 Codex、Antigravity 与 Grok 的 WSL 凭据只在发行版**已经在运行**时读取。读取停止的发行版会启动它的虚拟机，而这项检查是按计划执行的，因此更筹不会为此唤醒 WSL。需要时可先启动发行版，再从右键菜单的**服务商访问权限 → 重新探测服务商**触发一次检查。
 
@@ -148,7 +148,7 @@ Codex、Antigravity 与 Grok 的 WSL 凭据只在发行版**已经在运行**时
 
 卸载前，如已启用**开机启动**，请先在菜单中关闭，然后删除可执行文件、`%APPDATA%\Gengchou` 和 `%LOCALAPPDATA%\Gengchou` 两个目录。
 
-网络请求会直接发往已启用且获得明确授权的服务商（Anthropic、ChatGPT/Codex、Google）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
+网络请求会直接发往已启用且获得明确授权的服务商（Anthropic、ChatGPT/Codex、Google、xAI）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
 
 - 收集分析或遥测数据，或上传任何文件；
 - 将凭据发送给签发者以外的任何一方；

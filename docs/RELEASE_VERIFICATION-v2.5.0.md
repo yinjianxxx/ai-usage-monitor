@@ -14,7 +14,7 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --all-targets --locked -- -D warnings` | Pass |
-| `cargo test --locked` | Pass: 313 passed, 0 failed, 0 ignored |
+| `cargo test --locked` | Pass: 314 passed, 0 failed, 0 ignored |
 | RustSec (`cargo-audit`) | Not run locally; not installed here. CI enforces it |
 | `tools/check-retired-identity.ps1` | Pass (13 historical lines) |
 | current updater inbound readiness E2E | Pass |
@@ -26,7 +26,7 @@
 
 The final local EXE reports FileVersion/ProductVersion `2.5.0`, ProductName
 `Gengchou`, and CompanyName `ynjmxn`. Its local pre-release SHA-256 is
-`da00fbcee8942355b4fd912bafc80440c02bdddefd1e071041f8314eb0ff0551`.
+`53c2b9c6d81a961036e812dfa4da84e288f5239866cd96a1428fdb20b8b50eb2`.
 The GitHub workflow rebuilds independently, so the public asset hash is expected
 to differ and remains the only hash valid for WinGet.
 
@@ -89,6 +89,29 @@ round-trips every provider through the serialized form.
 A settings file naming a provider this build does not know now loads with that
 entry dropped and every other field intact; normalization then re-appends the
 providers this build does know.
+
+### Independent pre-release review
+
+A second agent reviewed `v2.4.2..HEAD` in the same working copy and initially
+returned a no-go. Its three findings were reproduced here before being fixed:
+
+- **Release blocker.** Grok reached the poll pass but not the failure-recovery
+  state machine: `update_provider_refresh_states`, the credential-watch
+  predicates, the all-failed transient check, and the stale-transition timing
+  each spelled out three providers in parallel expressions rather than matching
+  on the provider, so the compiler could not catch the omission. Grok therefore
+  recorded no rate-limit cooldown, counted no consecutive failures, never went
+  stale, and never raised the one authentication balloon it owes the user. All
+  five now iterate `TrayIconKind::ALL`, and
+  `every_provider_reaches_the_refresh_state_machine` fails if a provider is
+  dropped from that loop - verified by temporarily restricting it to three.
+- **Medium.** Loading the usage cache at startup cleared unauthorized Claude,
+  Codex, and Antigravity values but not Grok, so a revoked Grok could be
+  restored from disk. The filter now iterates every provider and uses
+  `provider_has_credential_access`, the same predicate that gates polling.
+- **Low.** Both READMEs rendered the Windows path as `%GROK_HOME%uth.json`
+  with the backslash written as U+0007, and the network-traffic list did not
+  name xAI. Both are corrected.
 
 ## Not verified
 
