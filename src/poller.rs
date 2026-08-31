@@ -15,6 +15,7 @@ use crate::models::{
     AppUsageData, ProviderStatus, UsageData, UsageWindow, FIVE_HOURS_SECONDS, ONE_DAY_SECONDS,
     ONE_WEEK_SECONDS,
 };
+use crate::tray_icon::TrayIconKind;
 use crate::{claude_cli, claude_desktop};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -41,6 +42,20 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
 ];
+/// grok CLI's own billing endpoint. Not part of the documented xAI API - the
+/// CLI uses it to render its `/usage` view - so treat a shape change as a
+/// normal provider outage rather than a bug in the response parser.
+const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// grok CLI marks its own token with this header; the endpoint rejects a
+/// bearer token that arrives without it.
+const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
+const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+const GROK_REQUEST_TIMEOUT_SECS: u64 = 15;
+/// `auth.json` is a registry keyed by `{issuer}::{client_id}`, and an
+/// enterprise OIDC entry there is signed by someone other than xAI. Only
+/// issuers under xAI's own domain may have their token sent to xAI.
+const GROK_ISSUER_HOST_SUFFIX: &str = ".x.ai";
+const GROK_PREFERRED_ISSUER_PREFIX: &str = "https://auth.x.ai::";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
@@ -63,6 +78,7 @@ pub enum CredentialWatchMode {
     ClaudeSources,
     Codex,
     Antigravity,
+    Grok,
     AllProviders,
 }
 
@@ -132,6 +148,7 @@ struct AuthRejectionBackoff {
 
 static CODEX_AUTH_REJECTION: OnceLock<Mutex<Option<AuthRejectionBackoff>>> = OnceLock::new();
 static ANTIGRAVITY_AUTH_REJECTION: OnceLock<Mutex<Option<AuthRejectionBackoff>>> = OnceLock::new();
+static GROK_AUTH_REJECTION: OnceLock<Mutex<Option<AuthRejectionBackoff>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct CodexAuthFile {
@@ -171,6 +188,46 @@ struct AntigravityAuthFile {
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
+}
+
+struct GrokTokenData {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+struct GrokBillingResponse {
+    config: GrokBillingConfig,
+}
+
+/// Only the fields this app displays. The endpoint also reports prepaid
+/// balances and top-up settings, which are not quota windows.
+#[derive(Deserialize)]
+struct GrokBillingConfig {
+    /// Server-computed used percentage. Omitted at zero usage, which is how
+    /// a free-tier account reports "nothing used" - absent is 0%, not
+    /// "unknown".
+    #[serde(rename = "creditUsagePercent")]
+    credit_usage_percent: Option<f64>,
+    #[serde(rename = "currentPeriod")]
+    current_period: Option<GrokBillingPeriod>,
+    #[serde(rename = "onDemandCap")]
+    on_demand_cap: Option<GrokAmount>,
+    #[serde(rename = "onDemandUsed")]
+    on_demand_used: Option<GrokAmount>,
+}
+
+#[derive(Deserialize)]
+struct GrokBillingPeriod {
+    #[serde(rename = "type")]
+    period_type: Option<String>,
+    start: Option<String>,
+    end: String,
+}
+
+#[derive(Deserialize)]
+struct GrokAmount {
+    #[serde(default)]
+    val: f64,
 }
 
 #[derive(Deserialize)]
@@ -275,58 +332,96 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
+/// One provider's work for a single poll pass.
+///
+/// Boxed rather than generic so the pass is a table: adding a provider adds a
+/// row here instead of two more parameters and another copy of the
+/// error-handling block below.
+struct PollTarget<'a> {
+    kind: TrayIconKind,
+    enabled: bool,
+    poll: Box<dyn FnOnce() -> Result<UsageData, PollError> + Send + 'a>,
+}
+
 pub fn poll(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
     force_claude_refresh: bool,
 ) -> Result<AppUsageData, PollFailure> {
-    poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        || poll_claude_code(force_claude_refresh),
-        poll_codex,
-        poll_antigravity,
-    )
+    poll_with(vec![
+        PollTarget {
+            kind: TrayIconKind::Claude,
+            enabled: show_claude_code,
+            poll: Box::new(move || poll_claude_code(force_claude_refresh)),
+        },
+        PollTarget {
+            kind: TrayIconKind::Codex,
+            enabled: show_codex,
+            poll: Box::new(poll_codex),
+        },
+        PollTarget {
+            kind: TrayIconKind::Antigravity,
+            enabled: show_antigravity,
+            poll: Box::new(poll_antigravity),
+        },
+        PollTarget {
+            kind: TrayIconKind::Grok,
+            enabled: show_grok,
+            poll: Box::new(poll_grok),
+        },
+    ])
 }
 
-fn poll_with(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    poll_claude_code: impl FnOnce() -> Result<UsageData, PollError> + Send,
-    poll_codex: impl FnOnce() -> Result<UsageData, PollError> + Send,
-    poll_antigravity: impl FnOnce() -> Result<UsageData, PollError> + Send,
-) -> Result<AppUsageData, PollFailure> {
+fn poll_with(targets: Vec<PollTarget<'_>>) -> Result<AppUsageData, PollFailure> {
     // Fetch the enabled providers concurrently: results reach the UI only
     // once the whole pass finishes, so a slow endpoint would otherwise hold
     // back every other provider's fresh numbers for its full duration.
-    let (claude_code, codex, antigravity) = std::thread::scope(|scope| {
-        let claude_code = show_claude_code.then(|| scope.spawn(poll_claude_code));
-        let codex = show_codex.then(|| scope.spawn(poll_codex));
-        let antigravity = show_antigravity.then(|| scope.spawn(poll_antigravity));
-        (
-            claude_code.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
-            codex.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
-            antigravity.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
-        )
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .into_iter()
+            .map(
+                |PollTarget {
+                     kind,
+                     enabled,
+                     poll,
+                 }| (kind, enabled.then(|| scope.spawn(poll))),
+            )
+            .collect();
+        handles
+            .into_iter()
+            .map(|(kind, handle)| {
+                (
+                    kind,
+                    handle.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
+                )
+            })
+            .collect::<Vec<_>>()
     });
 
     let mut data = AppUsageData::default();
     let mut errors = Vec::new();
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
+    let active_provider_count = results
+        .iter()
+        .filter(|(_, result)| result.is_some())
+        .count();
 
-    if let Some(result) = claude_code {
+    for (kind, result) in results {
+        let Some(result) = result else { continue };
         match result {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
+            Ok(usage) => data.provider_mut(kind).usage = Some(usage),
             Err(error) => {
                 if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
+                    diagnose::log(format!(
+                        "{} usage poll failed: {error:?}",
+                        kind.diagnostic_label()
+                    ));
                 }
-                data.claude_code_error = Some(provider_status(error));
+                let slot = data.provider_mut(kind);
+                slot.error = Some(provider_status(error));
                 if let PollError::RateLimited(retry_after_ms) = error {
-                    data.claude_code_retry_after_ms = retry_after_ms;
+                    slot.retry_after_ms = retry_after_ms;
                 }
                 record_poll_error(&mut data, error);
                 errors.push(error);
@@ -334,47 +429,13 @@ fn poll_with(
         }
     }
 
-    if let Some(result) = codex {
-        match result {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
-                data.codex_error = Some(provider_status(error));
-                if let PollError::RateLimited(retry_after_ms) = error {
-                    data.codex_retry_after_ms = retry_after_ms;
-                }
-                record_poll_error(&mut data, error);
-                errors.push(error);
-            }
-        }
-    }
-
-    if let Some(result) = antigravity {
-        match result {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
-                data.antigravity_error = Some(provider_status(error));
-                if let PollError::RateLimited(retry_after_ms) = error {
-                    data.antigravity_retry_after_ms = retry_after_ms;
-                }
-                record_poll_error(&mut data, error);
-                errors.push(error);
-            }
-        }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+    if data.has_any_usage() {
+        Ok(data)
+    } else {
         Err(PollFailure {
             error: aggregate_poll_errors(&errors),
             data: Box::new(data),
         })
-    } else {
-        Ok(data)
     }
 }
 
@@ -951,6 +1012,147 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     }
 }
 
+fn poll_grok() -> Result<UsageData, PollError> {
+    let creds = match read_grok_credentials() {
+        Some(creds) => creds,
+        None => {
+            diagnose::log("Grok usage poll failed: no Grok credentials found");
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    // No local expiry check before the request. grok CLI mints six-hour
+    // access tokens and refreshes them only when it is itself run, so a
+    // locally expired token is the normal state between sessions - and the
+    // server, not this app's clock, decides whether it still works. A
+    // rejection parks the provider until the credential file changes, which
+    // is exactly when grok CLI has refreshed it.
+    let token_hash = token_hash(&creds.access_token);
+    if auth_rejection_is_backed_off(&GROK_AUTH_REJECTION, token_hash) {
+        diagnose::log("Grok usage poll skipped; rejected credentials have not changed");
+        return Err(PollError::AuthRequired);
+    }
+
+    match fetch_grok_usage(&creds.access_token) {
+        Ok(data) => {
+            clear_auth_rejection(&GROK_AUTH_REJECTION);
+            Ok(data)
+        }
+        Err(PollError::AuthRequired | PollError::AuthForbidden) => {
+            record_auth_rejection(&GROK_AUTH_REJECTION, token_hash);
+            Err(PollError::AuthRequired)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_grok_usage(token: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent_for_url(
+        GROK_BILLING_URL,
+        Duration::from_secs(GROK_REQUEST_TIMEOUT_SECS),
+    )?;
+    let resp = match agent
+        .get(GROK_BILLING_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set(GROK_TOKEN_AUTH_HEADER, GROK_TOKEN_AUTH_VALUE)
+        .set("Accept", "application/json")
+        .set("User-Agent", "gengchou")
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, response)) => {
+            return Err(http_status_poll_error(
+                "Grok billing endpoint",
+                code,
+                &response,
+            ));
+        }
+        Err(error) => {
+            diagnose::log_error("Grok billing endpoint request failed", error);
+            return Err(PollError::NetworkUnavailable);
+        }
+    };
+
+    let response: GrokBillingResponse =
+        match crate::http_client::response_json_limited(resp, "Grok billing response") {
+            Ok(response) => response,
+            Err(error) => {
+                diagnose::log_error("unable to parse Grok billing response", error);
+                return Err(PollError::RequestFailed);
+            }
+        };
+
+    grok_usage_from_billing(response).ok_or_else(|| {
+        diagnose::log("Grok billing response did not contain a usable quota window");
+        PollError::RequestFailed
+    })
+}
+
+/// Turn one billing period into the single window Grok reports.
+///
+/// The period is mandatory: without it there is no reset time, and a
+/// percentage with no reset would overwrite a complete cached window with
+/// half a one. The window length is measured from the period itself rather
+/// than assumed from its type, so a calendar month stays 28-31 days instead
+/// of a rounded 30.
+fn grok_usage_from_billing(response: GrokBillingResponse) -> Option<UsageData> {
+    let config = response.config;
+    let period = config.current_period?;
+    let resets_at = parse_iso8601(Some(&period.end))?;
+    let duration_seconds = period
+        .start
+        .as_deref()
+        .and_then(|start| parse_iso8601(Some(start)))
+        .and_then(|start| resets_at.duration_since(start).ok())
+        .map(|duration| duration.as_secs())
+        .filter(|seconds| *seconds > 0);
+    let percent = grok_used_percent(
+        config.credit_usage_percent,
+        config.on_demand_used.map(|amount| amount.val),
+        config.on_demand_cap.map(|amount| amount.val),
+    )?;
+    // Only when the length is unmeasurable does the period type get used, and
+    // then only as the label the surfaces already show for unknown windows.
+    let source_label = duration_seconds
+        .is_none()
+        .then(|| grok_period_label(period.period_type.as_deref()));
+    Some(UsageData::from_windows(vec![UsageWindow::new(
+        percent,
+        Some(resets_at),
+        duration_seconds,
+    )
+    .with_source_label(source_label)]))
+}
+
+fn grok_period_label(period_type: Option<&str>) -> String {
+    period_type
+        .unwrap_or_default()
+        .trim()
+        .strip_prefix("USAGE_PERIOD_TYPE_")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// Used percentage, preferring the value the server already computed.
+///
+/// A missing percentage with no on-demand allowance is zero usage, not a
+/// failure: that is what a free-tier account returns.
+fn grok_used_percent(
+    credit_usage_percent: Option<f64>,
+    on_demand_used: Option<f64>,
+    on_demand_cap: Option<f64>,
+) -> Option<f64> {
+    if let Some(percent) = credit_usage_percent {
+        return (percent.is_finite() && (0.0..=100.0).contains(&percent)).then_some(percent);
+    }
+    match (on_demand_used, on_demand_cap) {
+        (Some(used), Some(cap)) if cap > 0.0 => {
+            (used.is_finite() && used >= 0.0).then(|| (used / cap * 100.0).clamp(0.0, 100.0))
+        }
+        _ => Some(0.0),
+    }
+}
+
 fn auth_rejection_is_backed_off(
     state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>,
     token_hash: u64,
@@ -1036,10 +1238,12 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
         CredentialWatchMode::ClaudeSources => claude_credential_watch_snapshot(),
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
+        CredentialWatchMode::Grok => vec![grok_credential_watch_signature()],
         CredentialWatchMode::AllProviders => {
             let mut snapshot = claude_credential_watch_snapshot();
             snapshot.push(codex_credential_watch_signature());
             snapshot.push(antigravity_credential_watch_signature());
+            snapshot.push(grok_credential_watch_signature());
             snapshot
         }
     };
@@ -1054,11 +1258,12 @@ pub struct DetectedProviders {
     pub claude: bool,
     pub codex: bool,
     pub antigravity: bool,
+    pub grok: bool,
 }
 
 impl DetectedProviders {
     pub fn any(self) -> bool {
-        self.claude || self.codex || self.antigravity
+        self.claude || self.codex || self.antigravity || self.grok
     }
 }
 
@@ -1076,6 +1281,8 @@ pub struct DetectionInputs {
     pub codex_wsl: bool,
     pub antigravity_windows: bool,
     pub antigravity_wsl: bool,
+    pub grok_windows: bool,
+    pub grok_wsl: bool,
 }
 
 pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
@@ -1083,6 +1290,7 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
         claude: inputs.claude_windows || inputs.claude_desktop || inputs.claude_wsl,
         codex: inputs.codex_windows || inputs.codex_wsl,
         antigravity: inputs.antigravity_windows || inputs.antigravity_wsl,
+        grok: inputs.grok_windows || inputs.grok_wsl,
     }
 }
 
@@ -1113,13 +1321,16 @@ pub fn detect_signed_in_providers() -> DetectedProviders {
         antigravity_windows: read_windows_antigravity_credentials().is_some(),
         antigravity_wsl: !running.is_empty()
             && read_antigravity_credentials_from_wsl(&running).is_some(),
+        grok_windows: read_windows_grok_credentials().is_some(),
+        grok_wsl: !running.is_empty() && read_grok_credentials_from_wsl(&running).is_some(),
     };
     let detected = detect_from(inputs);
     diagnose::log(format!(
-        "provider detection: claude={} codex={} antigravity={} (running WSL distros: {})",
+        "provider detection: claude={} codex={} antigravity={} grok={} (running WSL distros: {})",
         detected.claude,
         detected.codex,
         detected.antigravity,
+        detected.grok,
         running.len()
     ));
     detected
@@ -1263,6 +1474,16 @@ fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialPr
 /// fallback has no WSL equivalent, so the file is the only source there.
 const WSL_CODEX_CREDENTIAL_SCRIPT: &str = r#"
 config_dir="${CODEX_HOME:-$HOME/.codex}"
+credential_path="$config_dir/auth.json"
+if [ ! -e "$credential_path" ]; then exit 44; fi
+if [ ! -r "$credential_path" ]; then exit 45; fi
+cat -- "$credential_path"
+"#;
+
+/// grok CLI keeps `auth.json` under `$GROK_HOME` (default `~/.grok`), the
+/// same layout as the Windows install and with no keyring fallback.
+const WSL_GROK_CREDENTIAL_SCRIPT: &str = r#"
+config_dir="${GROK_HOME:-$HOME/.grok}"
 credential_path="$config_dir/auth.json"
 if [ ! -e "$credential_path" ]; then exit 44; fi
 if [ ! -r "$credential_path" ]; then exit 45; fi
@@ -2670,6 +2891,114 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
         .or_else(|| read_antigravity_credentials_from_wsl(&list_running_wsl_distros()))
 }
 
+fn grok_home() -> Option<PathBuf> {
+    grok_home_from(
+        std::env::var_os("GROK_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn grok_home_from(configured: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    configured
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| home.map(|home| home.join(".grok")))
+}
+
+fn grok_auth_path() -> Option<PathBuf> {
+    grok_home().map(|home| home.join("auth.json"))
+}
+
+fn read_windows_grok_credentials() -> Option<GrokTokenData> {
+    let auth_path = grok_auth_path()?;
+    let tokens = std::fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|content| grok_token_from_auth_json(&content));
+    if tokens.is_none() {
+        diagnose::log(format!(
+            "no readable Grok CLI credentials found at {}",
+            auth_path.display()
+        ));
+    }
+    tokens
+}
+
+fn read_grok_credentials_from_wsl(distros: &[String]) -> Option<GrokTokenData> {
+    for distro in distros {
+        let Some(bytes) = read_wsl_script_output(distro, WSL_GROK_CREDENTIAL_SCRIPT) else {
+            continue;
+        };
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if let Some(tokens) = grok_token_from_auth_json(&content) {
+            diagnose::log(format!("loaded Grok credentials from WSL distro {distro}"));
+            return Some(tokens);
+        }
+    }
+    None
+}
+
+fn read_grok_credentials() -> Option<GrokTokenData> {
+    read_windows_grok_credentials()
+        .or_else(|| read_grok_credentials_from_wsl(&list_running_wsl_distros()))
+}
+
+fn grok_credential_watch_signature() -> String {
+    let Some(auth_path) = grok_auth_path() else {
+        return "win:grok-auth|missing".to_string();
+    };
+    windows_credential_watch_signature(&auth_path)
+}
+
+/// Pick the entry grok CLI itself would use.
+///
+/// `auth.json` is a registry keyed by `{issuer}::{client_id}`, so one file can
+/// hold several sign-ins. xAI's own OAuth scope wins; anything else under an
+/// `x.ai` issuer is the fallback. An entry from some other issuer - an
+/// enterprise IdP - is skipped rather than used, because its token was not
+/// issued by xAI and must not be sent to xAI. `serde_json` keeps object keys
+/// sorted, so the fallback is stable between polls.
+fn grok_token_from_auth_json(content: &str) -> Option<GrokTokenData> {
+    let registry: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(content).ok()?;
+    let usable_token = |entry: &serde_json::Value| -> Option<String> {
+        let token = entry.get("key")?.as_str()?.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    };
+    let issued_by_xai = |key: &str, entry: &serde_json::Value| {
+        let issuer = entry
+            .get("oidc_issuer")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| key.split("::").next().unwrap_or_default());
+        grok_issuer_is_xai(issuer)
+    };
+    let preferred = registry.iter().find(|(key, entry)| {
+        key.starts_with(GROK_PREFERRED_ISSUER_PREFIX)
+            && issued_by_xai(key, entry)
+            && usable_token(entry).is_some()
+    });
+    preferred
+        .or_else(|| {
+            registry
+                .iter()
+                .find(|(key, entry)| issued_by_xai(key, entry) && usable_token(entry).is_some())
+        })
+        .and_then(|(_, entry)| usable_token(entry))
+        .map(|access_token| GrokTokenData { access_token })
+}
+
+fn grok_issuer_is_xai(issuer: &str) -> bool {
+    let Some(rest) = issuer.trim().strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "x.ai" || host.ends_with(GROK_ISSUER_HOST_SUFFIX)
+}
+
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     let result = read_windows_generic_credential_quiet(target);
     if result.is_none() {
@@ -3593,6 +3922,185 @@ mod tests {
         assert!(windows_credential_watch_signature(&path).ends_with("|missing"));
     }
 
+    /// Build a poll pass table from the fixed three-provider order used by
+    /// these cases, so a test states only which providers are on and what
+    /// each one returns.
+    fn poll_targets<'a>(
+        enabled: [bool; TrayIconKind::COUNT],
+        polls: [Box<dyn FnOnce() -> Result<UsageData, PollError> + Send + 'a>; TrayIconKind::COUNT],
+    ) -> Vec<PollTarget<'a>> {
+        TrayIconKind::ALL
+            .into_iter()
+            .zip(enabled)
+            .zip(polls)
+            .map(|((kind, enabled), poll)| PollTarget {
+                kind,
+                enabled,
+                poll,
+            })
+            .collect()
+    }
+
+    /// Shape of a real `/v1/billing?format=credits` response on a free-tier
+    /// account: no `creditUsagePercent`, no on-demand allowance, one weekly
+    /// period. A billing response carries no token or account identifier.
+    const GROK_FREE_TIER_BILLING: &str = r#"{"config":{"currentPeriod":{
+        "type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-15T00:00:00+00:00",
+        "end":"2026-08-22T00:00:00+00:00"},"onDemandCap":{"val":0},
+        "onDemandUsed":{"val":0},"isUnifiedBillingUser":true,
+        "prepaidBalance":{"val":0}}}"#;
+
+    fn grok_usage(text: &str) -> Option<UsageData> {
+        let response: GrokBillingResponse = serde_json::from_str(text).ok()?;
+        grok_usage_from_billing(response)
+    }
+
+    #[test]
+    fn grok_missing_percentage_is_zero_not_missing_data() {
+        let data = grok_usage(GROK_FREE_TIER_BILLING).expect("free tier billing should parse");
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].percentage, 0.0);
+        assert_eq!(data.windows[0].duration_seconds, Some(7 * 24 * 60 * 60));
+        assert_eq!(data.windows[0].source_label, None);
+        assert_eq!(
+            data.windows[0]
+                .resets_at
+                .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            Some(1_787_356_800)
+        );
+    }
+
+    /// Verified against the live endpoint on 2026-08-31: a paid account
+    /// reports the percentage directly, and both period bounds carry
+    /// fractional seconds and a numeric UTC offset rather than `Z`.
+    #[test]
+    fn grok_parses_the_live_response_shape() {
+        let live = r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",
+            "start":"2026-08-30T18:29:39.234502+00:00",
+            "end":"2026-09-06T18:29:39.234502+00:00"},
+            "creditUsagePercent":5.0,"onDemandCap":{"val":0},"onDemandUsed":{"val":0},
+            "isUnifiedBillingUser":true,"prepaidBalance":{"val":0},
+            "billingPeriodStart":"2026-08-30T18:29:39.234502+00:00",
+            "billingPeriodEnd":"2026-09-06T18:29:39.234502+00:00",
+            "topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","productUsage":{}}}"#;
+        let data = grok_usage(live).expect("live response shape should parse");
+        assert_eq!(data.windows[0].percentage, 5.0);
+        assert_eq!(data.windows[0].duration_seconds, Some(7 * 24 * 60 * 60));
+        assert_eq!(data.windows[0].source_label, None);
+    }
+
+    #[test]
+    fn grok_window_length_is_measured_not_assumed() {
+        // A February billing period is 28 days, so a fixed 30-day constant
+        // would mislabel it. The period reports its own start and end.
+        let february = GROK_FREE_TIER_BILLING
+            .replace("USAGE_PERIOD_TYPE_WEEKLY", "USAGE_PERIOD_TYPE_MONTHLY")
+            .replace("2026-08-15T00:00:00+00:00", "2027-02-01T00:00:00+00:00")
+            .replace("2026-08-22T00:00:00+00:00", "2027-03-01T00:00:00+00:00");
+        let data = grok_usage(&february).expect("monthly billing should parse");
+        assert_eq!(data.windows[0].duration_seconds, Some(28 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn grok_unmeasurable_window_falls_back_to_the_reported_period_type() {
+        let no_start =
+            GROK_FREE_TIER_BILLING.replace(r#""start":"2026-08-15T00:00:00+00:00","#, "");
+        let data = grok_usage(&no_start).expect("billing without a start should still parse");
+        assert_eq!(data.windows[0].duration_seconds, None);
+        assert_eq!(data.windows[0].source_label.as_deref(), Some("weekly"));
+    }
+
+    #[test]
+    fn grok_rejects_billing_without_a_usable_reset() {
+        for text in [
+            r#"{"config":{"onDemandCap":{"val":0}}}"#,
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"nope"}}}"#,
+        ] {
+            assert!(grok_usage(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn grok_percentage_prefers_the_server_value_and_rejects_impossible_ones() {
+        assert_eq!(
+            grok_used_percent(Some(42.5), Some(9.0), Some(10.0)),
+            Some(42.5)
+        );
+        assert_eq!(grok_used_percent(Some(101.0), None, None), None);
+        assert_eq!(grok_used_percent(Some(-1.0), None, None), None);
+        assert_eq!(grok_used_percent(Some(f64::NAN), None, None), None);
+        // Falls back to the on-demand ratio, and never divides by a zero cap:
+        // a free-tier account reports every allowance as zero.
+        assert_eq!(grok_used_percent(None, Some(10.0), Some(40.0)), Some(25.0));
+        assert_eq!(grok_used_percent(None, Some(0.0), Some(0.0)), Some(0.0));
+        assert_eq!(grok_used_percent(None, None, None), Some(0.0));
+    }
+
+    #[test]
+    fn grok_auth_json_prefers_the_xai_oauth_scope() {
+        let content = r#"{
+            "https://accounts.x.ai/sign-in::legacy": {"key": "legacy-token"},
+            "https://auth.x.ai::b1a00492": {"key": "oauth-token",
+                "oidc_issuer": "https://auth.x.ai"}
+        }"#;
+        assert_eq!(
+            grok_token_from_auth_json(content).map(|token| token.access_token),
+            Some("oauth-token".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_auth_json_never_hands_a_third_party_token_to_xai() {
+        // An enterprise OIDC entry is signed by someone other than xAI, so it
+        // is skipped rather than used - even when it is the only entry.
+        let enterprise_only = r#"{
+            "https://login.example.com::client": {"key": "enterprise-token",
+                "oidc_issuer": "https://login.example.com"}
+        }"#;
+        assert!(grok_token_from_auth_json(enterprise_only).is_none());
+
+        // A hostname that merely ends in the domain text is not the domain.
+        let lookalike = r#"{
+            "https://auth.notx.ai::client": {"key": "lookalike-token",
+                "oidc_issuer": "https://auth.notx.ai"}
+        }"#;
+        assert!(grok_token_from_auth_json(lookalike).is_none());
+
+        let mixed = r#"{
+            "https://login.example.com::client": {"key": "enterprise-token",
+                "oidc_issuer": "https://login.example.com"},
+            "https://accounts.x.ai/sign-in::legacy": {"key": "legacy-token"}
+        }"#;
+        assert_eq!(
+            grok_token_from_auth_json(mixed).map(|token| token.access_token),
+            Some("legacy-token".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_auth_json_ignores_entries_without_a_usable_token() {
+        assert!(grok_token_from_auth_json("{}").is_none());
+        assert!(grok_token_from_auth_json("not json").is_none());
+        assert!(grok_token_from_auth_json(r#"{"https://auth.x.ai::c": {}}"#).is_none());
+        assert!(grok_token_from_auth_json(r#"{"https://auth.x.ai::c": {"key": "  "}}"#).is_none());
+    }
+
+    #[test]
+    fn grok_home_ignores_an_empty_override() {
+        let home = PathBuf::from(r"C:\Users\Example");
+        let configured = PathBuf::from(r"D:\GrokProfile");
+        assert_eq!(
+            grok_home_from(Some(configured.clone()), Some(home.clone())),
+            Some(configured)
+        );
+        assert_eq!(
+            grok_home_from(Some(PathBuf::new()), Some(home.clone())),
+            Some(home.join(".grok"))
+        );
+        assert_eq!(grok_home_from(None, None), None);
+    }
+
     fn usage_with_percent(percentage: f64) -> UsageData {
         UsageData::from_windows(vec![UsageWindow::new(
             percentage,
@@ -3775,108 +4283,140 @@ mod tests {
             }
         };
 
-        let data = poll_with(true, true, false, make_poll(11.0), make_poll(22.0), || {
-            unreachable!("antigravity is disabled")
-        })
+        let data = poll_with(poll_targets(
+            [true, true, false, false],
+            [
+                Box::new(make_poll(11.0)),
+                Box::new(make_poll(22.0)),
+                Box::new(|| unreachable!("antigravity is disabled")),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect("both concurrent providers should succeed");
 
-        assert_eq!(data.claude_code.unwrap().windows[0].percentage, 11.0);
-        assert_eq!(data.codex.unwrap().windows[0].percentage, 22.0);
+        assert_eq!(
+            data.usage(TrayIconKind::Claude).unwrap().windows[0].percentage,
+            11.0
+        );
+        assert_eq!(
+            data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
+            22.0
+        );
     }
 
     #[test]
     fn claude_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::AuthRequired),
-            || Ok(usage_with_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
-        )
+        let data = poll_with(poll_targets(
+            [true, true, false, false],
+            [
+                Box::new(|| Err(PollError::AuthRequired)),
+                Box::new(|| Ok(usage_with_percent(42.0))),
+                Box::new(|| unreachable!("antigravity is disabled")),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect("codex data should keep the poll successful");
 
-        assert!(data.claude_code.is_none());
+        assert!(data.usage(TrayIconKind::Claude).is_none());
         assert_eq!(
-            data.claude_code_error,
+            data.error(TrayIconKind::Claude),
             Some(ProviderStatus::AuthenticationFailed)
         );
-        assert!(data.codex_error.is_none());
-        assert_eq!(data.codex.unwrap().windows[0].percentage, 42.0);
+        assert!(data.error(TrayIconKind::Codex).is_none());
+        assert_eq!(
+            data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
+            42.0
+        );
     }
 
     #[test]
     fn codex_failure_does_not_block_claude_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Ok(usage_with_percent(64.0)),
-            || Err(PollError::RequestFailed),
-            || unreachable!("antigravity is disabled"),
-        )
+        let data = poll_with(poll_targets(
+            [true, true, false, false],
+            [
+                Box::new(|| Ok(usage_with_percent(64.0))),
+                Box::new(|| Err(PollError::RequestFailed)),
+                Box::new(|| unreachable!("antigravity is disabled")),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect("claude data should keep the poll successful");
 
-        assert_eq!(data.claude_code.unwrap().windows[0].percentage, 64.0);
-        assert!(data.codex.is_none());
+        assert_eq!(
+            data.usage(TrayIconKind::Claude).unwrap().windows[0].percentage,
+            64.0
+        );
+        assert!(data.usage(TrayIconKind::Codex).is_none());
     }
 
     #[test]
     fn rate_limit_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::RateLimited(Some(120_000))),
-            || Ok(usage_with_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
-        )
+        let data = poll_with(poll_targets(
+            [true, true, false, false],
+            [
+                Box::new(|| Err(PollError::RateLimited(Some(120_000)))),
+                Box::new(|| Ok(usage_with_percent(42.0))),
+                Box::new(|| unreachable!("antigravity is disabled")),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect("codex data should keep the poll successful");
 
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.claude_code_error, Some(ProviderStatus::RateLimited));
-        assert_eq!(data.codex.unwrap().windows[0].percentage, 42.0);
-        assert_eq!(data.claude_code_retry_after_ms, Some(120_000));
-        assert_eq!(data.codex_retry_after_ms, None);
+        assert!(data.usage(TrayIconKind::Claude).is_none());
+        assert_eq!(
+            data.error(TrayIconKind::Claude),
+            Some(ProviderStatus::RateLimited)
+        );
+        assert_eq!(
+            data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
+            42.0
+        );
+        assert_eq!(
+            data.provider(TrayIconKind::Claude).retry_after_ms,
+            Some(120_000)
+        );
+        assert_eq!(data.provider(TrayIconKind::Codex).retry_after_ms, None);
     }
     #[test]
     fn mixed_all_provider_failure_does_not_claim_every_provider_needs_login() {
-        let failure = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::RequestFailed),
-            || Err(PollError::NoCredentials),
-        )
+        let failure = poll_with(poll_targets(
+            [true, true, true, false],
+            [
+                Box::new(|| Err(PollError::AuthRequired)),
+                Box::new(|| Err(PollError::RequestFailed)),
+                Box::new(|| Err(PollError::NoCredentials)),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect_err("all-provider failure should return an error");
 
         assert_eq!(failure.error, PollError::RequestFailed);
         assert_eq!(
-            failure.data.claude_code_error,
+            failure.data.error(TrayIconKind::Claude),
             Some(ProviderStatus::AuthenticationFailed)
         );
         assert_eq!(
-            failure.data.codex_error,
+            failure.data.error(TrayIconKind::Codex),
             Some(ProviderStatus::RequestFailed)
         );
         // Never signed in, not rejected: the user has nothing to re-authenticate.
         assert_eq!(
-            failure.data.antigravity_error,
+            failure.data.error(TrayIconKind::Antigravity),
             Some(ProviderStatus::NotSignedIn)
         );
     }
 
     #[test]
     fn all_provider_auth_failures_still_require_login() {
-        let failure = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::NoCredentials),
-            || Err(PollError::AuthRequired),
-        )
+        let failure = poll_with(poll_targets(
+            [true, true, true, false],
+            [
+                Box::new(|| Err(PollError::AuthRequired)),
+                Box::new(|| Err(PollError::NoCredentials)),
+                Box::new(|| Err(PollError::AuthRequired)),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect_err("all-provider authentication failure should return an error");
 
         assert!(matches!(
@@ -3884,20 +4424,23 @@ mod tests {
             PollError::AuthRequired | PollError::NoCredentials
         ));
         assert_eq!(
-            failure.data.claude_code_error,
+            failure.data.error(TrayIconKind::Claude),
             Some(ProviderStatus::AuthenticationFailed)
         );
-        assert_eq!(failure.data.codex_error, Some(ProviderStatus::NotSignedIn));
         assert_eq!(
-            failure.data.antigravity_error,
+            failure.data.error(TrayIconKind::Codex),
+            Some(ProviderStatus::NotSignedIn)
+        );
+        assert_eq!(
+            failure.data.error(TrayIconKind::Antigravity),
             Some(ProviderStatus::AuthenticationFailed)
         );
         // Both still park the provider and keep the credential watch armed;
         // only the wording and the balloon differ.
         for status in [
-            failure.data.claude_code_error,
-            failure.data.codex_error,
-            failure.data.antigravity_error,
+            failure.data.error(TrayIconKind::Claude),
+            failure.data.error(TrayIconKind::Codex),
+            failure.data.error(TrayIconKind::Antigravity),
         ] {
             assert!(status.is_some_and(ProviderStatus::needs_credentials));
         }
@@ -3917,6 +4460,7 @@ mod tests {
                 claude: true,
                 codex: true,
                 antigravity: false,
+                grok: false,
             }
         );
         assert_eq!(
@@ -3929,6 +4473,7 @@ mod tests {
                 claude: true,
                 codex: false,
                 antigravity: true,
+                grok: false,
             }
         );
         assert!(!detect_from(DetectionInputs::default()).any());
@@ -4003,18 +4548,22 @@ mod tests {
 
     #[test]
     fn antigravity_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            false,
-            true,
-            true,
-            || unreachable!("claude code is disabled"),
-            || Ok(usage_with_percent(42.0)),
-            || Err(PollError::NoCredentials),
-        )
+        let data = poll_with(poll_targets(
+            [false, true, true, false],
+            [
+                Box::new(|| unreachable!("claude code is disabled")),
+                Box::new(|| Ok(usage_with_percent(42.0))),
+                Box::new(|| Err(PollError::NoCredentials)),
+                Box::new(|| unreachable!("grok is disabled")),
+            ],
+        ))
         .expect("codex data should keep the poll successful");
 
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().windows[0].percentage, 42.0);
+        assert!(data.usage(TrayIconKind::Antigravity).is_none());
+        assert_eq!(
+            data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
+            42.0
+        );
     }
 
     #[test]

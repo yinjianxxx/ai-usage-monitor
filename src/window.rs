@@ -104,6 +104,7 @@ struct ProviderRefreshStates {
     claude_code: ProviderRefreshState,
     codex: ProviderRefreshState,
     antigravity: ProviderRefreshState,
+    grok: ProviderRefreshState,
 }
 
 impl ProviderRefreshStates {
@@ -112,10 +113,17 @@ impl ProviderRefreshStates {
             tray_icon::TrayIconKind::Claude => self.claude_code,
             tray_icon::TrayIconKind::Codex => self.codex,
             tray_icon::TrayIconKind::Antigravity => self.antigravity,
+            tray_icon::TrayIconKind::Grok => self.grok,
         }
     }
 
-    fn reset_hidden(&mut self, show_claude_code: bool, show_codex: bool, show_antigravity: bool) {
+    fn reset_hidden(
+        &mut self,
+        show_claude_code: bool,
+        show_codex: bool,
+        show_antigravity: bool,
+        show_grok: bool,
+    ) {
         if !show_claude_code {
             self.claude_code = ProviderRefreshState::default();
         }
@@ -124,6 +132,9 @@ impl ProviderRefreshStates {
         }
         if !show_antigravity {
             self.antigravity = ProviderRefreshState::default();
+        }
+        if !show_grok {
+            self.grok = ProviderRefreshState::default();
         }
     }
 }
@@ -176,13 +187,16 @@ struct AppState {
     claude_widget: ProviderWidgetData,
     codex_widget: ProviderWidgetData,
     antigravity_widget: ProviderWidgetData,
+    grok_widget: ProviderWidgetData,
     compact_vm: CompactViewModel,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
     allow_claude_credentials: bool,
     allow_codex_credentials: bool,
     allow_antigravity_credentials: bool,
+    allow_grok_credentials: bool,
     /// Answer to the one-time, all-provider access prompt. Every credential
     /// read is gated on this in addition to the per-provider switch above.
     credential_consent_granted: bool,
@@ -191,6 +205,7 @@ struct AppState {
     claude_credential_access_decided: bool,
     codex_credential_access_decided: bool,
     antigravity_credential_access_decided: bool,
+    grok_credential_access_decided: bool,
     provider_order: Vec<tray_icon::TrayIconKind>,
     pending_provider_order: Option<Vec<tray_icon::TrayIconKind>>,
     pending_provider_order_samples: u8,
@@ -347,6 +362,8 @@ const IDM_ACCESS_CLAUDE_CODE: u16 = 63;
 const IDM_ACCESS_CODEX: u16 = 64;
 const IDM_ACCESS_ANTIGRAVITY: u16 = 65;
 const IDM_REDETECT_PROVIDERS: u16 = 66;
+const IDM_MODEL_GROK: u16 = 67;
+const IDM_ACCESS_GROK: u16 = 68;
 const IDM_NOTIFY_SESSION_RESET: u16 = 80;
 const IDM_NOTIFY_WEEKLY_RESET: u16 = 81;
 
@@ -932,7 +949,12 @@ unsafe fn recreate_widget_window() -> Option<HWND> {
         match state.as_ref() {
             Some(s) => (
                 s.language.strings().window_title,
-                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                active_model_count(
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_grok,
+                ),
             ),
             None => return None,
         }
@@ -1493,20 +1515,17 @@ fn fresh_cached_provider(
 
 fn write_usage_cache(snapshot: &UsageCacheSnapshot) -> std::io::Result<()> {
     let data = &snapshot.data;
+    // The on-disk shape stays a field per provider: it is a published format,
+    // and a stored key that no longer maps to a provider must stay readable.
+    let to_cache = |kind: tray_icon::TrayIconKind| {
+        data.usage(kind)
+            .map(|usage| usage_provider_to_cache(usage, data.provider(kind).updated_unix))
+    };
     let file = UsageCacheFile {
         saved_unix: snapshot.saved_unix,
-        claude_code: data
-            .claude_code
-            .as_ref()
-            .map(|usage| usage_provider_to_cache(usage, data.claude_code_updated_unix)),
-        codex: data
-            .codex
-            .as_ref()
-            .map(|usage| usage_provider_to_cache(usage, data.codex_updated_unix)),
-        antigravity: data
-            .antigravity
-            .as_ref()
-            .map(|usage| usage_provider_to_cache(usage, data.antigravity_updated_unix)),
+        claude_code: to_cache(tray_icon::TrayIconKind::Claude),
+        codex: to_cache(tray_icon::TrayIconKind::Codex),
+        antigravity: to_cache(tray_icon::TrayIconKind::Antigravity),
     };
     let path = usage_cache_path()?;
     let json = serde_json::to_string(&file).map_err(std::io::Error::other)?;
@@ -1564,30 +1583,29 @@ fn load_usage_cache() -> Option<(AppUsageData, u64)> {
     if now.saturating_sub(file.saved_unix) > USAGE_CACHE_MAX_AGE_SECS {
         return None;
     }
-    let claude_code = fresh_cached_provider(file.claude_code.as_ref(), file.saved_unix, now);
-    let codex = fresh_cached_provider(file.codex.as_ref(), file.saved_unix, now);
-    let antigravity = fresh_cached_provider(file.antigravity.as_ref(), file.saved_unix, now);
-    let data = AppUsageData {
-        claude_code: claude_code.as_ref().map(|(usage, _)| usage.clone()),
-        codex: codex.as_ref().map(|(usage, _)| usage.clone()),
-        antigravity: antigravity.as_ref().map(|(usage, _)| usage.clone()),
-        claude_code_updated_unix: claude_code.as_ref().map(|(_, updated_unix)| *updated_unix),
-        codex_updated_unix: codex.as_ref().map(|(_, updated_unix)| *updated_unix),
-        antigravity_updated_unix: antigravity.as_ref().map(|(_, updated_unix)| *updated_unix),
-        ..Default::default()
-    };
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+    let mut data = AppUsageData::default();
+    for (kind, cached) in [
+        (tray_icon::TrayIconKind::Claude, file.claude_code.as_ref()),
+        (tray_icon::TrayIconKind::Codex, file.codex.as_ref()),
+        (
+            tray_icon::TrayIconKind::Antigravity,
+            file.antigravity.as_ref(),
+        ),
+    ] {
+        if let Some((usage, updated_unix)) = fresh_cached_provider(cached, file.saved_unix, now) {
+            let slot = data.provider_mut(kind);
+            slot.usage = Some(usage);
+            slot.updated_unix = Some(updated_unix);
+        }
+    }
+    if !data.has_any_usage() {
         return None;
     }
-    let last_success_unix = [
-        data.claude_code_updated_unix,
-        data.codex_updated_unix,
-        data.antigravity_updated_unix,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(file.saved_unix);
+    let last_success_unix = tray_icon::TrayIconKind::ALL
+        .into_iter()
+        .filter_map(|kind| data.provider(kind).updated_unix)
+        .max()
+        .unwrap_or(file.saved_unix);
     Some((data, last_success_unix))
 }
 
@@ -1637,15 +1655,18 @@ fn save_state_settings() {
                 show_claude_code: s.show_claude_code,
                 show_codex: s.show_codex,
                 show_antigravity: s.show_antigravity,
+                show_grok: s.show_grok,
                 allow_claude_credentials: s.allow_claude_credentials,
                 allow_codex_credentials: s.allow_codex_credentials,
                 allow_antigravity_credentials: s.allow_antigravity_credentials,
+                allow_grok_credentials: s.allow_grok_credentials,
                 credential_consent_granted: s.credential_consent_granted,
                 credential_consent_decided: s.credential_consent_decided,
                 consent_schema_version: settings::CONSENT_SCHEMA_VERSION,
                 claude_credential_access_decided: s.claude_credential_access_decided,
                 codex_credential_access_decided: s.codex_credential_access_decided,
                 antigravity_credential_access_decided: s.antigravity_credential_access_decided,
+                grok_credential_access_decided: s.grok_credential_access_decided,
                 provider_order: s.provider_order.clone(),
                 notify_session_reset: s.notify_session_reset,
                 notify_weekly_reset: s.notify_weekly_reset,
@@ -1830,6 +1851,7 @@ fn localized_provider_name(kind: tray_icon::TrayIconKind, strings: Strings) -> &
         tray_icon::TrayIconKind::Claude => strings.claude_model,
         tray_icon::TrayIconKind::Codex => strings.codex_model,
         tray_icon::TrayIconKind::Antigravity => strings.antigravity_model,
+        tray_icon::TrayIconKind::Grok => strings.grok_model,
     }
 }
 
@@ -1882,24 +1904,16 @@ fn first_provider_credential_issue(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> Option<(tray_icon::TrayIconKind, ProviderStatus)> {
     for kind in shown_provider_order(
         provider_order,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_grok,
     ) {
-        let status = match kind {
-            tray_icon::TrayIconKind::Claude => data
-                .and_then(|data| data.claude_code_error)
-                .or(global_status),
-            tray_icon::TrayIconKind::Codex => {
-                data.and_then(|data| data.codex_error).or(global_status)
-            }
-            tray_icon::TrayIconKind::Antigravity => data
-                .and_then(|data| data.antigravity_error)
-                .or(global_status),
-        };
+        let status = data.and_then(|data| data.error(kind)).or(global_status);
         if let Some(status) = status.filter(|status| status.needs_credentials()) {
             return Some((kind, status));
         }
@@ -1912,14 +1926,16 @@ fn shown_provider_order(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> Vec<tray_icon::TrayIconKind> {
     let defaults = default_provider_order();
-    let mut ordered = Vec::with_capacity(3);
+    let mut ordered = Vec::with_capacity(tray_icon::TrayIconKind::COUNT);
     for kind in configured.iter().chain(defaults.iter()).copied() {
         let shown = match kind {
             tray_icon::TrayIconKind::Claude => show_claude_code,
             tray_icon::TrayIconKind::Codex => show_codex,
             tray_icon::TrayIconKind::Antigravity => show_antigravity,
+            tray_icon::TrayIconKind::Grok => show_grok,
         };
         if shown && !ordered.contains(&kind) {
             ordered.push(kind);
@@ -1987,45 +2003,19 @@ fn widget_tooltip_snapshot(kind: tray_icon::TrayIconKind) -> WidgetTooltipSnapsh
         s.last_error
             .map(|error| provider_status_for_kind(kind, error))
     };
-    let (provider_name, usage, status, updated_unix) = match kind {
-        tray_icon::TrayIconKind::Claude => (
-            strings.claude_model,
-            provider_has_values
-                .then(|| s.data.as_ref().and_then(|data| data.claude_code.as_ref()))
-                .flatten(),
-            s.data
-                .as_ref()
-                .and_then(|data| data.claude_code_error)
-                .or_else(|| global_status(tray_icon::TrayIconKind::Claude)),
-            s.data
-                .as_ref()
-                .and_then(|data| data.claude_code_updated_unix),
-        ),
-        tray_icon::TrayIconKind::Codex => (
-            strings.codex_model,
-            provider_has_values
-                .then(|| s.data.as_ref().and_then(|data| data.codex.as_ref()))
-                .flatten(),
-            s.data
-                .as_ref()
-                .and_then(|data| data.codex_error)
-                .or_else(|| global_status(tray_icon::TrayIconKind::Codex)),
-            s.data.as_ref().and_then(|data| data.codex_updated_unix),
-        ),
-        tray_icon::TrayIconKind::Antigravity => (
-            strings.antigravity_model,
-            provider_has_values
-                .then(|| s.data.as_ref().and_then(|data| data.antigravity.as_ref()))
-                .flatten(),
-            s.data
-                .as_ref()
-                .and_then(|data| data.antigravity_error)
-                .or_else(|| global_status(tray_icon::TrayIconKind::Antigravity)),
-            s.data
-                .as_ref()
-                .and_then(|data| data.antigravity_updated_unix),
-        ),
-    };
+    let provider_name = localized_provider_name(kind, strings);
+    let usage = provider_has_values
+        .then(|| s.data.as_ref().and_then(|data| data.usage(kind)))
+        .flatten();
+    let status = s
+        .data
+        .as_ref()
+        .and_then(|data| data.error(kind))
+        .or_else(|| global_status(kind));
+    let updated_unix = s
+        .data
+        .as_ref()
+        .and_then(|data| data.provider(kind).updated_unix);
     let status = visible_provider_status(
         status,
         s.provider_refresh_states.for_kind(kind),
@@ -2168,41 +2158,25 @@ fn tray_icon_data_from_state() -> (Vec<tray_icon::TrayIconData>, bool, String) {
         s.show_claude_code,
         s.show_codex,
         s.show_antigravity,
+        s.show_grok,
     ) {
         let provider_name = localized_provider_name(kind, strings);
-        let (usage, status, updated_unix, widget) = match kind {
-            tray_icon::TrayIconKind::Claude => (
-                data.and_then(|data| data.claude_code.as_ref()),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.claude_code_error)
-                    .or_else(|| global_status(tray_icon::TrayIconKind::Claude)),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.claude_code_updated_unix),
-                &s.claude_widget,
-            ),
-            tray_icon::TrayIconKind::Codex => (
-                data.and_then(|data| data.codex.as_ref()),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.codex_error)
-                    .or_else(|| global_status(tray_icon::TrayIconKind::Codex)),
-                s.data.as_ref().and_then(|data| data.codex_updated_unix),
-                &s.codex_widget,
-            ),
-            tray_icon::TrayIconKind::Antigravity => (
-                data.and_then(|data| data.antigravity.as_ref()),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.antigravity_error)
-                    .or_else(|| global_status(tray_icon::TrayIconKind::Antigravity)),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.antigravity_updated_unix),
-                &s.antigravity_widget,
-            ),
-        };
+        let (usage, status, updated_unix, widget) = (
+            data.and_then(|data| data.usage(kind)),
+            s.data
+                .as_ref()
+                .and_then(|data| data.error(kind))
+                .or_else(|| global_status(kind)),
+            s.data
+                .as_ref()
+                .and_then(|data| data.provider(kind).updated_unix),
+            match kind {
+                tray_icon::TrayIconKind::Claude => &s.claude_widget,
+                tray_icon::TrayIconKind::Codex => &s.codex_widget,
+                tray_icon::TrayIconKind::Antigravity => &s.antigravity_widget,
+                tray_icon::TrayIconKind::Grok => &s.grok_widget,
+            },
+        );
         let status = visible_provider_status(
             status,
             s.provider_refresh_states.for_kind(kind),
@@ -2236,8 +2210,15 @@ fn tray_surface_provider_order(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> Vec<tray_icon::TrayIconKind> {
-    shown_provider_order(configured, show_claude_code, show_codex, show_antigravity)
+    shown_provider_order(
+        configured,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_grok,
+    )
 }
 
 fn sync_tray_icons(hwnd: HWND) {
@@ -2259,6 +2240,7 @@ fn enabled_provider_kinds(state: &AppState) -> Vec<tray_icon::TrayIconKind> {
             tray_icon::TrayIconKind::Claude => state.show_claude_code,
             tray_icon::TrayIconKind::Codex => state.show_codex,
             tray_icon::TrayIconKind::Antigravity => state.show_antigravity,
+            tray_icon::TrayIconKind::Grok => state.show_grok,
         })
         .collect()
 }
@@ -3064,12 +3046,14 @@ fn set_widget_placeholders(state: &mut AppState, text: &str) {
     state.claude_widget = placeholder_widget();
     state.codex_widget = placeholder_widget();
     state.antigravity_widget = placeholder_widget();
+    state.grok_widget = placeholder_widget();
     state.compact_vm = compact_view::placeholder_model(
         text,
         &state.provider_order,
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
+        state.show_grok,
     );
 }
 
@@ -3080,11 +3064,17 @@ fn refresh_usage_texts(state: &mut AppState) {
 
     let strings = state.language.strings();
     let data = state.data.as_ref();
-    state.claude_widget =
-        provider_widget_from_usage(data.and_then(|data| data.claude_code.as_ref()));
-    state.codex_widget = provider_widget_from_usage(data.and_then(|data| data.codex.as_ref()));
-    state.antigravity_widget =
-        provider_widget_from_usage(data.and_then(|data| data.antigravity.as_ref()));
+    state.claude_widget = provider_widget_from_usage(
+        data.and_then(|data| data.usage(tray_icon::TrayIconKind::Claude)),
+    );
+    state.codex_widget = provider_widget_from_usage(
+        data.and_then(|data| data.usage(tray_icon::TrayIconKind::Codex)),
+    );
+    state.antigravity_widget = provider_widget_from_usage(
+        data.and_then(|data| data.usage(tray_icon::TrayIconKind::Antigravity)),
+    );
+    state.grok_widget =
+        provider_widget_from_usage(data.and_then(|data| data.usage(tray_icon::TrayIconKind::Grok)));
     state.compact_vm = compact_view::build(
         data,
         strings,
@@ -3092,6 +3082,7 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
+        state.show_grok,
     );
 
     let global_status = |kind| {
@@ -3100,17 +3091,27 @@ fn refresh_usage_texts(state: &mut AppState) {
             .map(|error| provider_status_for_kind(kind, error))
     };
     let claude_status = data
-        .and_then(|data| data.claude_code_error)
+        .and_then(|data| data.error(tray_icon::TrayIconKind::Claude))
         .or_else(|| global_status(tray_icon::TrayIconKind::Claude));
     let codex_status = data
-        .and_then(|data| data.codex_error)
+        .and_then(|data| data.error(tray_icon::TrayIconKind::Codex))
         .or_else(|| global_status(tray_icon::TrayIconKind::Codex));
     let antigravity_status = data
-        .and_then(|data| data.antigravity_error)
+        .and_then(|data| data.error(tray_icon::TrayIconKind::Antigravity))
         .or_else(|| global_status(tray_icon::TrayIconKind::Antigravity));
-    let claude_updated_unix = data.and_then(|data| data.claude_code_updated_unix);
-    let codex_updated_unix = data.and_then(|data| data.codex_updated_unix);
-    let antigravity_updated_unix = data.and_then(|data| data.antigravity_updated_unix);
+    let claude_updated_unix =
+        data.and_then(|data| data.provider(tray_icon::TrayIconKind::Claude).updated_unix);
+    let codex_updated_unix =
+        data.and_then(|data| data.provider(tray_icon::TrayIconKind::Codex).updated_unix);
+    let antigravity_updated_unix = data.and_then(|data| {
+        data.provider(tray_icon::TrayIconKind::Antigravity)
+            .updated_unix
+    });
+    let grok_status = data
+        .and_then(|data| data.error(tray_icon::TrayIconKind::Grok))
+        .or_else(|| global_status(tray_icon::TrayIconKind::Grok));
+    let grok_updated_unix =
+        data.and_then(|data| data.provider(tray_icon::TrayIconKind::Grok).updated_unix);
     let refresh_states = state.provider_refresh_states;
     let poll_interval_ms = state.poll_interval_ms;
     let now_unix = now_unix_secs();
@@ -3119,6 +3120,7 @@ fn refresh_usage_texts(state: &mut AppState) {
             tray_icon::TrayIconKind::Claude => (claude_status, claude_updated_unix),
             tray_icon::TrayIconKind::Codex => (codex_status, codex_updated_unix),
             tray_icon::TrayIconKind::Antigravity => (antigravity_status, antigravity_updated_unix),
+            tray_icon::TrayIconKind::Grok => (grok_status, grok_updated_unix),
         };
         provider.attention = compact_attention_for_provider_status(
             provider.attention,
@@ -3302,15 +3304,8 @@ fn update_provider_refresh_state(
 }
 
 fn provider_has_history(data: Option<&AppUsageData>, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => data
-            .and_then(|data| data.claude_code_updated_unix)
-            .is_some(),
-        tray_icon::TrayIconKind::Codex => data.and_then(|data| data.codex_updated_unix).is_some(),
-        tray_icon::TrayIconKind::Antigravity => data
-            .and_then(|data| data.antigravity_updated_unix)
-            .is_some(),
-    }
+    data.and_then(|data| data.provider(kind).updated_unix)
+        .is_some()
 }
 
 fn update_provider_refresh_states(
@@ -3337,9 +3332,10 @@ fn update_provider_refresh_states(
         "Claude",
         plan.show_claude_code,
         plan.poll_claude_code,
-        data.claude_code_error,
+        data.error(tray_icon::TrayIconKind::Claude),
         claude_has_history,
-        data.claude_code_retry_after_ms,
+        data.provider(tray_icon::TrayIconKind::Claude)
+            .retry_after_ms,
         poll_interval_ms,
         now_unix,
         now,
@@ -3351,9 +3347,9 @@ fn update_provider_refresh_states(
         "Codex",
         plan.show_codex,
         plan.poll_codex,
-        data.codex_error,
+        data.error(tray_icon::TrayIconKind::Codex),
         codex_has_history,
-        data.codex_retry_after_ms,
+        data.provider(tray_icon::TrayIconKind::Codex).retry_after_ms,
         poll_interval_ms,
         now_unix,
         now,
@@ -3365,9 +3361,10 @@ fn update_provider_refresh_states(
         "Antigravity",
         plan.show_antigravity,
         plan.poll_antigravity,
-        data.antigravity_error,
+        data.error(tray_icon::TrayIconKind::Antigravity),
         antigravity_has_history,
-        data.antigravity_retry_after_ms,
+        data.provider(tray_icon::TrayIconKind::Antigravity)
+            .retry_after_ms,
         poll_interval_ms,
         now_unix,
         now,
@@ -3384,33 +3381,32 @@ fn merge_missing_provider_data(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> AppUsageData {
     if let Some(previous) = previous {
-        if show_claude_code && next.claude_code.is_none() {
-            next.claude_code = previous.claude_code.clone();
-            next.claude_code_updated_unix = previous.claude_code_updated_unix;
-        }
-        if show_codex && next.codex.is_none() {
-            next.codex = previous.codex.clone();
-            next.codex_updated_unix = previous.codex_updated_unix;
-        }
-        if show_antigravity && next.antigravity.is_none() {
-            next.antigravity = previous.antigravity.clone();
-            next.antigravity_updated_unix = previous.antigravity_updated_unix;
+        for (kind, shown) in [
+            (tray_icon::TrayIconKind::Claude, show_claude_code),
+            (tray_icon::TrayIconKind::Codex, show_codex),
+            (tray_icon::TrayIconKind::Antigravity, show_antigravity),
+            (tray_icon::TrayIconKind::Grok, show_grok),
+        ] {
+            if shown && next.provider(kind).usage.is_none() {
+                let carried = previous.provider(kind).clone();
+                let slot = next.provider_mut(kind);
+                slot.usage = carried.usage;
+                slot.updated_unix = carried.updated_unix;
+            }
         }
     }
     next
 }
 
 fn stamp_provider_updates(data: &mut AppUsageData, updated_unix: u64) {
-    if data.claude_code.is_some() && data.claude_code_error.is_none() {
-        data.claude_code_updated_unix = Some(updated_unix);
-    }
-    if data.codex.is_some() && data.codex_error.is_none() {
-        data.codex_updated_unix = Some(updated_unix);
-    }
-    if data.antigravity.is_some() && data.antigravity_error.is_none() {
-        data.antigravity_updated_unix = Some(updated_unix);
+    for kind in tray_icon::TrayIconKind::ALL {
+        let slot = data.provider_mut(kind);
+        if slot.usage.is_some() && slot.error.is_none() {
+            slot.updated_unix = Some(updated_unix);
+        }
     }
 }
 
@@ -3436,36 +3432,18 @@ fn collect_reset_notifications(
     };
 
     let mut notifications = Vec::new();
-    push_provider_reset_notifications(
-        &mut notifications,
-        tray_icon::TrayIconKind::Claude,
-        strings.claude_model,
-        previous.claude_code.as_ref(),
-        next.claude_code.as_ref(),
-        notify_session_reset,
-        notify_weekly_reset,
-        strings,
-    );
-    push_provider_reset_notifications(
-        &mut notifications,
-        tray_icon::TrayIconKind::Codex,
-        strings.codex_model,
-        previous.codex.as_ref(),
-        next.codex.as_ref(),
-        notify_session_reset,
-        notify_weekly_reset,
-        strings,
-    );
-    push_provider_reset_notifications(
-        &mut notifications,
-        tray_icon::TrayIconKind::Antigravity,
-        strings.antigravity_model,
-        previous.antigravity.as_ref(),
-        next.antigravity.as_ref(),
-        notify_session_reset,
-        notify_weekly_reset,
-        strings,
-    );
+    for kind in tray_icon::TrayIconKind::ALL {
+        push_provider_reset_notifications(
+            &mut notifications,
+            kind,
+            localized_provider_name(kind, strings),
+            previous.usage(kind),
+            next.usage(kind),
+            notify_session_reset,
+            notify_weekly_reset,
+            strings,
+        );
+    }
     notifications
 }
 
@@ -3562,12 +3540,15 @@ struct PollPassPlan {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
     poll_claude_code: bool,
     poll_codex: bool,
     poll_antigravity: bool,
+    poll_grok: bool,
     claude_cooldown_ms: Option<u32>,
     codex_cooldown_ms: Option<u32>,
     antigravity_cooldown_ms: Option<u32>,
+    grok_cooldown_ms: Option<u32>,
 }
 
 impl PollPassPlan {
@@ -3590,38 +3571,67 @@ impl PollPassPlan {
                 .for_kind(tray_icon::TrayIconKind::Antigravity),
             now,
         );
+        let grok_cooldown_ms = provider_cooldown_remaining_ms(
+            state
+                .provider_refresh_states
+                .for_kind(tray_icon::TrayIconKind::Grok),
+            now,
+        );
         // Mirrors `state_credential_poll_selection`; see the note there.
-        let (show_claude_code, show_codex, show_antigravity) =
+        let (show_claude_code, show_codex, show_antigravity, show_grok) =
             state_credential_poll_selection(state);
         Self {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_grok,
             poll_claude_code: show_claude_code && claude_cooldown_ms.is_none(),
             poll_codex: show_codex && codex_cooldown_ms.is_none(),
             poll_antigravity: show_antigravity && antigravity_cooldown_ms.is_none(),
+            poll_grok: show_grok && grok_cooldown_ms.is_none(),
             claude_cooldown_ms,
             codex_cooldown_ms,
             antigravity_cooldown_ms,
+            grok_cooldown_ms,
         }
     }
 
     fn has_poll_target(self) -> bool {
-        self.poll_claude_code || self.poll_codex || self.poll_antigravity
+        self.poll_claude_code || self.poll_codex || self.poll_antigravity || self.poll_grok
     }
 
     fn apply_skipped_rate_limits(self, data: &mut AppUsageData) {
-        if self.show_claude_code && !self.poll_claude_code {
-            data.claude_code_error = Some(ProviderStatus::RateLimited);
-            data.claude_code_retry_after_ms = self.claude_cooldown_ms;
-        }
-        if self.show_codex && !self.poll_codex {
-            data.codex_error = Some(ProviderStatus::RateLimited);
-            data.codex_retry_after_ms = self.codex_cooldown_ms;
-        }
-        if self.show_antigravity && !self.poll_antigravity {
-            data.antigravity_error = Some(ProviderStatus::RateLimited);
-            data.antigravity_retry_after_ms = self.antigravity_cooldown_ms;
+        for (kind, shown, polled, cooldown_ms) in [
+            (
+                tray_icon::TrayIconKind::Claude,
+                self.show_claude_code,
+                self.poll_claude_code,
+                self.claude_cooldown_ms,
+            ),
+            (
+                tray_icon::TrayIconKind::Codex,
+                self.show_codex,
+                self.poll_codex,
+                self.codex_cooldown_ms,
+            ),
+            (
+                tray_icon::TrayIconKind::Antigravity,
+                self.show_antigravity,
+                self.poll_antigravity,
+                self.antigravity_cooldown_ms,
+            ),
+            (
+                tray_icon::TrayIconKind::Grok,
+                self.show_grok,
+                self.poll_grok,
+                self.grok_cooldown_ms,
+            ),
+        ] {
+            if shown && !polled {
+                let slot = data.provider_mut(kind);
+                slot.error = Some(ProviderStatus::RateLimited);
+                slot.retry_after_ms = cooldown_ms;
+            }
         }
     }
 }
@@ -3632,16 +3642,12 @@ fn provider_cooldown_remaining_ms(state: ProviderRefreshState, now: Instant) -> 
 }
 
 fn poll_delay_with_provider_cooldowns(state: &AppState, base_ms: u32, now: Instant) -> u32 {
-    [
-        tray_icon::TrayIconKind::Claude,
-        tray_icon::TrayIconKind::Codex,
-        tray_icon::TrayIconKind::Antigravity,
-    ]
-    .into_iter()
-    .filter_map(|kind| {
-        provider_cooldown_remaining_ms(state.provider_refresh_states.for_kind(kind), now)
-    })
-    .fold(base_ms.max(1), u32::min)
+    tray_icon::TrayIconKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            provider_cooldown_remaining_ms(state.provider_refresh_states.for_kind(kind), now)
+        })
+        .fold(base_ms.max(1), u32::min)
 }
 
 /// Whether signing in could clear this failure.
@@ -3669,8 +3675,10 @@ fn credential_watch_mode_for_shown(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> Option<poller::CredentialWatchMode> {
-    let shown_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
+    let shown_count =
+        show_claude_code as u8 + show_codex as u8 + show_antigravity as u8 + show_grok as u8;
     if shown_count == 0 {
         return None;
     }
@@ -3682,6 +3690,9 @@ fn credential_watch_mode_for_shown(
     }
     if show_antigravity {
         return Some(poller::CredentialWatchMode::Antigravity);
+    }
+    if show_grok {
+        return Some(poller::CredentialWatchMode::Grok);
     }
     // Claude can use the Windows file or any WSL distribution. Watching only
     // the credential selected for the failed request lets an expired Windows
@@ -3725,15 +3736,15 @@ fn all_shown_providers_need_auth(
     shown_count > 0
         && (!show_claude_code
             || data
-                .claude_code_error
+                .error(tray_icon::TrayIconKind::Claude)
                 .is_some_and(ProviderStatus::needs_credentials))
         && (!show_codex
             || data
-                .codex_error
+                .error(tray_icon::TrayIconKind::Codex)
                 .is_some_and(ProviderStatus::needs_credentials))
         && (!show_antigravity
             || data
-                .antigravity_error
+                .error(tray_icon::TrayIconKind::Antigravity)
                 .is_some_and(ProviderStatus::needs_credentials))
 }
 
@@ -3911,6 +3922,7 @@ fn provider_has_credential_access(state: &AppState, kind: tray_icon::TrayIconKin
             tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
             tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
             tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
+            tray_icon::TrayIconKind::Grok => state.allow_grok_credentials,
         },
     )
 }
@@ -3920,6 +3932,7 @@ fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> b
         tray_icon::TrayIconKind::Claude => state.show_claude_code,
         tray_icon::TrayIconKind::Codex => state.show_codex,
         tray_icon::TrayIconKind::Antigravity => state.show_antigravity,
+        tray_icon::TrayIconKind::Grok => state.show_grok,
     };
     access_is_revoked(
         shown,
@@ -3929,17 +3942,18 @@ fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> b
 }
 
 fn credential_poll_selection(
-    shown: (bool, bool, bool),
-    allowed: (bool, bool, bool),
-) -> (bool, bool, bool) {
+    shown: (bool, bool, bool, bool),
+    allowed: (bool, bool, bool, bool),
+) -> (bool, bool, bool, bool) {
     (
         shown.0 && allowed.0,
         shown.1 && allowed.1,
         shown.2 && allowed.2,
+        shown.3 && allowed.3,
     )
 }
 
-fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool) {
+fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool, bool) {
     // Must stay in step with `PollPassPlan::from_state`: this decides whether
     // a poll worker starts at all, that decides what the pass targets. If the
     // two disagree a worker can start with nothing to do, or worse, a target
@@ -3949,11 +3963,13 @@ fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool) {
             state.show_claude_code,
             state.show_codex,
             state.show_antigravity,
+            state.show_grok,
         ),
         (
             provider_has_credential_access(state, tray_icon::TrayIconKind::Claude),
             provider_has_credential_access(state, tray_icon::TrayIconKind::Codex),
             provider_has_credential_access(state, tray_icon::TrayIconKind::Antigravity),
+            provider_has_credential_access(state, tray_icon::TrayIconKind::Grok),
         ),
     )
 }
@@ -3969,25 +3985,15 @@ fn clear_provider_usage(state: &mut AppState, kind: tray_icon::TrayIconKind) {
         tray_icon::TrayIconKind::Antigravity => {
             state.provider_refresh_states.antigravity = ProviderRefreshState::default()
         }
+        tray_icon::TrayIconKind::Grok => {
+            state.provider_refresh_states.grok = ProviderRefreshState::default()
+        }
     }
     if let Some(data) = state.data.as_mut() {
-        match kind {
-            tray_icon::TrayIconKind::Claude => {
-                data.claude_code = None;
-                data.claude_code_updated_unix = None;
-                data.claude_code_error = None;
-            }
-            tray_icon::TrayIconKind::Codex => {
-                data.codex = None;
-                data.codex_updated_unix = None;
-                data.codex_error = None;
-            }
-            tray_icon::TrayIconKind::Antigravity => {
-                data.antigravity = None;
-                data.antigravity_updated_unix = None;
-                data.antigravity_error = None;
-            }
-        }
+        let slot = data.provider_mut(kind);
+        slot.usage = None;
+        slot.updated_unix = None;
+        slot.error = None;
     }
 }
 
@@ -4015,6 +4021,13 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                     s.antigravity_credential_access_decided = true;
                     if allowed {
                         s.show_antigravity = true;
+                    }
+                }
+                tray_icon::TrayIconKind::Grok => {
+                    s.allow_grok_credentials = allowed;
+                    s.grok_credential_access_decided = true;
+                    if allowed {
+                        s.show_grok = true;
                     }
                 }
             }
@@ -4046,11 +4059,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
     }
     diagnose::log(format!(
         "{} credential access {}",
-        match kind {
-            tray_icon::TrayIconKind::Claude => "Claude Code",
-            tray_icon::TrayIconKind::Codex => "Codex",
-            tray_icon::TrayIconKind::Antigravity => "Antigravity",
-        },
+        kind.diagnostic_label(),
         if allowed { "granted" } else { "revoked" }
     ));
 }
@@ -4121,11 +4130,7 @@ fn set_credential_consent(granted: bool) {
             s.credential_consent_granted = granted;
             s.credential_consent_decided = true;
             if !granted {
-                for kind in [
-                    tray_icon::TrayIconKind::Claude,
-                    tray_icon::TrayIconKind::Codex,
-                    tray_icon::TrayIconKind::Antigravity,
-                ] {
+                for kind in tray_icon::TrayIconKind::ALL {
                     clear_provider_usage(s, kind);
                 }
                 s.auth_watch_active = false;
@@ -4204,12 +4209,15 @@ fn state_provider_visibility(state: &AppState) -> settings::ProviderVisibility {
         show_claude_code: state.show_claude_code,
         show_codex: state.show_codex,
         show_antigravity: state.show_antigravity,
+        show_grok: state.show_grok,
         allow_claude_credentials: state.allow_claude_credentials,
         allow_codex_credentials: state.allow_codex_credentials,
         allow_antigravity_credentials: state.allow_antigravity_credentials,
+        allow_grok_credentials: state.allow_grok_credentials,
         claude_announced: state.claude_credential_access_decided,
         codex_announced: state.codex_credential_access_decided,
         antigravity_announced: state.antigravity_credential_access_decided,
+        grok_announced: state.grok_credential_access_decided,
     }
 }
 
@@ -4217,12 +4225,15 @@ fn apply_provider_visibility(state: &mut AppState, visibility: settings::Provide
     state.show_claude_code = visibility.show_claude_code;
     state.show_codex = visibility.show_codex;
     state.show_antigravity = visibility.show_antigravity;
+    state.show_grok = visibility.show_grok;
     state.allow_claude_credentials = visibility.allow_claude_credentials;
     state.allow_codex_credentials = visibility.allow_codex_credentials;
     state.allow_antigravity_credentials = visibility.allow_antigravity_credentials;
+    state.allow_grok_credentials = visibility.allow_grok_credentials;
     state.claude_credential_access_decided = visibility.claude_announced;
     state.codex_credential_access_decided = visibility.codex_announced;
     state.antigravity_credential_access_decided = visibility.antigravity_announced;
+    state.grok_credential_access_decided = visibility.grok_announced;
 }
 
 /// Detection shells out to `wsl.exe` and reads the Windows keyring, so it runs
@@ -4264,6 +4275,7 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_grok,
             );
             set_widget_placeholders(s, "...");
         }
@@ -4593,31 +4605,15 @@ fn detail_popup_snapshot() -> DetailPopupState {
         s.show_claude_code,
         s.show_codex,
         s.show_antigravity,
+        s.show_grok,
     ) {
-        let (name, usage, error, updated_unix) = match kind {
-            tray_icon::TrayIconKind::Claude => (
-                strings.claude_model,
-                s.data.as_ref().and_then(|data| data.claude_code.as_ref()),
-                s.data.as_ref().and_then(|data| data.claude_code_error),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.claude_code_updated_unix),
-            ),
-            tray_icon::TrayIconKind::Codex => (
-                strings.codex_model,
-                s.data.as_ref().and_then(|data| data.codex.as_ref()),
-                s.data.as_ref().and_then(|data| data.codex_error),
-                s.data.as_ref().and_then(|data| data.codex_updated_unix),
-            ),
-            tray_icon::TrayIconKind::Antigravity => (
-                strings.antigravity_model,
-                s.data.as_ref().and_then(|data| data.antigravity.as_ref()),
-                s.data.as_ref().and_then(|data| data.antigravity_error),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.antigravity_updated_unix),
-            ),
-        };
+        let name = localized_provider_name(kind, strings);
+        let usage = s.data.as_ref().and_then(|data| data.usage(kind));
+        let error = s.data.as_ref().and_then(|data| data.error(kind));
+        let updated_unix = s
+            .data
+            .as_ref()
+            .and_then(|data| data.provider(kind).updated_unix);
         let error = error.or_else(|| global_error(kind));
         let persistent_refresh_issue = provider_refresh_is_stale(
             error,
@@ -5030,28 +5026,14 @@ fn detail_refresh_issue_count(state: &AppState) -> (usize, usize) {
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
+        state.show_grok,
     );
     for kind in &shown {
-        let (status, updated_unix) = match kind {
-            tray_icon::TrayIconKind::Claude => (
-                state.data.as_ref().and_then(|data| data.claude_code_error),
-                state
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.claude_code_updated_unix),
-            ),
-            tray_icon::TrayIconKind::Codex => (
-                state.data.as_ref().and_then(|data| data.codex_error),
-                state.data.as_ref().and_then(|data| data.codex_updated_unix),
-            ),
-            tray_icon::TrayIconKind::Antigravity => (
-                state.data.as_ref().and_then(|data| data.antigravity_error),
-                state
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.antigravity_updated_unix),
-            ),
-        };
+        let status = state.data.as_ref().and_then(|data| data.error(*kind));
+        let updated_unix = state
+            .data
+            .as_ref()
+            .and_then(|data| data.provider(*kind).updated_unix);
         if status.is_some_and(ProviderStatus::needs_credentials)
             || provider_refresh_is_stale(
                 status,
@@ -5416,6 +5398,17 @@ pub fn dump_widget(dir: &str) -> i32 {
                 ],
                 compact_view::Attention::Normal,
             ),
+            // Grok reports one billing period, so it is the single-window case.
+            provider(
+                tray_icon::TrayIconKind::Grok,
+                vec![window(
+                    "7d",
+                    23.0,
+                    "\u{00b7}5d",
+                    compact_view::Severity::Normal,
+                )],
+                compact_view::Attention::Normal,
+            ),
         ],
     };
     if let Err(error) = std::fs::create_dir_all(dir) {
@@ -5474,20 +5467,16 @@ pub fn dump_widget(dir: &str) -> i32 {
         ],
     };
     let nodata_vm = CompactViewModel {
-        providers: [
-            tray_icon::TrayIconKind::Claude,
-            tray_icon::TrayIconKind::Codex,
-            tray_icon::TrayIconKind::Antigravity,
-        ]
-        .into_iter()
-        .map(|kind| compact_view::ProviderView {
-            kind,
-            badge: None,
-            windows: Vec::new(),
-            placeholder: Some("--".to_string()),
-            attention: compact_view::Attention::Normal,
-        })
-        .collect(),
+        providers: tray_icon::TrayIconKind::ALL
+            .into_iter()
+            .map(|kind| compact_view::ProviderView {
+                kind,
+                badge: None,
+                windows: Vec::new(),
+                placeholder: Some("--".to_string()),
+                attention: compact_view::Attention::Normal,
+            })
+            .collect(),
     };
     let mut auth_vm = normal_vm.clone();
     if let Some(provider) = auth_vm
@@ -5588,6 +5577,7 @@ pub fn dump_widget(dir: &str) -> i32 {
             tray_icon::TrayIconKind::Claude => "claude",
             tray_icon::TrayIconKind::Codex => "codex",
             tray_icon::TrayIconKind::Antigravity => "antigravity",
+            tray_icon::TrayIconKind::Grok => "grok",
         };
         for (theme_name, is_dark) in [("dark", true), ("light", false)] {
             let name = format!("tooltip-{provider}-{theme_name}.bmp");
@@ -5817,6 +5807,7 @@ pub fn dump_detail_popup(
         (5 * 86_400 + 9 * 3_600 + 5 * 60, local_time(12, 6, 7, 0)),
         (5 * 3_600, local_time(7, 1, 2, 55)),
         (3 * 86_400 + 3 * 3_600 + 56 * 60, local_time(10, 4, 1, 51)),
+        (4 * 86_400 + 6 * 3_600 + 5 * 60, local_time(11, 5, 4, 0)),
     ];
     let resets = reset_specs.map(|(seconds, target)| {
         detail_reset_line_from_parts(
@@ -5862,6 +5853,14 @@ pub fn dump_detail_popup(
                 row("5h", 0.0, resets[3].clone(), 5),
                 row("7d", 1.0, resets[4].clone(), 7),
             ],
+            data_is_stale: false,
+            hint: None,
+        },
+        DetailProviderGroup {
+            kind: tray_icon::TrayIconKind::Grok,
+            name: "Grok".to_string(),
+            badge: None,
+            rows: vec![row("7d", 23.0, resets[5].clone(), 7)],
             data_is_stale: false,
             hint: None,
         },
@@ -7611,6 +7610,7 @@ fn provider_accent(kind: tray_icon::TrayIconKind, is_dark: bool, high_contrast: 
         tray_icon::TrayIconKind::Claude => claude_accent_color(high_contrast),
         tray_icon::TrayIconKind::Codex => codex_accent_color(is_dark, high_contrast),
         tray_icon::TrayIconKind::Antigravity => antigravity_accent_color(high_contrast),
+        tray_icon::TrayIconKind::Grok => grok_accent_color(high_contrast),
     }
 }
 
@@ -7625,6 +7625,8 @@ fn detail_provider_tint(kind: tray_icon::TrayIconKind, is_dark: bool) -> Color {
         (tray_icon::TrayIconKind::Codex, false) => Color::from_hex("#F1F1F3"),
         (tray_icon::TrayIconKind::Antigravity, true) => Color::from_hex("#202B3B"),
         (tray_icon::TrayIconKind::Antigravity, false) => Color::from_hex("#EEF5FF"),
+        (tray_icon::TrayIconKind::Grok, true) => Color::from_hex("#26243A"),
+        (tray_icon::TrayIconKind::Grok, false) => Color::from_hex("#F1EFFF"),
     }
 }
 
@@ -7638,6 +7640,8 @@ fn detail_action_badge_foreground(kind: tray_icon::TrayIconKind, is_dark: bool) 
         (tray_icon::TrayIconKind::Codex, false) => Color::from_hex("#1F1F1F"),
         (tray_icon::TrayIconKind::Antigravity, true) => Color::from_hex("#74A7FF"),
         (tray_icon::TrayIconKind::Antigravity, false) => Color::from_hex("#1A56C4"),
+        (tray_icon::TrayIconKind::Grok, true) => Color::from_hex("#A79BFF"),
+        (tray_icon::TrayIconKind::Grok, false) => Color::from_hex("#4B3BC7"),
     }
 }
 
@@ -7700,6 +7704,11 @@ fn provider_chip_style(
             Color::from_hex("#BFD3FF"),
             false,
         ),
+        // One tile for both themes, matching the single Grok brand tile: the
+        // mark only exists as white on near-black.
+        (tray_icon::TrayIconKind::Grok, _) => {
+            (Color::from_hex("#17171C"), Color::from_hex("#41414D"), true)
+        }
     }
 }
 
@@ -8713,6 +8722,30 @@ const PROVIDER_TILE_ANTIGRAVITY_LIGHT: [&[u8]; 10] = [
     include_bytes!("icons/providers/rendered/tiles/antigravity-light-336.png"),
     include_bytes!("icons/providers/rendered/tiles/antigravity-light-384.png"),
 ];
+const PROVIDER_TILE_GROK: [&[u8]; 10] = [
+    include_bytes!("icons/providers/rendered/tiles/grok-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-192.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-216.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-240.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-288.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-336.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-384.png"),
+];
+const PROVIDER_TILE_GROK_C20: [&[u8]; 10] = [
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-192.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-216.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-240.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-288.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-336.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c20-384.png"),
+];
 const PROVIDER_TILE_ANTIGRAVITY_DARK_C20: [&[u8]; 10] = [
     include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-96.png"),
     include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-120.png"),
@@ -8792,6 +8825,8 @@ fn provider_tile_asset(
         (tray_icon::TrayIconKind::Antigravity, false, TileSize::Chip20) => {
             PROVIDER_TILE_ANTIGRAVITY_LIGHT_C20[bucket]
         }
+        (tray_icon::TrayIconKind::Grok, _, TileSize::Chip28) => PROVIDER_TILE_GROK[bucket],
+        (tray_icon::TrayIconKind::Grok, _, TileSize::Chip20) => PROVIDER_TILE_GROK_C20[bucket],
         (_, _, TileSize::Chip16) => unreachable!("chip16 uses the shared provider tile module"),
     };
     let (logical_size, size) = match tile_size {
@@ -9604,8 +9639,14 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn active_model_count(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_grok: bool,
+) -> i32 {
+    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32 + show_grok as i32)
+        .max(1)
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
@@ -9670,6 +9711,7 @@ fn widget_tooltip_abbrev(kind: tray_icon::TrayIconKind) -> &'static str {
         tray_icon::TrayIconKind::Claude => "CL",
         tray_icon::TrayIconKind::Codex => "CX",
         tray_icon::TrayIconKind::Antigravity => "AG",
+        tray_icon::TrayIconKind::Grok => "GK",
     }
 }
 
@@ -10377,6 +10419,14 @@ fn antigravity_accent_color(high_contrast: bool) -> Color {
     }
 }
 
+fn grok_accent_color(high_contrast: bool) -> Color {
+    if high_contrast {
+        theme::system_color(COLOR_HIGHLIGHT)
+    } else {
+        Color::from_hex("#7C6BF5")
+    }
+}
+
 struct WidgetPalette {
     bg: Color,
 }
@@ -10483,6 +10533,7 @@ fn compact_color(key: ColorKey, is_dark: bool, high_contrast: bool) -> Color {
             tray_icon::TrayIconKind::Claude => claude_accent_color(false),
             tray_icon::TrayIconKind::Codex => codex_accent_color(is_dark, false),
             tray_icon::TrayIconKind::Antigravity => antigravity_accent_color(false),
+            tray_icon::TrayIconKind::Grok => grok_accent_color(false),
         },
         ColorKey::GaugeWarn => {
             if is_dark {
@@ -11268,6 +11319,7 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
+            settings.show_grok,
         );
         let hwnd = match CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -11329,25 +11381,30 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 claude_widget: placeholder_widget(),
                 codex_widget: placeholder_widget(),
                 antigravity_widget: placeholder_widget(),
+                grok_widget: placeholder_widget(),
                 compact_vm: compact_view::placeholder_model(
                     "--",
                     &settings.provider_order,
                     settings.show_claude_code,
                     settings.show_codex,
                     settings.show_antigravity,
+                    settings.show_grok,
                 ),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_grok: settings.show_grok,
                 allow_claude_credentials: settings.allow_claude_credentials,
                 allow_codex_credentials: settings.allow_codex_credentials,
                 allow_antigravity_credentials: settings.allow_antigravity_credentials,
+                allow_grok_credentials: settings.allow_grok_credentials,
                 credential_consent_granted: settings.credential_consent_granted,
                 credential_consent_decided: settings.credential_consent_decided,
                 claude_credential_access_decided: settings.claude_credential_access_decided,
                 codex_credential_access_decided: settings.codex_credential_access_decided,
                 antigravity_credential_access_decided: settings
                     .antigravity_credential_access_decided,
+                grok_credential_access_decided: settings.grok_credential_access_decided,
                 provider_order: settings.provider_order.clone(),
                 pending_provider_order: None,
                 pending_provider_order_samples: 0,
@@ -11881,15 +11938,19 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 show_claude_code: false,
                 show_codex: false,
                 show_antigravity: false,
+                show_grok: false,
                 poll_claude_code: false,
                 poll_codex: false,
                 poll_antigravity: false,
+                poll_grok: false,
                 claude_cooldown_ms: None,
                 codex_cooldown_ms: None,
                 antigravity_cooldown_ms: None,
+                grok_cooldown_ms: None,
             })
     };
     let show_claude_code = plan.show_claude_code;
+    let show_grok = plan.show_grok;
     let show_codex = plan.show_codex;
     let show_antigravity = plan.show_antigravity;
 
@@ -11920,13 +11981,14 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
     // refreshed signature, so the watch would compare it against itself and
     // never fire.
     let watch_mode =
-        credential_watch_mode_for_shown(show_claude_code, show_codex, show_antigravity);
+        credential_watch_mode_for_shown(show_claude_code, show_codex, show_antigravity, show_grok);
     let pre_poll_snapshot = watch_mode.map(poller::credential_watch_snapshot);
 
     let poll_result = match poller::poll(
         plan.poll_claude_code,
         plan.poll_codex,
         plan.poll_antigravity,
+        plan.poll_grok,
         force_claude_refresh,
     ) {
         Ok(mut data) => {
@@ -11949,9 +12011,9 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // can shell out to WSL, which must not happen while the state is
             // held (nor on the UI thread - this runs on the poll worker).
             let needs_auth = shown_provider_needs_auth(
-                data.claude_code_error,
-                data.codex_error,
-                data.antigravity_error,
+                data.error(tray_icon::TrayIconKind::Claude),
+                data.error(tray_icon::TrayIconKind::Codex),
+                data.error(tray_icon::TrayIconKind::Antigravity),
                 show_claude_code,
                 show_codex,
                 show_antigravity,
@@ -11975,7 +12037,8 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 return;
             }
             if let Some(s) = state.as_mut() {
-                let claude_poll_healthy = plan.poll_claude_code && data.claude_code_error.is_none();
+                let claude_poll_healthy =
+                    plan.poll_claude_code && data.error(tray_icon::TrayIconKind::Claude).is_none();
                 let refresh_now = Instant::now();
                 let auth_transitions =
                     update_provider_refresh_states(s, plan, &data, updated_unix, refresh_now);
@@ -11984,6 +12047,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_grok,
                 )
                 .into_iter()
                 .find(|kind| auth_transitions.contains(kind));
@@ -11993,6 +12057,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_grok,
                 );
                 // A cached previous snapshot is from an earlier run: any
                 // reset that elapsed while the app was closed is old news,
@@ -12147,17 +12212,17 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             let failed_data = *failure.data;
             let has_transient_failure = (plan.poll_claude_code
                 && matches!(
-                    failed_data.claude_code_error,
+                    failed_data.error(tray_icon::TrayIconKind::Claude),
                     Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
                 ))
                 || (plan.poll_codex
                     && matches!(
-                        failed_data.codex_error,
+                        failed_data.error(tray_icon::TrayIconKind::Codex),
                         Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
                     ))
                 || (plan.poll_antigravity
                     && matches!(
-                        failed_data.antigravity_error,
+                        failed_data.error(tray_icon::TrayIconKind::Antigravity),
                         Some(ProviderStatus::NetworkUnavailable | ProviderStatus::RequestFailed)
                     ));
             // The aggregate error is only the first credential failure when
@@ -12170,9 +12235,9 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // baseline with credentials that were refreshed while the poll was
             // in flight. Compare against the pre-poll sample instead.
             let needs_watch = shown_provider_needs_auth(
-                failed_data.claude_code_error,
-                failed_data.codex_error,
-                failed_data.antigravity_error,
+                failed_data.error(tray_icon::TrayIconKind::Claude),
+                failed_data.error(tray_icon::TrayIconKind::Codex),
+                failed_data.error(tray_icon::TrayIconKind::Antigravity),
                 show_claude_code,
                 show_codex,
                 show_antigravity,
@@ -12216,6 +12281,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                         s.show_claude_code,
                         s.show_codex,
                         s.show_antigravity,
+                        s.show_grok,
                     )
                     .into_iter()
                     .find(|kind| auth_transitions.contains(kind));
@@ -12230,6 +12296,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                         s.show_claude_code,
                         s.show_codex,
                         s.show_antigravity,
+                        s.show_grok,
                     );
                     s.data = Some(merged);
                     s.manual_refresh_in_progress = false;
@@ -12377,12 +12444,10 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
 /// recorded by the last poll) has a quota window past its reset time - the
 /// only case where the 5s reset fast poll actually helps.
 fn healthy_provider_past_reset(data: &AppUsageData) -> bool {
-    let check = |usage: Option<&UsageData>, error: Option<ProviderStatus>| {
-        error.is_none() && usage.is_some_and(poller::is_past_reset)
-    };
-    check(data.claude_code.as_ref(), data.claude_code_error)
-        || check(data.codex.as_ref(), data.codex_error)
-        || check(data.antigravity.as_ref(), data.antigravity_error)
+    tray_icon::TrayIconKind::ALL.into_iter().any(|kind| {
+        let slot = data.provider(kind);
+        slot.error.is_none() && slot.usage.as_ref().is_some_and(poller::is_past_reset)
+    })
 }
 
 fn schedule_countdown_timer() {
@@ -12418,35 +12483,32 @@ fn schedule_countdown_timer() {
         }
     }
 
-    let usage_display_delay = [
-        data.claude_code.as_ref(),
-        data.codex.as_ref(),
-        data.antigravity.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .flat_map(|usage| usage.windows.iter())
-    .filter_map(|window| poller::time_until_display_change(window.resets_at))
-    .min();
+    let usage_display_delay = tray_icon::TrayIconKind::ALL
+        .into_iter()
+        .filter_map(|kind| data.usage(kind))
+        .flat_map(|usage| usage.windows.iter())
+        .filter_map(|window| poller::time_until_display_change(window.resets_at))
+        .min();
     let now_unix = now_unix_secs();
     let stale_transition_delay = [
         (
-            data.claude_code_error,
+            data.error(tray_icon::TrayIconKind::Claude),
             s.provider_refresh_states
                 .for_kind(tray_icon::TrayIconKind::Claude),
-            data.claude_code_updated_unix,
+            data.provider(tray_icon::TrayIconKind::Claude).updated_unix,
         ),
         (
-            data.codex_error,
+            data.error(tray_icon::TrayIconKind::Codex),
             s.provider_refresh_states
                 .for_kind(tray_icon::TrayIconKind::Codex),
-            data.codex_updated_unix,
+            data.provider(tray_icon::TrayIconKind::Codex).updated_unix,
         ),
         (
-            data.antigravity_error,
+            data.error(tray_icon::TrayIconKind::Antigravity),
             s.provider_refresh_states
                 .for_kind(tray_icon::TrayIconKind::Antigravity),
-            data.antigravity_updated_unix,
+            data.provider(tray_icon::TrayIconKind::Antigravity)
+                .updated_unix,
         ),
     ]
     .into_iter()
@@ -13223,11 +13285,15 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     }
                     save_state_settings();
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_MODEL_CLAUDE_CODE
+                | IDM_MODEL_CODEX
+                | IDM_MODEL_ANTIGRAVITY
+                | IDM_MODEL_GROK => {
                     let kind = match id {
                         IDM_MODEL_CLAUDE_CODE => tray_icon::TrayIconKind::Claude,
                         IDM_MODEL_CODEX => tray_icon::TrayIconKind::Codex,
                         IDM_MODEL_ANTIGRAVITY => tray_icon::TrayIconKind::Antigravity,
+                        IDM_MODEL_GROK => tray_icon::TrayIconKind::Grok,
                         _ => unreachable!(),
                     };
                     {
@@ -13235,18 +13301,39 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                    if s.show_codex
+                                        || s.show_antigravity
+                                        || s.show_grok
+                                        || !s.show_claude_code
+                                    {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
                                 IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
+                                    if s.show_claude_code
+                                        || s.show_antigravity
+                                        || s.show_grok
+                                        || !s.show_codex
+                                    {
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
                                 IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || s.show_grok
+                                        || !s.show_antigravity
+                                    {
                                         s.show_antigravity = !s.show_antigravity;
+                                    }
+                                }
+                                IDM_MODEL_GROK => {
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || s.show_antigravity
+                                        || !s.show_grok
+                                    {
+                                        s.show_grok = !s.show_grok;
                                     }
                                 }
                                 _ => {}
@@ -13255,6 +13342,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                 s.show_claude_code,
                                 s.show_codex,
                                 s.show_antigravity,
+                                s.show_grok,
                             );
                             set_widget_placeholders(s, "...");
                             s.pending_provider_order = None;
@@ -13263,6 +13351,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                 tray_icon::TrayIconKind::Claude => s.show_claude_code,
                                 tray_icon::TrayIconKind::Codex => s.show_codex,
                                 tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
+                                tray_icon::TrayIconKind::Grok => s.show_grok,
                             };
                             // Turning a provider on is a request to monitor
                             // it, so it also restores access. Without this the
@@ -13285,6 +13374,10 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                     s.allow_antigravity_credentials |= grant;
                                     s.antigravity_credential_access_decided = true;
                                 }
+                                tray_icon::TrayIconKind::Grok => {
+                                    s.allow_grok_credentials |= grant;
+                                    s.grok_credential_access_decided = true;
+                                }
                             }
                         }
                     }
@@ -13301,11 +13394,15 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         spawn_provider_detection(DetectionReason::Manual);
                     }
                 }
-                IDM_ACCESS_CLAUDE_CODE | IDM_ACCESS_CODEX | IDM_ACCESS_ANTIGRAVITY => {
+                IDM_ACCESS_CLAUDE_CODE
+                | IDM_ACCESS_CODEX
+                | IDM_ACCESS_ANTIGRAVITY
+                | IDM_ACCESS_GROK => {
                     let kind = match id {
                         IDM_ACCESS_CLAUDE_CODE => tray_icon::TrayIconKind::Claude,
                         IDM_ACCESS_CODEX => tray_icon::TrayIconKind::Codex,
                         IDM_ACCESS_ANTIGRAVITY => tray_icon::TrayIconKind::Antigravity,
+                        IDM_ACCESS_GROK => tray_icon::TrayIconKind::Grok,
                         _ => unreachable!(),
                     };
                     let currently_allowed = {
@@ -13513,9 +13610,11 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_grok,
             allow_claude_credentials,
             allow_codex_credentials,
             allow_antigravity_credentials,
+            allow_grok_credentials,
             notify_session_reset,
             notify_weekly_reset,
             widget_placement,
@@ -13536,9 +13635,11 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_grok,
                     s.allow_claude_credentials,
                     s.allow_codex_credentials,
                     s.allow_antigravity_credentials,
+                    s.allow_grok_credentials,
                     s.notify_session_reset,
                     s.notify_weekly_reset,
                     s.widget_placement.clone(),
@@ -13555,6 +13656,8 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     false,
                     true,
                     true,
+                    false,
+                    false,
                     false,
                     false,
                     false,
@@ -13628,8 +13731,11 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             return;
         };
         let claude_model = native_interop::wide_str(strings.claude_model);
-        let only_one_provider =
-            u8::from(show_claude_code) + u8::from(show_codex) + u8::from(show_antigravity) == 1;
+        let only_one_provider = u8::from(show_claude_code)
+            + u8::from(show_codex)
+            + u8::from(show_antigravity)
+            + u8::from(show_grok)
+            == 1;
         let claude_flags = provider_menu_item_flags(show_claude_code, only_one_provider);
         let _ = AppendMenuW(
             models_menu,
@@ -13654,6 +13760,15 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             antigravity_flags,
             IDM_MODEL_ANTIGRAVITY as usize,
             PCWSTR::from_raw(antigravity_model.as_ptr()),
+        );
+
+        let grok_model = native_interop::wide_str(strings.grok_model);
+        let grok_flags = provider_menu_item_flags(show_grok, only_one_provider);
+        let _ = AppendMenuW(
+            models_menu,
+            grok_flags,
+            IDM_MODEL_GROK as usize,
+            PCWSTR::from_raw(grok_model.as_ptr()),
         );
 
         let models_label = native_interop::wide_str(strings.models);
@@ -13688,6 +13803,7 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                 strings.antigravity_model,
                 allow_antigravity_credentials,
             ),
+            (IDM_ACCESS_GROK, strings.grok_model, allow_grok_credentials),
         ] {
             let label = native_interop::wide_str(label);
             let flags = if allowed {
@@ -14597,10 +14713,8 @@ mod reset_notification_tests {
     /// stop it recovering on its own when the user finally signs in.
     #[test]
     fn never_signed_in_still_pauses_polling_and_arms_the_watch() {
-        let data = AppUsageData {
-            codex_error: Some(ProviderStatus::NotSignedIn),
-            ..Default::default()
-        };
+        let data = AppUsageData::default()
+            .with_error(tray_icon::TrayIconKind::Codex, ProviderStatus::NotSignedIn);
         assert!(all_shown_providers_need_auth(&data, false, true, false));
         assert!(shown_provider_needs_auth(
             None,
@@ -14611,18 +14725,17 @@ mod reset_notification_tests {
             false
         ));
 
-        let mixed = AppUsageData {
-            claude_code_error: Some(ProviderStatus::NotSignedIn),
-            codex_error: Some(ProviderStatus::AuthenticationFailed),
-            ..Default::default()
-        };
+        let mixed = AppUsageData::default()
+            .with_error(tray_icon::TrayIconKind::Claude, ProviderStatus::NotSignedIn)
+            .with_error(
+                tray_icon::TrayIconKind::Codex,
+                ProviderStatus::AuthenticationFailed,
+            );
         assert!(all_shown_providers_need_auth(&mixed, true, true, false));
 
         // A provider that is merely rate limited is not waiting on the user.
-        let transient = AppUsageData {
-            codex_error: Some(ProviderStatus::RateLimited),
-            ..Default::default()
-        };
+        let transient = AppUsageData::default()
+            .with_error(tray_icon::TrayIconKind::Codex, ProviderStatus::RateLimited);
         assert!(!all_shown_providers_need_auth(
             &transient, false, true, false
         ));
@@ -14685,16 +14798,16 @@ mod reset_notification_tests {
     #[test]
     fn credential_poll_selection_requires_visibility_and_explicit_consent() {
         assert_eq!(
-            credential_poll_selection((true, true, true), (false, false, false)),
-            (false, false, false)
+            credential_poll_selection((true, true, true, true), (false, false, false, false)),
+            (false, false, false, false)
         );
         assert_eq!(
-            credential_poll_selection((false, false, false), (true, true, true)),
-            (false, false, false)
+            credential_poll_selection((false, false, false, false), (true, true, true, true)),
+            (false, false, false, false)
         );
         assert_eq!(
-            credential_poll_selection((true, false, true), (true, true, false)),
-            (true, false, false)
+            credential_poll_selection((true, false, true, true), (true, true, false, true)),
+            (true, false, false, true)
         );
     }
 
@@ -14834,22 +14947,29 @@ mod reset_notification_tests {
         // Derived from what is shown (not from what failed) so the same mode
         // can be sampled either side of a poll and the snapshots compared.
         assert_eq!(
-            credential_watch_mode_for_shown(true, true, false),
+            credential_watch_mode_for_shown(true, true, false, false),
             Some(CredentialWatchMode::AllProviders)
         );
         assert_eq!(
-            credential_watch_mode_for_shown(true, false, false),
+            credential_watch_mode_for_shown(true, false, false, false),
             Some(CredentialWatchMode::ClaudeSources)
         );
         assert_eq!(
-            credential_watch_mode_for_shown(false, true, false),
+            credential_watch_mode_for_shown(false, true, false, false),
             Some(CredentialWatchMode::Codex)
         );
         assert_eq!(
-            credential_watch_mode_for_shown(false, false, true),
+            credential_watch_mode_for_shown(false, false, true, false),
             Some(CredentialWatchMode::Antigravity)
         );
-        assert_eq!(credential_watch_mode_for_shown(false, false, false), None);
+        assert_eq!(
+            credential_watch_mode_for_shown(false, false, false, true),
+            Some(CredentialWatchMode::Grok)
+        );
+        assert_eq!(
+            credential_watch_mode_for_shown(false, false, false, false),
+            None
+        );
     }
 
     #[test]
@@ -14940,11 +15060,18 @@ mod reset_notification_tests {
 
     #[test]
     fn mixed_credential_failures_recheck_any_remote_rejection() {
-        let data = AppUsageData {
-            claude_code_error: Some(ProviderStatus::AuthenticationFailed),
-            codex_error: Some(ProviderStatus::AuthenticationFailed),
-            remote_auth_rejection: true,
-            ..Default::default()
+        let data = {
+            let mut data = AppUsageData::default()
+                .with_error(
+                    tray_icon::TrayIconKind::Claude,
+                    ProviderStatus::AuthenticationFailed,
+                )
+                .with_error(
+                    tray_icon::TrayIconKind::Codex,
+                    ProviderStatus::AuthenticationFailed,
+                );
+            data.remote_auth_rejection = true;
+            data
         };
 
         assert!(poll_failure_needs_auth_rejection_recheck(
@@ -14953,9 +15080,10 @@ mod reset_notification_tests {
         ));
         assert!(!poll_failure_needs_auth_rejection_recheck(
             poller::PollError::NoCredentials,
-            &AppUsageData {
-                remote_auth_rejection: false,
-                ..data
+            &{
+                let mut data = AppUsageData::default();
+                data.remote_auth_rejection = false;
+                data
             },
         ));
     }
@@ -15000,17 +15128,17 @@ mod reset_notification_tests {
     #[test]
     fn credential_watch_mode_tracks_the_only_enabled_provider() {
         assert_eq!(
-            credential_watch_mode_for_shown(false, true, false),
+            credential_watch_mode_for_shown(false, true, false, false),
             Some(poller::CredentialWatchMode::Codex)
         );
         assert_eq!(
-            credential_watch_mode_for_shown(false, false, true),
+            credential_watch_mode_for_shown(false, false, true, false),
             Some(poller::CredentialWatchMode::Antigravity)
         );
         // Claude credentials can live in Windows or any WSL distribution, so
         // every source remains watched even when one file supplied the poll.
         assert_eq!(
-            credential_watch_mode_for_shown(true, false, false),
+            credential_watch_mode_for_shown(true, false, false, false),
             Some(poller::CredentialWatchMode::ClaudeSources)
         );
         assert!(poll_error_needs_credential_watch(
@@ -15021,7 +15149,7 @@ mod reset_notification_tests {
     #[test]
     fn credential_watch_mode_uses_all_providers_for_combined_auth_failure() {
         assert_eq!(
-            credential_watch_mode_for_shown(true, true, true),
+            credential_watch_mode_for_shown(true, true, true, false),
             Some(poller::CredentialWatchMode::AllProviders)
         );
         assert!(poll_error_needs_credential_watch(
@@ -15103,16 +15231,25 @@ mod reset_notification_tests {
             tray_icon::TrayIconKind::Codex,
             tray_icon::TrayIconKind::Claude,
         ];
-        assert_eq!(shown_provider_order(&order, true, true, true), order);
-        assert_eq!(tray_surface_provider_order(&order, true, true, true), order);
-
-        let data = AppUsageData {
-            claude_code_error: Some(ProviderStatus::AuthenticationFailed),
-            codex_error: Some(ProviderStatus::AuthenticationFailed),
-            ..Default::default()
-        };
+        // Grok stays hidden here so the assertion is about the user's order
+        // being respected, not about a hidden provider being appended.
+        assert_eq!(shown_provider_order(&order, true, true, true, false), order);
         assert_eq!(
-            first_provider_credential_issue(Some(&data), None, &order, true, true, false),
+            tray_surface_provider_order(&order, true, true, true, false),
+            order
+        );
+
+        let data = AppUsageData::default()
+            .with_error(
+                tray_icon::TrayIconKind::Claude,
+                ProviderStatus::AuthenticationFailed,
+            )
+            .with_error(
+                tray_icon::TrayIconKind::Codex,
+                ProviderStatus::AuthenticationFailed,
+            );
+        assert_eq!(
+            first_provider_credential_issue(Some(&data), None, &order, true, true, false, false),
             Some((
                 tray_icon::TrayIconKind::Codex,
                 ProviderStatus::AuthenticationFailed
@@ -16327,62 +16464,89 @@ mod reset_notification_tests {
     fn partial_poll_preserves_failed_provider_freshness() {
         let usage =
             UsageData::from_windows(vec![UsageWindow::new(7.0, None, Some(FIVE_HOURS_SECONDS))]);
-        let previous = AppUsageData {
-            claude_code: Some(usage.clone()),
-            codex: Some(usage.clone()),
-            claude_code_updated_unix: Some(100),
-            codex_updated_unix: Some(100),
-            ..Default::default()
-        };
-        let mut next = AppUsageData {
-            codex: Some(usage),
-            claude_code_error: Some(ProviderStatus::RateLimited),
-            ..Default::default()
-        };
+        let previous = AppUsageData::default()
+            .with_usage(tray_icon::TrayIconKind::Claude, usage.clone())
+            .with_usage(tray_icon::TrayIconKind::Codex, usage.clone())
+            .with_updated_unix(tray_icon::TrayIconKind::Claude, 100)
+            .with_updated_unix(tray_icon::TrayIconKind::Codex, 100);
+        let mut next = AppUsageData::default()
+            .with_usage(tray_icon::TrayIconKind::Codex, usage)
+            .with_error(tray_icon::TrayIconKind::Claude, ProviderStatus::RateLimited);
         stamp_provider_updates(&mut next, 200);
 
-        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false);
-        assert!(merged.claude_code.is_some());
-        assert_eq!(merged.claude_code_updated_unix, Some(100));
-        assert_eq!(merged.codex_updated_unix, Some(200));
+        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false, false);
+        assert!(merged.usage(tray_icon::TrayIconKind::Claude).is_some());
+        assert_eq!(
+            merged
+                .provider(tray_icon::TrayIconKind::Claude)
+                .updated_unix,
+            Some(100)
+        );
+        assert_eq!(
+            merged.provider(tray_icon::TrayIconKind::Codex).updated_unix,
+            Some(200)
+        );
     }
 
     #[test]
     fn failed_poll_keeps_usage_but_replaces_stale_provider_errors() {
         let usage =
             UsageData::from_windows(vec![UsageWindow::new(7.0, None, Some(FIVE_HOURS_SECONDS))]);
-        let previous = AppUsageData {
-            claude_code: Some(usage.clone()),
-            codex: Some(usage),
-            claude_code_updated_unix: Some(100),
-            codex_updated_unix: Some(100),
-            claude_code_error: Some(ProviderStatus::RateLimited),
-            codex_error: Some(ProviderStatus::RequestFailed),
-            claude_code_retry_after_ms: Some(120_000),
-            ..Default::default()
-        };
-        let next = AppUsageData {
-            claude_code_error: Some(ProviderStatus::AuthenticationFailed),
-            codex_error: Some(ProviderStatus::AuthenticationFailed),
-            ..Default::default()
-        };
+        let previous = AppUsageData::default()
+            .with_usage(tray_icon::TrayIconKind::Claude, usage.clone())
+            .with_usage(tray_icon::TrayIconKind::Codex, usage)
+            .with_updated_unix(tray_icon::TrayIconKind::Claude, 100)
+            .with_updated_unix(tray_icon::TrayIconKind::Codex, 100)
+            .with_error(tray_icon::TrayIconKind::Claude, ProviderStatus::RateLimited)
+            .with_error(
+                tray_icon::TrayIconKind::Codex,
+                ProviderStatus::RequestFailed,
+            )
+            .with_retry_after_ms(tray_icon::TrayIconKind::Claude, 120_000);
+        let next = AppUsageData::default()
+            .with_error(
+                tray_icon::TrayIconKind::Claude,
+                ProviderStatus::AuthenticationFailed,
+            )
+            .with_error(
+                tray_icon::TrayIconKind::Codex,
+                ProviderStatus::AuthenticationFailed,
+            );
 
-        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false);
+        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false, false);
 
-        assert!(merged.claude_code.is_some());
-        assert!(merged.codex.is_some());
-        assert_eq!(merged.claude_code_updated_unix, Some(100));
-        assert_eq!(merged.codex_updated_unix, Some(100));
+        assert!(merged.usage(tray_icon::TrayIconKind::Claude).is_some());
+        assert!(merged.usage(tray_icon::TrayIconKind::Codex).is_some());
         assert_eq!(
-            merged.claude_code_error,
+            merged
+                .provider(tray_icon::TrayIconKind::Claude)
+                .updated_unix,
+            Some(100)
+        );
+        assert_eq!(
+            merged.provider(tray_icon::TrayIconKind::Codex).updated_unix,
+            Some(100)
+        );
+        assert_eq!(
+            merged.error(tray_icon::TrayIconKind::Claude),
             Some(ProviderStatus::AuthenticationFailed)
         );
         assert_eq!(
-            merged.codex_error,
+            merged.error(tray_icon::TrayIconKind::Codex),
             Some(ProviderStatus::AuthenticationFailed)
         );
-        assert_eq!(merged.claude_code_retry_after_ms, None);
-        assert_eq!(merged.codex_retry_after_ms, None);
+        assert_eq!(
+            merged
+                .provider(tray_icon::TrayIconKind::Claude)
+                .retry_after_ms,
+            None
+        );
+        assert_eq!(
+            merged
+                .provider(tray_icon::TrayIconKind::Codex)
+                .retry_after_ms,
+            None
+        );
     }
 
     #[test]
@@ -16615,21 +16779,34 @@ mod reset_notification_tests {
             show_claude_code: true,
             show_codex: true,
             show_antigravity: false,
+            show_grok: false,
             poll_claude_code: false,
             poll_codex: true,
             poll_antigravity: false,
+            poll_grok: false,
             claude_cooldown_ms: Some(42_000),
             codex_cooldown_ms: None,
             antigravity_cooldown_ms: None,
+            grok_cooldown_ms: None,
         };
         let mut data = AppUsageData::default();
 
         plan.apply_skipped_rate_limits(&mut data);
 
-        assert_eq!(data.claude_code_error, Some(ProviderStatus::RateLimited));
-        assert_eq!(data.claude_code_retry_after_ms, Some(42_000));
-        assert_eq!(data.codex_error, None);
-        assert_eq!(data.codex_retry_after_ms, None);
+        assert_eq!(
+            data.error(tray_icon::TrayIconKind::Claude),
+            Some(ProviderStatus::RateLimited)
+        );
+        assert_eq!(
+            data.provider(tray_icon::TrayIconKind::Claude)
+                .retry_after_ms,
+            Some(42_000)
+        );
+        assert_eq!(data.error(tray_icon::TrayIconKind::Codex), None);
+        assert_eq!(
+            data.provider(tray_icon::TrayIconKind::Codex).retry_after_ms,
+            None
+        );
         assert!(plan.has_poll_target());
     }
 

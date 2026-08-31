@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    grok_model: "Grok",
     settings: "Settings",
     settings_storage_failed: "Settings and cached usage could not be saved.",
     start_with_windows: "Start with Windows",

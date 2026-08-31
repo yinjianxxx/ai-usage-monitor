@@ -9,6 +9,7 @@ pub(crate) enum ProviderBrand {
     Claude,
     Codex,
     Antigravity,
+    Grok,
 }
 
 pub(crate) const BUCKET_DPIS: [u32; 10] = [96, 120, 144, 168, 192, 216, 240, 288, 336, 384];
@@ -49,6 +50,18 @@ const OPENAI: [&[u8]; 10] = [
     include_bytes!("icons/providers/rendered/tiles/openai-c16-288.png"),
     include_bytes!("icons/providers/rendered/tiles/openai-c16-336.png"),
     include_bytes!("icons/providers/rendered/tiles/openai-c16-384.png"),
+];
+const GROK: [&[u8]; 10] = [
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-192.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-216.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-240.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-288.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-336.png"),
+    include_bytes!("icons/providers/rendered/tiles/grok-c16-384.png"),
 ];
 const ANTIGRAVITY_DARK: [&[u8]; 10] = [
     include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-96.png"),
@@ -104,6 +117,7 @@ pub(crate) fn chip16_asset(brand: ProviderBrand, dpi: u32, is_dark: bool) -> Chi
         (ProviderBrand::Codex, _) => OPENAI[bucket],
         (ProviderBrand::Antigravity, true) => ANTIGRAVITY_DARK[bucket],
         (ProviderBrand::Antigravity, false) => ANTIGRAVITY_LIGHT[bucket],
+        (ProviderBrand::Grok, _) => GROK[bucket],
     };
     let size = CHIP16_SIZES[bucket];
     debug_assert_eq!(size, scale_px_for_dpi(16, BUCKET_DPIS[bucket]));

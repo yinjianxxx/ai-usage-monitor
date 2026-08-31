@@ -164,6 +164,7 @@ fn provider_abbrev(kind: TrayIconKind) -> &'static str {
         TrayIconKind::Claude => "CL",
         TrayIconKind::Codex => "CX",
         TrayIconKind::Antigravity => "AG",
+        TrayIconKind::Grok => "GK",
     }
 }
 
@@ -1215,6 +1216,73 @@ mod tests {
         assert_eq!(tracks[0].x, tracks[1].x);
         assert_eq!(tracks[0].w, tracks[1].w);
         assert_eq!(tracks[0].x + tracks[0].w, tracks[1].x + tracks[1].w);
+    }
+
+    /// Four providers is the first count where the widget carries more badges
+    /// than it was originally laid out for, so the geometry is asserted
+    /// directly rather than assumed to generalise from the three-badge cases.
+    #[test]
+    fn four_badges_stay_ordered_and_evenly_spaced() {
+        let m = Metrics::logical();
+        let one_window = |kind| {
+            provider(
+                kind,
+                vec![window("7d", 23.0, "\u{00b7}5d", Severity::Normal)],
+                Attention::Normal,
+            )
+        };
+        let three = CompactViewModel {
+            providers: vec![
+                one_window(TrayIconKind::Claude),
+                one_window(TrayIconKind::Codex),
+                one_window(TrayIconKind::Antigravity),
+            ],
+        };
+        let four = CompactViewModel {
+            providers: vec![
+                one_window(TrayIconKind::Claude),
+                one_window(TrayIconKind::Codex),
+                one_window(TrayIconKind::Antigravity),
+                one_window(TrayIconKind::Grok),
+            ],
+        };
+        let three_scene = layout_badges(&three, &m, false, &fake_measure);
+        let four_scene = layout_badges(&four, &m, false, &fake_measure);
+
+        let pills = |scene: &Scene| {
+            scene
+                .cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::RoundRect {
+                        rect,
+                        color: ColorKey::PillBg,
+                        ..
+                    } => Some(*rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let three_pills = pills(&three_scene);
+        let four_pills = pills(&four_scene);
+        assert_eq!(three_pills.len(), 3);
+        assert_eq!(four_pills.len(), 4);
+
+        // The fourth badge is appended, not squeezed in: every earlier badge
+        // keeps its position and width.
+        for (left, right) in three_pills.iter().zip(four_pills.iter()) {
+            assert_eq!(left.x, right.x);
+            assert_eq!(left.w, right.w);
+        }
+        // Identical content means identical width, and one more gap.
+        let pill_w = four_pills[0].w;
+        for pill in &four_pills {
+            assert_eq!(pill.w, pill_w);
+        }
+        for pair in four_pills.windows(2) {
+            assert_eq!(pair[1].x - (pair[0].x + pair[0].w), m.badge_gap);
+        }
+        assert_eq!(four_scene.width - three_scene.width, pill_w + m.badge_gap);
     }
 
     #[test]

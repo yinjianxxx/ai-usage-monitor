@@ -104,6 +104,18 @@ const variants = [
     background: '#E8F0FF',
     border: '#BFD3FF',
   },
+  // xAI ships one look for the Grok mark - white on near-black - so unlike
+  // Claude and Antigravity it gets a single tile that both themes share. The
+  // near-black carries the same cool tint the other dark tiles use: a neutral
+  // grey collapses every blend onto one channel, which leaves a 20 px tile
+  // below the generator's own antialiasing floor.
+  {
+    name: 'grok',
+    source: 'grok.svg',
+    color: '#FFFFFF',
+    background: '#17171C',
+    border: '#41414D',
+  },
 ];
 
 const executablePath = process.env.CHROMIUM_PATH;

@@ -228,6 +228,7 @@ pub struct Strings {
     pub claude_model: &'static str,
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
+    pub grok_model: &'static str,
     pub settings: &'static str,
     pub settings_storage_failed: &'static str,
     pub start_with_windows: &'static str,

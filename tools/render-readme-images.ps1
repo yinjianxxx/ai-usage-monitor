@@ -8,7 +8,7 @@
 #   widget-badges-dark.png / -light.png         taskbar widget, normal state
 #   widget-badges-warn-dark.png                 taskbar widget, warning takeover
 #   floating-rows-dark.png / -light.png         floating window, normal state
-#   tray-icons-dark.png / -light.png            three provider tray icons composed
+#   tray-icons-dark.png / -light.png            four provider tray icons composed
 #                                               at taskbar size on the widget's
 #                                               own background colour
 #
@@ -89,7 +89,7 @@ try {
         $iconSize = 26
         $margin = 12
         $gap = 12
-        $icons = @("claude-72-48-$theme.bmp", "codex-42-12-$theme.bmp", "ag-single-60-$theme.bmp")
+        $icons = @("claude-72-48-$theme.bmp", "codex-42-12-$theme.bmp", "ag-single-60-$theme.bmp", "grok-single-23-$theme.bmp")
         $width = $margin * 2 + $iconSize * $icons.Count + $gap * ($icons.Count - 1)
         $height = $iconSize + $margin * 2
 

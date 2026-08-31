@@ -16,7 +16,7 @@
 [![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup in dark theme: Claude flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="400"> <img src=".github/readme/detail-popup-en-light.png" alt="The same detail popup in light theme" width="400">
+<img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup in dark theme: Claude flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle; Grok at 23% of its billing period" width="400"> <img src=".github/readme/detail-popup-en-light.png" alt="The same detail popup in light theme" width="400">
 
 <sub>The detail popup in dark and light — including what a near-limit warning looks like.</sub>
 
@@ -24,8 +24,8 @@
 
 Gengchou puts the quota windows your AI providers actually report — how much
 is used, and when it resets — directly on the Windows taskbar. Claude,
-Codex, and Antigravity each get a live percentage on whichever surface you
-prefer, from a full detail card down to a single tray number, so checking
+Codex, Antigravity, and Grok each get a live percentage on whichever surface
+you prefer, from a full detail card down to a single tray number, so checking
 your remaining budget never means opening a dashboard.
 
 > 烧香知夜漏，刻烛验更筹。
@@ -151,8 +151,8 @@ Release maintainers should also follow the
 
 - Quota data comes from what each provider actually reports — windows and
   reset times are never guessed or extrapolated
-- A new installation shows whichever of Claude, Codex, and Google Antigravity
-  it detects on this machine; enable or disable any combination afterwards
+- A new installation shows whichever of Claude, Codex, Google Antigravity, and
+  Grok it detects on this machine; enable or disable any combination afterwards
 - Windows system colours in High Contrast mode
 - Optional reset notifications (off by default)
 - Survives `explorer.exe` restarts and RDP / lock-screen transitions; polling
@@ -188,8 +188,16 @@ each provider's own account rules:
   Manager; if that is unavailable,
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` in a **running** WSL
   distribution is read next
+- **Grok** — a signed-in grok CLI session. Windows resolves
+  `%GROK_HOME%uth.json` (normally `%USERPROFILE%\.grokuth.json`); if that
+  is unavailable, `$GROK_HOME/auth.json` (default `$HOME/.grok/auth.json`) in a
+  **running** WSL distribution is read next. `auth.json` can hold sign-ins from
+  several identity providers; only an entry issued by xAI itself is used, and
+  its token is only ever sent to xAI. An `XAI_API_KEY` environment variable is
+  not a session and is not read
 
-Codex and Antigravity credentials inside WSL are only read from distributions
+Codex, Antigravity, and Grok credentials inside WSL are only read from
+distributions
 that are **already running**. Reading a stopped distribution would start its
 virtual machine, and this check runs on a schedule, so Gengchou never wakes WSL
 for it. Start the distribution first, then use **Provider access → Detect

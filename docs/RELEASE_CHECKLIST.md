@@ -67,12 +67,13 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   **Provider access → Detect providers again** picks it up immediately. Confirm
   the periodic sweep notifies once per provider and never changes what is
   displayed on its own, and stays quiet about providers the user turned off.
-- With Codex and Antigravity credentials only inside WSL, confirm they are read
-  from a **running** distribution (`$CODEX_HOME/auth.json` and
-  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`) and that a stopped
+- With Codex, Antigravity, and Grok credentials only inside WSL, confirm they
+  are read from a **running** distribution (`$CODEX_HOME/auth.json`,
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, and
+  `$GROK_HOME/auth.json`) and that a stopped
   distribution is never started by the scheduled check. Actually place a
   credential inside a distribution and watch it appear: this row failed
-  silently for every provider until now, because `wsl.exe --` re-parsed the
+  silently for every provider until v2.5.0, because `wsl.exe --` re-parsed the
   probe script in the login shell and dropped its quoting, and a WSL-only
   credential is indistinguishable from an absent one on the surfaces.
 - Force a WSL credential probe spawn failure, timeout, and unexpected exit;
@@ -168,7 +169,7 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   visually quiet. On the third consecutive failure, verify the card becomes
   **Refresh failed**, keeps and mutes the last valid data, shows its age, and
   gives a localized connection action plus an automatic-retry outcome.
-- Disable Provider tray icons and confirm the three provider icons are replaced
+- Disable Provider tray icons and confirm the provider icons are replaced
   by one app icon matching the executable; re-enable it and confirm all enabled
   provider icons return without duplicates. At each tested DPI, confirm the app
   icon fills the Shell slot without clipping. Exercise this notification

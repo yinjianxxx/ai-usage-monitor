@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    grok_model: "Grok",
     settings: "Einstellungen",
     settings_storage_failed:
         "Einstellungen und zwischengespeicherte Nutzungsdaten konnten nicht gespeichert werden.",

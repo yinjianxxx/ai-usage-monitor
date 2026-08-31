@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    grok_model: "Grok",
     settings: "设置",
     settings_storage_failed: "无法保存设置和缓存的用量数据。",
     start_with_windows: "开机启动",

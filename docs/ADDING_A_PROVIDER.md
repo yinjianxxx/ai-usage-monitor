@@ -1,7 +1,12 @@
 # Adding a provider
 
-Working notes for the cost of adding a fourth quota provider, plus the
-OpenCode Go research that prompted them.
+Working notes for the cost of adding a quota provider, plus the OpenCode Go
+research that prompted them.
+
+> **Grok landed as the fourth provider in v2.5.0.** Sections 1 and 2 were
+> written while a fourth provider was still hypothetical; what actually
+> happened is recorded in section 2.2. Read that before trusting the framing
+> of the two sections above it.
 
 Any implementation must preserve the release-blocking constraints in
 [`docs/INVARIANTS.md`](INVARIANTS.md), especially explicit credential access,
@@ -110,7 +115,7 @@ done**:
 Reasons for deferring:
 
 - Its only benefit is making a fourth provider cheap, and the fourth provider is
-  indefinitely postponed (section 3).
+  indefinitely postponed (section 3). *(This premise expired: see section 2.2.)*
 - It addresses the left column of section 1 but none of section 1.2, so it saves
   well under half the real cost.
 - Steps 4 and 5 carry the risk: `window.rs` is large and largely UI, and a
@@ -120,7 +125,7 @@ Reasons for deferring:
 If some of it is ever wanted for its own sake, steps 1 and 3 stand alone as a
 simplification of existing duplication, have unit-test coverage already, and
 touch neither the UI nor persisted state. Stop there unless a fourth provider is
-actually landing.
+actually landing. *(Both were done in v2.5.0; see section 2.2.)*
 
 Decision reaffirmed on 2026-08-09: do not split `window.rs` merely to reduce its
 line count. Reconsider a responsibility split when a fourth provider is
@@ -138,6 +143,37 @@ second kind of measure alongside `UsageWindow`, and note that
 `display_percent`'s rounding direction is currently chosen for *usage* (floor is
 conservative); the same rounding on a *remaining* value is optimistic and would
 delay warnings.
+
+### 2.2 What the fourth provider actually cost (Grok, v2.5.0)
+
+Steps 1 and 3 were done first, as a separate change with no behaviour
+difference, and steps 2, 4, and 5 were left alone. That split held up:
+
+- **Step 2 turned out to be a prerequisite, not an option.** Indexing storage
+  by provider needs a provider identity to index by, so `TrayIconKind::ALL`,
+  `COUNT`, and `index()` landed with step 1 rather than separately.
+- **Steps 1 and 3 paid for themselves.** `AppUsageData`'s twelve parallel
+  fields became four-field slots behind `provider()` / `provider_mut()`, and
+  `poll_with`'s six parameters and three copies of the error-handling block
+  became one table and one loop. Around a dozen three-statement blocks in
+  `window.rs` collapsed into loops over `TrayIconKind::ALL` on the way through.
+- **Leaving steps 4 and 5 alone was still right.** The settings triples and the
+  UI match arms were extended by hand, one arm per site. That is dull but it is
+  also auditable, and it kept a settings migration well away from the same
+  change.
+- **Section 1.2 held exactly as written.** The brand tiles, the eleven language
+  files, the compact-layout geometry, and the documentation and release work
+  were untouched by any of the restructuring.
+
+Two things worth knowing before the next one:
+
+- `provider_tile` needs the PNGs to exist before anything referencing the new
+  `ProviderBrand` variant will compile, so generate the art first.
+- The generator's antialiasing floor (`opaque_colors >= 100`) assumes a
+  chromatic mark. A strictly greyscale palette collapses every blend onto one
+  channel and fails the check at 20 px even when the tile is correct. Grok's
+  tile carries the same cool tint the other dark tiles use; do that rather than
+  relaxing the shared check.
 
 ## 3. OpenCode Go — external snapshot, 2026-08-06
 

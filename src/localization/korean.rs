@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    grok_model: "Grok",
     settings: "설정",
     settings_storage_failed: "설정과 캐시된 사용량 데이터를 저장할 수 없습니다.",
     start_with_windows: "Windows 시작 시 자동 실행",
