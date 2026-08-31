@@ -29,6 +29,13 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   visibility and explicit provider permission.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
+- When a release adds a provider, state the downgrade consequence in the
+  release notes. `provider_order` stores provider names, and a build that does
+  not know one of them cannot use the file: v2.5.0 and later drop the unknown
+  entry and keep the rest, but **v2.4.2 and earlier reject the whole settings
+  file**, fall back to defaults, and overwrite the user's layout, language, and
+  provider selection on the next save. Downgrading across that boundary is a
+  settings reset, not a rollback.
 - Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
   and principal dependencies and record whether an upgrade is justified.
   Between minor releases, review them immediately only for a security advisory,
@@ -67,10 +74,15 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   **Provider access → Detect providers again** picks it up immediately. Confirm
   the periodic sweep notifies once per provider and never changes what is
   displayed on its own, and stays quiet about providers the user turned off.
-- With Codex and Antigravity credentials only inside WSL, confirm they are read
-  from a **running** distribution (`$CODEX_HOME/auth.json` and
-  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`) and that a stopped
-  distribution is never started by the scheduled check.
+- With Codex, Antigravity, and Grok credentials only inside WSL, confirm they
+  are read from a **running** distribution (`$CODEX_HOME/auth.json`,
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, and
+  `$GROK_HOME/auth.json`) and that a stopped
+  distribution is never started by the scheduled check. Actually place a
+  credential inside a distribution and watch it appear: this row failed
+  silently for every provider until v2.5.0, because `wsl.exe --` re-parsed the
+  probe script in the login shell and dropped its quoting, and a WSL-only
+  credential is indistinguishable from an absent one on the surfaces.
 - Force a WSL credential probe spawn failure, timeout, and unexpected exit;
   each must follow the transient request-failure path and must not show an
   authentication warning. A concrete credential file that is present but
@@ -164,7 +176,7 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   visually quiet. On the third consecutive failure, verify the card becomes
   **Refresh failed**, keeps and mutes the last valid data, shows its age, and
   gives a localized connection action plus an automatic-retry outcome.
-- Disable Provider tray icons and confirm the three provider icons are replaced
+- Disable Provider tray icons and confirm the provider icons are replaced
   by one app icon matching the executable; re-enable it and confirm all enabled
   provider icons return without duplicates. At each tested DPI, confirm the app
   icon fills the Shell slot without clipping. Exercise this notification

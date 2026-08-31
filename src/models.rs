@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+use crate::tray_icon::TrayIconKind;
+
 pub const FIVE_HOURS_SECONDS: u64 = 5 * 60 * 60;
 pub const ONE_DAY_SECONDS: u64 = 24 * 60 * 60;
 pub const ONE_WEEK_SECONDS: u64 = 7 * ONE_DAY_SECONDS;
@@ -97,22 +99,76 @@ impl ProviderStatus {
     }
 }
 
+/// One provider's slice of a poll pass: its usage, when that usage was
+/// observed, and why it is missing when it is.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderSlot {
+    pub usage: Option<UsageData>,
+    pub updated_unix: Option<u64>,
+    pub error: Option<ProviderStatus>,
+    pub retry_after_ms: Option<u32>,
+}
+
+/// The result of one poll pass, indexed by provider.
+///
+/// Indexed rather than a field per provider so that adding a provider does not
+/// mean threading four more fields through every call site; the slots are
+/// private precisely so nothing can index them by anything but a
+/// [`TrayIconKind`].
 #[derive(Clone, Debug, Default)]
 pub struct AppUsageData {
-    pub claude_code: Option<UsageData>,
-    pub codex: Option<UsageData>,
-    pub antigravity: Option<UsageData>,
-    pub claude_code_updated_unix: Option<u64>,
-    pub codex_updated_unix: Option<u64>,
-    pub antigravity_updated_unix: Option<u64>,
-    pub claude_code_error: Option<ProviderStatus>,
-    pub codex_error: Option<ProviderStatus>,
-    pub antigravity_error: Option<ProviderStatus>,
-    pub claude_code_retry_after_ms: Option<u32>,
-    pub codex_retry_after_ms: Option<u32>,
-    pub antigravity_retry_after_ms: Option<u32>,
+    slots: [ProviderSlot; TrayIconKind::COUNT],
     /// At least one provider returned a remote 401/403 in this poll pass.
     pub remote_auth_rejection: bool,
+}
+
+impl AppUsageData {
+    pub fn provider(&self, kind: TrayIconKind) -> &ProviderSlot {
+        &self.slots[kind.index()]
+    }
+
+    pub fn provider_mut(&mut self, kind: TrayIconKind) -> &mut ProviderSlot {
+        &mut self.slots[kind.index()]
+    }
+
+    pub fn usage(&self, kind: TrayIconKind) -> Option<&UsageData> {
+        self.provider(kind).usage.as_ref()
+    }
+
+    pub fn error(&self, kind: TrayIconKind) -> Option<ProviderStatus> {
+        self.provider(kind).error
+    }
+
+    /// Whether any provider produced usage at all. A pass with none of it is
+    /// the whole-pass failure case.
+    pub fn has_any_usage(&self) -> bool {
+        self.slots.iter().any(|slot| slot.usage.is_some())
+    }
+}
+
+/// Test-only builders. Production code writes through [`AppUsageData::provider_mut`];
+/// tests read better as a chain than as four statements per provider.
+#[cfg(test)]
+impl AppUsageData {
+    pub fn with_usage(mut self, kind: TrayIconKind, usage: UsageData) -> Self {
+        self.provider_mut(kind).usage = Some(usage);
+        self
+    }
+
+    pub fn with_updated_unix(mut self, kind: TrayIconKind, updated_unix: u64) -> Self {
+        self.provider_mut(kind).updated_unix = Some(updated_unix);
+        self
+    }
+
+    pub fn with_error(mut self, kind: TrayIconKind, error: ProviderStatus) -> Self {
+        self.provider_mut(kind).error = Some(error);
+        self
+    }
+
+    pub fn with_retry_after_ms(mut self, kind: TrayIconKind, retry_after_ms: u32) -> Self {
+        self.provider_mut(kind).retry_after_ms = Some(retry_after_ms);
+        self
+    }
 }
 
 #[cfg(test)]

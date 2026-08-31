@@ -60,29 +60,23 @@ pub(crate) fn build(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> CompactViewModel {
     let providers = order
         .iter()
-        .filter_map(|kind| match kind {
-            TrayIconKind::Claude if show_claude_code => Some(provider_view(
+        .filter(|kind| match kind {
+            TrayIconKind::Claude => show_claude_code,
+            TrayIconKind::Codex => show_codex,
+            TrayIconKind::Antigravity => show_antigravity,
+            TrayIconKind::Grok => show_grok,
+        })
+        .map(|kind| {
+            provider_view(
                 *kind,
-                data.and_then(|data| data.claude_code.as_ref()),
-                data.and_then(|data| data.claude_code_error),
+                data.and_then(|data| data.usage(*kind)),
+                data.and_then(|data| data.error(*kind)),
                 strings,
-            )),
-            TrayIconKind::Codex if show_codex => Some(provider_view(
-                *kind,
-                data.and_then(|data| data.codex.as_ref()),
-                data.and_then(|data| data.codex_error),
-                strings,
-            )),
-            TrayIconKind::Antigravity if show_antigravity => Some(provider_view(
-                *kind,
-                data.and_then(|data| data.antigravity.as_ref()),
-                data.and_then(|data| data.antigravity_error),
-                strings,
-            )),
-            _ => None,
+            )
         })
         .collect();
     CompactViewModel { providers }
@@ -94,6 +88,7 @@ pub(crate) fn placeholder_model(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_grok: bool,
 ) -> CompactViewModel {
     let providers = order
         .iter()
@@ -102,6 +97,7 @@ pub(crate) fn placeholder_model(
                 TrayIconKind::Claude => show_claude_code,
                 TrayIconKind::Codex => show_codex,
                 TrayIconKind::Antigravity => show_antigravity,
+                TrayIconKind::Grok => show_grok,
             };
             visible.then(|| ProviderView {
                 kind: *kind,
@@ -389,10 +385,7 @@ mod tests {
     }
 
     fn data_with_claude(claude: UsageData) -> AppUsageData {
-        AppUsageData {
-            claude_code: Some(claude),
-            ..Default::default()
-        }
+        AppUsageData::default().with_usage(TrayIconKind::Claude, claude)
     }
 
     #[test]
@@ -403,7 +396,7 @@ mod tests {
             UsageWindow::new(0.0, resets, Some(FIVE_HOURS_SECONDS)),
             UsageWindow::new(92.0, resets, Some(ONE_WEEK_SECONDS)),
         ]));
-        let vm = build(Some(&data), strings, &ORDER, true, false, false);
+        let vm = build(Some(&data), strings, &ORDER, true, false, false, false);
         assert_eq!(vm.providers[0].attention, Attention::Warn);
         assert_eq!(vm.providers[0].windows[0].severity, Severity::Warn);
         assert_eq!(vm.providers[0].windows[0].label, "7d");
@@ -437,44 +430,50 @@ mod tests {
     #[test]
     fn transient_provider_errors_stay_quiet_until_the_application_promotes_them() {
         let strings = LanguageId::English.strings();
-        let cached = AppUsageData {
-            codex: Some(usage(vec![UsageWindow::new(
-                51.0,
-                None,
-                Some(ONE_WEEK_SECONDS),
-            )])),
-            codex_error: Some(ProviderStatus::RateLimited),
-            ..Default::default()
-        };
-        let vm = build(Some(&cached), strings, &ORDER, false, true, false);
+        let cached = AppUsageData::default()
+            .with_usage(
+                TrayIconKind::Codex,
+                usage(vec![UsageWindow::new(51.0, None, Some(ONE_WEEK_SECONDS))]),
+            )
+            .with_error(TrayIconKind::Codex, ProviderStatus::RateLimited);
+        let vm = build(Some(&cached), strings, &ORDER, false, true, false, false);
         assert_eq!(vm.providers[0].attention, Attention::Normal);
         assert_eq!(vm.providers[0].windows[0].percent_text, "51%");
 
-        let transient = AppUsageData {
-            codex_error: Some(ProviderStatus::RequestFailed),
-            ..Default::default()
-        };
-        let vm = build(Some(&transient), strings, &ORDER, false, true, false);
+        let transient =
+            AppUsageData::default().with_error(TrayIconKind::Codex, ProviderStatus::RequestFailed);
+        let vm = build(Some(&transient), strings, &ORDER, false, true, false, false);
         assert_eq!(vm.providers[0].attention, Attention::Normal);
         assert_eq!(vm.providers[0].placeholder.as_deref(), Some("--"));
 
-        let warned_transient = AppUsageData {
-            codex: Some(usage(vec![UsageWindow::new(
-                92.0,
-                None,
-                Some(ONE_WEEK_SECONDS),
-            )])),
-            codex_error: Some(ProviderStatus::RequestFailed),
-            ..Default::default()
-        };
-        let vm = build(Some(&warned_transient), strings, &ORDER, false, true, false);
+        let warned_transient = AppUsageData::default()
+            .with_usage(
+                TrayIconKind::Codex,
+                usage(vec![UsageWindow::new(92.0, None, Some(ONE_WEEK_SECONDS))]),
+            )
+            .with_error(TrayIconKind::Codex, ProviderStatus::RequestFailed);
+        let vm = build(
+            Some(&warned_transient),
+            strings,
+            &ORDER,
+            false,
+            true,
+            false,
+            false,
+        );
         assert_eq!(vm.providers[0].attention, Attention::Warn);
 
-        let unavailable = AppUsageData {
-            codex_error: Some(ProviderStatus::AuthenticationFailed),
-            ..Default::default()
-        };
-        let vm = build(Some(&unavailable), strings, &ORDER, false, true, false);
+        let unavailable = AppUsageData::default()
+            .with_error(TrayIconKind::Codex, ProviderStatus::AuthenticationFailed);
+        let vm = build(
+            Some(&unavailable),
+            strings,
+            &ORDER,
+            false,
+            true,
+            false,
+            false,
+        );
         assert_eq!(vm.providers[0].attention, Attention::ActionRequired);
         assert_eq!(vm.providers[0].placeholder.as_deref(), Some("--"));
     }
@@ -568,7 +567,7 @@ mod tests {
             UsageWindow::new(70.0, None, Some(24 * 60 * 60)),
             UsageWindow::new(80.0, None, Some(ONE_WEEK_SECONDS)),
         ]));
-        let vm = build(Some(&data), strings, &ORDER, true, false, false);
+        let vm = build(Some(&data), strings, &ORDER, true, false, false, false);
         let provider = &vm.providers[0];
 
         assert_eq!(provider.windows.len(), 2);
@@ -585,7 +584,7 @@ mod tests {
             UsageWindow::new(70.0, None, Some(24 * 60 * 60)),
             UsageWindow::new(92.0, None, Some(ONE_WEEK_SECONDS)),
         ]));
-        let vm = build(Some(&data), strings, &ORDER, true, false, false);
+        let vm = build(Some(&data), strings, &ORDER, true, false, false, false);
         let provider = &vm.providers[0];
 
         assert_eq!(provider.windows.len(), 2);
@@ -597,16 +596,16 @@ mod tests {
     #[test]
     fn labels_and_provider_order_are_language_independent() {
         let strings = LanguageId::Korean.strings();
-        let data = AppUsageData {
-            claude_code: Some(usage(vec![UsageWindow::new(10.0, None, Some(30 * 60))])),
-            antigravity: Some(usage(vec![UsageWindow::new(
-                1.0,
-                None,
-                Some(365 * 24 * 60 * 60),
-            )])),
-            ..Default::default()
-        };
-        let vm = build(Some(&data), strings, &ORDER, true, false, true);
+        let data = AppUsageData::default()
+            .with_usage(
+                TrayIconKind::Claude,
+                usage(vec![UsageWindow::new(10.0, None, Some(30 * 60))]),
+            )
+            .with_usage(
+                TrayIconKind::Antigravity,
+                usage(vec![UsageWindow::new(1.0, None, Some(365 * 24 * 60 * 60))]),
+            );
+        let vm = build(Some(&data), strings, &ORDER, true, false, true, false);
         assert_eq!(vm.providers[0].kind, TrayIconKind::Claude);
         assert_eq!(vm.providers[0].windows[0].label, "30m");
         assert_eq!(vm.providers[1].windows[0].label, "365d");
@@ -614,7 +613,7 @@ mod tests {
 
     #[test]
     fn placeholder_model_respects_visibility() {
-        let vm = placeholder_model("--", &ORDER, true, false, true);
+        let vm = placeholder_model("--", &ORDER, true, false, true, false);
         assert_eq!(vm.providers.len(), 2);
         assert!(vm
             .providers
@@ -624,7 +623,7 @@ mod tests {
 
     #[test]
     fn provider_reorder_preserves_cached_payload_and_attention() {
-        let mut vm = placeholder_model("--", &ORDER, true, true, true);
+        let mut vm = placeholder_model("--", &ORDER, true, true, true, false);
         let codex = vm
             .providers
             .iter_mut()

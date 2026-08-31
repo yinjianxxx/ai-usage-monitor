@@ -32,7 +32,7 @@ const SUPPORTED_POLL_INTERVALS: [u32; 6] = [
 pub(crate) const PLACEMENT_SCHEMA_VERSION: u8 = 2;
 /// Version 1 introduced the one-time, all-provider access prompt that
 /// replaced the per-provider prompts.
-pub(crate) const CONSENT_SCHEMA_VERSION: u8 = 1;
+pub(crate) const CONSENT_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MonitorKey {
@@ -181,12 +181,16 @@ pub(crate) struct SettingsFile {
     pub show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     pub show_antigravity: bool,
+    #[serde(default = "default_show_grok")]
+    pub show_grok: bool,
     #[serde(default)]
     pub allow_claude_credentials: bool,
     #[serde(default)]
     pub allow_codex_credentials: bool,
     #[serde(default)]
     pub allow_antigravity_credentials: bool,
+    #[serde(default)]
+    pub allow_grok_credentials: bool,
     /// Whether the user has answered the one-time access prompt, and what
     /// they answered. The prompt covers every provider at once; the
     /// `allow_*_credentials` switches above stay per-provider so access can
@@ -210,7 +214,12 @@ pub(crate) struct SettingsFile {
     pub codex_credential_access_decided: bool,
     #[serde(default)]
     pub antigravity_credential_access_decided: bool,
-    #[serde(default = "legacy_provider_order")]
+    #[serde(default)]
+    pub grok_credential_access_decided: bool,
+    #[serde(
+        default = "legacy_provider_order",
+        deserialize_with = "deserialize_provider_order"
+    )]
     pub provider_order: Vec<TrayIconKind>,
     #[serde(default)]
     pub notify_session_reset: bool,
@@ -241,15 +250,18 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
+            show_grok: false,
             allow_claude_credentials: false,
             allow_codex_credentials: false,
             allow_antigravity_credentials: false,
+            allow_grok_credentials: false,
             credential_consent_granted: false,
             credential_consent_decided: false,
             consent_schema_version: CONSENT_SCHEMA_VERSION,
             claude_credential_access_decided: false,
             codex_credential_access_decided: false,
             antigravity_credential_access_decided: false,
+            grok_credential_access_decided: false,
             provider_order: default_provider_order(),
             notify_session_reset: false,
             notify_weekly_reset: false,
@@ -257,11 +269,41 @@ impl Default for SettingsFile {
     }
 }
 
+/// Drop provider names this build does not know instead of rejecting the file.
+///
+/// A settings file written by a newer version can name a provider that does not
+/// exist in this one. serde's default for an unknown enum variant is an error,
+/// and an error on any field fails the whole file: the loader then falls back
+/// to defaults, and the next normalized save overwrites the user's layout,
+/// language, and provider selection with them. Dropping the unknown entry is
+/// safe because `normalize_provider_order` re-appends every kind missing from a
+/// stored order.
+fn deserialize_provider_order<'de, D>(deserializer: D) -> Result<Vec<TrayIconKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeKind {
+        Known(TrayIconKind),
+        Unknown(serde::de::IgnoredAny),
+    }
+
+    Ok(Vec::<MaybeKind>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            MaybeKind::Known(kind) => Some(kind),
+            MaybeKind::Unknown(_) => None,
+        })
+        .collect())
+}
+
 pub fn default_provider_order() -> Vec<TrayIconKind> {
     vec![
         TrayIconKind::Codex,
         TrayIconKind::Claude,
         TrayIconKind::Antigravity,
+        TrayIconKind::Grok,
     ]
 }
 
@@ -270,6 +312,7 @@ fn legacy_provider_order() -> Vec<TrayIconKind> {
         TrayIconKind::Claude,
         TrayIconKind::Codex,
         TrayIconKind::Antigravity,
+        TrayIconKind::Grok,
     ]
 }
 
@@ -297,6 +340,10 @@ fn default_show_antigravity() -> bool {
     false
 }
 
+fn default_show_grok() -> bool {
+    false
+}
+
 /// The provider-visibility slice of the settings, lifted out so detection can
 /// be decided as a pure function and applied to either the persisted file or
 /// the live application state.
@@ -305,13 +352,16 @@ pub(crate) struct ProviderVisibility {
     pub show_claude_code: bool,
     pub show_codex: bool,
     pub show_antigravity: bool,
+    pub show_grok: bool,
     pub allow_claude_credentials: bool,
     pub allow_codex_credentials: bool,
     pub allow_antigravity_credentials: bool,
+    pub allow_grok_credentials: bool,
     /// Whether the user has already been told this provider exists.
     pub claude_announced: bool,
     pub codex_announced: bool,
     pub antigravity_announced: bool,
+    pub grok_announced: bool,
 }
 
 /// Turn on exactly the providers detected right after the user granted
@@ -333,14 +383,17 @@ pub(crate) fn apply_first_run_detection(
     visibility.show_claude_code = detected.claude;
     visibility.show_codex = detected.codex;
     visibility.show_antigravity = detected.antigravity;
+    visibility.show_grok = detected.grok;
     visibility.allow_claude_credentials = detected.claude;
     visibility.allow_codex_credentials = detected.codex;
     visibility.allow_antigravity_credentials = detected.antigravity;
+    visibility.allow_grok_credentials = detected.grok;
     // Enabling a provider is itself the announcement, so it is never also
     // announced by a balloon later.
     visibility.claude_announced |= detected.claude;
     visibility.codex_announced |= detected.codex;
     visibility.antigravity_announced |= detected.antigravity;
+    visibility.grok_announced |= detected.grok;
     if !detected.any() {
         visibility.show_codex = true;
         visibility.allow_codex_credentials = true;
@@ -361,12 +414,15 @@ pub(crate) fn apply_manual_detection(
     visibility.show_claude_code |= detected.claude;
     visibility.show_codex |= detected.codex;
     visibility.show_antigravity |= detected.antigravity;
+    visibility.show_grok |= detected.grok;
     visibility.allow_claude_credentials |= detected.claude;
     visibility.allow_codex_credentials |= detected.codex;
     visibility.allow_antigravity_credentials |= detected.antigravity;
+    visibility.allow_grok_credentials |= detected.grok;
     visibility.claude_announced |= detected.claude;
     visibility.codex_announced |= detected.codex;
     visibility.antigravity_announced |= detected.antigravity;
+    visibility.grok_announced |= detected.grok;
 }
 
 /// Providers that appeared after first run and have never been announced.
@@ -397,6 +453,12 @@ pub(crate) fn take_detection_announcements(
             detected.antigravity,
             visibility.show_antigravity,
             &mut visibility.antigravity_announced,
+        ),
+        (
+            TrayIconKind::Grok,
+            detected.grok,
+            visibility.show_grok,
+            &mut visibility.grok_announced,
         ),
     ] {
         if detected && !shown && !*announced {
@@ -451,7 +513,11 @@ pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
         settings.poll_interval_ms = default_poll_interval();
         repaired.push("poll_interval_ms");
     }
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    if !settings.show_claude_code
+        && !settings.show_codex
+        && !settings.show_antigravity
+        && !settings.show_grok
+    {
         settings.show_codex = true;
         repaired.push("enabled_providers");
     }
@@ -460,7 +526,7 @@ pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
     // as already announced, so the new one-time prompt and the detector never
     // second-guess a decision the user already made. Runs exactly once: the
     // schema bump below closes the door behind it.
-    if settings.consent_schema_version < CONSENT_SCHEMA_VERSION {
+    if settings.consent_schema_version < 1 {
         settings.credential_consent_granted = settings.allow_claude_credentials
             || settings.allow_codex_credentials
             || settings.allow_antigravity_credentials;
@@ -468,6 +534,17 @@ pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
         settings.claude_credential_access_decided = true;
         settings.codex_credential_access_decided = true;
         settings.antigravity_credential_access_decided = true;
+    }
+    // Grok joined after the one-time prompt shipped, so an install that
+    // already answered it never got the chance to say anything about Grok.
+    // The prompt asks about reading AI CLI credentials as a whole, so the
+    // answer carries over rather than being asked again. Announcement stays
+    // unset on purpose: the detector still owes the user one balloon before
+    // Grok may appear on any surface.
+    if settings.consent_schema_version < 2 {
+        settings.allow_grok_credentials = settings.credential_consent_granted;
+    }
+    if settings.consent_schema_version < CONSENT_SCHEMA_VERSION {
         settings.consent_schema_version = CONSENT_SCHEMA_VERSION;
         repaired.push("credential_consent");
     }
@@ -687,6 +764,50 @@ pub(crate) fn save(settings: &SettingsFile) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A provider name from a newer build must not take the whole settings file
+    /// down with it: the loader falls back to defaults on a parse error, and the
+    /// next save would then overwrite the user's layout and provider selection.
+    #[test]
+    fn unknown_provider_names_are_dropped_instead_of_failing_the_file() {
+        let json = r#"{
+            "provider_order": ["codex", "not_a_provider", "claude"],
+            "poll_interval_ms": 120000,
+            "show_antigravity": true
+        }"#;
+        let mut settings: SettingsFile =
+            serde_json::from_str(json).expect("an unknown provider must not fail the whole file");
+
+        // Everything else in the file survives, which is the point.
+        assert_eq!(settings.poll_interval_ms, 120_000);
+        assert!(settings.show_antigravity);
+        assert_eq!(
+            settings.provider_order,
+            vec![TrayIconKind::Codex, TrayIconKind::Claude]
+        );
+
+        // Normalization then restores the providers this build does know.
+        normalize(&mut settings);
+        assert_eq!(
+            settings.provider_order,
+            vec![
+                TrayIconKind::Codex,
+                TrayIconKind::Claude,
+                TrayIconKind::Antigravity,
+                TrayIconKind::Grok,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entirely_unknown_provider_order_still_loads() {
+        let json = r#"{"provider_order": ["mystery", 7, null]}"#;
+        let mut settings: SettingsFile =
+            serde_json::from_str(json).expect("unknown entries must not fail the file");
+        assert!(settings.provider_order.is_empty());
+        normalize(&mut settings);
+        assert_eq!(settings.provider_order, default_provider_order());
+    }
+
     #[test]
     fn provider_order_is_deduplicated_and_completed() {
         assert_eq!(
@@ -695,6 +816,7 @@ mod tests {
                 TrayIconKind::Codex,
                 TrayIconKind::Claude,
                 TrayIconKind::Antigravity,
+                TrayIconKind::Grok,
             ]
         );
     }
@@ -706,12 +828,14 @@ mod tests {
         assert!(!settings.show_claude_code);
         assert!(settings.show_codex);
         assert!(!settings.show_antigravity);
+        assert!(!settings.show_grok);
         assert_eq!(
             settings.provider_order,
             vec![
                 TrayIconKind::Codex,
                 TrayIconKind::Claude,
                 TrayIconKind::Antigravity,
+                TrayIconKind::Grok,
             ]
         );
     }
@@ -741,6 +865,7 @@ mod tests {
                 TrayIconKind::Antigravity,
                 TrayIconKind::Codex,
                 TrayIconKind::Claude,
+                TrayIconKind::Grok,
             ]
         );
         assert_eq!(repaired.len(), 5);
@@ -904,6 +1029,7 @@ mod tests {
                 claude: true,
                 codex: false,
                 antigravity: true,
+                grok: false,
             },
         );
 
@@ -949,6 +1075,7 @@ mod tests {
                 claude: true,
                 codex: true,
                 antigravity: false,
+                grok: false,
             },
         );
 
@@ -1022,6 +1149,7 @@ mod tests {
                 claude: true,
                 codex: false,
                 antigravity: false,
+                grok: false,
             },
         );
 

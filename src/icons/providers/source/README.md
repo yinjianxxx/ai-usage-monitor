@@ -7,6 +7,7 @@ The SVG masters in this directory are pinned from
 - `packages/static-svg/icons/claude-color.svg`
 - `packages/static-svg/icons/openai.svg`
 - `packages/static-svg/icons/antigravity-color.svg`
+- `packages/static-svg/icons/grok.svg`
 
 Lobe Icons is distributed under the MIT License. The provider marks remain
 trademarks of their respective owners. Generated PNG files are produced by

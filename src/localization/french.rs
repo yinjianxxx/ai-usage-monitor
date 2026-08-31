@@ -17,6 +17,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_model: "Claude",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    grok_model: "Grok",
     settings: "Paramètres",
     settings_storage_failed:
         "Les paramètres et les données d’utilisation en cache n’ont pas pu être enregistrés.",

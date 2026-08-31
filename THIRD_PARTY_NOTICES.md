@@ -52,9 +52,9 @@ SOFTWARE.
 - Pinned SVG source commit: `49ea6caba8ca1fadd56e7bc918cddcdc1f05aae1`
 
 The detail popup, taskbar badges, and floating monitor use SVG provider marks
-and generated 8x-supersampled, exact-DPI PNG tiles for Claude, OpenAI, and
-Antigravity from this icon set. The marks themselves remain trademarks of
-their respective owners.
+and generated 8x-supersampled, exact-DPI PNG tiles for Claude, OpenAI,
+Antigravity, and Grok from this icon set. The marks themselves remain
+trademarks of their respective owners.
 
 MIT License
 

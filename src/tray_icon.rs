@@ -23,6 +23,7 @@ const CLAUDE_TRAY_ICON_ID: u32 = 1;
 const CODEX_TRAY_ICON_ID: u32 = 2;
 const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
 const APP_TRAY_ICON_ID: u32 = 4;
+const GROK_TRAY_ICON_ID: u32 = 5;
 const APP_ICON_RESOURCE_ID: usize = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 
@@ -35,6 +36,7 @@ enum IdentityMode {
 static CLAUDE_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 static CODEX_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 static ANTIGRAVITY_LEGACY_UID: AtomicBool = AtomicBool::new(false);
+static GROK_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 static APP_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 
 const ICON_SIZE: i32 = 64;
@@ -72,6 +74,7 @@ pub enum TrayIconKind {
     Claude,
     Codex,
     Antigravity,
+    Grok,
 }
 
 pub struct TrayIconData {
@@ -82,11 +85,40 @@ pub struct TrayIconData {
 }
 
 impl TrayIconKind {
+    /// Every provider, in the canonical order used to index per-provider
+    /// storage. Adding a variant here is what makes it visible to the
+    /// settings sweep, the poll pass, and `AppUsageData`.
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Antigravity, Self::Grok];
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Position in [`Self::ALL`]. Only ever used as an array index; it is not
+    /// persisted, so the order can change without a settings migration.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Claude => 0,
+            Self::Codex => 1,
+            Self::Antigravity => 2,
+            Self::Grok => 3,
+        }
+    }
+
+    /// Fixed English name for diagnostics. Never localized: log lines are
+    /// read by whoever is debugging, not by the user.
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
+            Self::Grok => "Grok",
+        }
+    }
+
     pub(crate) fn brand(self) -> ProviderBrand {
         match self {
             Self::Claude => ProviderBrand::Claude,
             Self::Codex => ProviderBrand::Codex,
             Self::Antigravity => ProviderBrand::Antigravity,
+            Self::Grok => ProviderBrand::Grok,
         }
     }
 
@@ -95,6 +127,7 @@ impl TrayIconKind {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
             Self::Codex => CODEX_TRAY_ICON_ID,
             Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
+            Self::Grok => GROK_TRAY_ICON_ID,
         }
     }
 
@@ -103,6 +136,7 @@ impl TrayIconKind {
             CLAUDE_TRAY_ICON_ID => Some(Self::Claude),
             CODEX_TRAY_ICON_ID => Some(Self::Codex),
             ANTIGRAVITY_TRAY_ICON_ID => Some(Self::Antigravity),
+            GROK_TRAY_ICON_ID => Some(Self::Grok),
             _ => None,
         }
     }
@@ -112,6 +146,7 @@ impl TrayIconKind {
             Self::Claude => GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f01),
             Self::Codex => GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f02),
             Self::Antigravity => GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f03),
+            Self::Grok => GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f04),
         }
     }
 
@@ -120,6 +155,7 @@ impl TrayIconKind {
             Self::Claude => &CLAUDE_LEGACY_UID,
             Self::Codex => &CODEX_LEGACY_UID,
             Self::Antigravity => &ANTIGRAVITY_LEGACY_UID,
+            Self::Grok => &GROK_LEGACY_UID,
         }
     }
 
@@ -271,6 +307,11 @@ fn provider_color(kind: TrayIconKind, is_dark: bool, high_contrast: bool) -> Col
             }
         }
         TrayIconKind::Antigravity => Color::from_hex("#4285F4"),
+        // Deliberately not xAI's black-and-white: that is exactly Codex's
+        // tray colour, and two providers whose numbers render identically
+        // defeat the point of separate icons. The brand's own look is kept
+        // on the no-data tile.
+        TrayIconKind::Grok => Color::from_hex("#7C6BF5"),
     }
 }
 
@@ -293,6 +334,8 @@ fn placeholder_letter(kind: TrayIconKind) -> &'static str {
         TrayIconKind::Claude => "A",
         TrayIconKind::Codex => "O",
         TrayIconKind::Antigravity => "G",
+        // xAI, because Antigravity already holds "G".
+        TrayIconKind::Grok => "X",
     }
 }
 
@@ -848,21 +891,13 @@ fn remove_app(hwnd: HWND) {
 pub fn sync(hwnd: HWND, icons: &[TrayIconData], detailed_icons: bool, app_tooltip: &str) {
     if !detailed_icons {
         ensure_app(hwnd, app_tooltip);
-        for kind in [
-            TrayIconKind::Claude,
-            TrayIconKind::Codex,
-            TrayIconKind::Antigravity,
-        ] {
+        for kind in TrayIconKind::ALL {
             remove(hwnd, kind);
         }
         return;
     }
 
-    for kind in [
-        TrayIconKind::Claude,
-        TrayIconKind::Codex,
-        TrayIconKind::Antigravity,
-    ] {
+    for kind in TrayIconKind::ALL {
         match icons.iter().find(|icon| icon.kind.id() == kind.id()) {
             Some(icon) => ensure(hwnd, icon.kind, &icon.percents, &icon.tooltip),
             None => remove(hwnd, kind),
@@ -872,9 +907,9 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData], detailed_icons: bool, app_toolti
 }
 
 pub fn remove_all(hwnd: HWND) {
-    remove(hwnd, TrayIconKind::Claude);
-    remove(hwnd, TrayIconKind::Codex);
-    remove(hwnd, TrayIconKind::Antigravity);
+    for kind in TrayIconKind::ALL {
+        remove(hwnd, kind);
+    }
     remove_app(hwnd);
 }
 
@@ -892,6 +927,9 @@ pub fn dump_icons(dir: &str) -> i32 {
         (TrayIconKind::Antigravity, "ag-nodata", &[]),
         (TrayIconKind::Antigravity, "ag-single-60", &[60.0]),
         (TrayIconKind::Antigravity, "ag-100-95", &[100.0, 95.0]),
+        (TrayIconKind::Grok, "grok-nodata", &[]),
+        (TrayIconKind::Grok, "grok-single-23", &[23.0]),
+        (TrayIconKind::Grok, "grok-91", &[91.0]),
     ];
     if std::fs::create_dir_all(dir).is_err() {
         return 1;

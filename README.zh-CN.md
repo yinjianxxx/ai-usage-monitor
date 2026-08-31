@@ -16,13 +16,13 @@
 [![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/readme/detail-popup-zh-dark.png" alt="深色主题详情弹窗：Claude 的 7 天窗口达 92% 被标记接近上限并高亮重置时间；Codex 51% 正常；Antigravity 空闲" width="400"> <img src=".github/readme/detail-popup-zh-light.png" alt="同一详情弹窗的浅色主题" width="400">
+<img src=".github/readme/detail-popup-zh-dark.png" alt="深色主题详情弹窗：Claude 的 7 天窗口达 92% 被标记接近上限并高亮重置时间；Codex 51% 正常；Antigravity 空闲；Grok 计费周期已用 23%" width="400"> <img src=".github/readme/detail-popup-zh-light.png" alt="同一详情弹窗的浅色主题" width="400">
 
 <sub>详情弹窗的深色和浅色主题，图中还展示了接近上限时的警示样式。</sub>
 
 </div>
 
-更筹 Gengchou（读作 `gēng chóu`）把服务商实际返回的配额窗口、已用比例和重置时间直接放到 Windows 任务栏。Claude、Codex 和 Antigravity 都能实时显示；你可以选择完整的详情卡片，也可以只保留托盘数字，不必再打开各家的控制台查看配额。
+更筹 Gengchou（读作 `gēng chóu`）把服务商实际返回的配额窗口、已用比例和重置时间直接放到 Windows 任务栏。Claude、Codex、Antigravity 和 Grok 都能实时显示；你可以选择完整的详情卡片，也可以只保留托盘数字，不必再打开各家的控制台查看配额。
 
 > 烧香知夜漏，刻烛验更筹。
 >
@@ -97,7 +97,7 @@ cargo build --release --locked
 ## 视图之外
 
 - 配额数据来自各服务商实际返回的窗口和重置时间，不做猜测或外推
-- 新安装显示在本机探测到的服务商；如果一个也没探测到，会保留一个仅在本地轮询的 Codex 占位项，以便识别首次登录；此后 Claude、Codex、Google Antigravity 可任意组合启用或关闭
+- 新安装显示在本机探测到的服务商；如果一个也没探测到，会保留一个仅在本地轮询的 Codex 占位项，以便识别首次登录；此后 Claude、Codex、Google Antigravity、Grok 可任意组合启用或关闭
 - 高对比度模式下使用 Windows 系统颜色
 - 可选的重置通知（默认关闭）
 - 在 `explorer.exe` 重启和 RDP/锁屏切换后自动恢复；锁屏期间仍按既定间隔轮询，恢复时只重建本地界面，不额外发送请求
@@ -112,8 +112,9 @@ cargo build --release --locked
 - **Claude**：已登录 Windows 或 WSL 中的 Claude Code，或者已登录 Windows Claude Desktop；Desktop 存在受支持的本地会话时无需安装 CLI。Claude Code 凭据会同时检查 Windows 和所有已知可用 WSL 发行版。Windows 默认读取 `%USERPROFILE%\.claude\.credentials.json`，设置 `CLAUDE_CONFIG_DIR` 后改读该目录下的 `.credentials.json`；每个 WSL 发行版按其自身的 `CLAUDE_CONFIG_DIR` 或 `$HOME/.claude` 解析
 - **Codex**：已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持的本地会话，无需另外安装 CLI。Windows 侧读取 `%CODEX_HOME%\auth.json`（默认 `%USERPROFILE%\.codex\auth.json`）或 Windows 凭据管理器中的 Codex 条目；如均不可用，再读取**正在运行的** WSL 发行版中的 `$CODEX_HOME/auth.json`（默认 `$HOME/.codex/auth.json`）
 - **Antigravity**：已登录的 Antigravity 会话（IDE 与 CLI 共用同一条凭据）。Windows 侧读取凭据管理器中的 `gemini:antigravity`；如不可用，再读取**正在运行的** WSL 发行版中的 `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`
+- **Grok**：已登录的 grok CLI 会话。Windows 侧读取 `%GROK_HOME%\auth.json`（默认 `%USERPROFILE%\.grok\auth.json`）；如不可用，再读取**正在运行的** WSL 发行版中的 `$GROK_HOME/auth.json`（默认 `$HOME/.grok/auth.json`）。`auth.json` 可能同时保存来自多个身份提供方的登录条目，更筹只使用由 xAI 自己签发的条目，且该令牌只会发往 xAI。环境变量 `XAI_API_KEY` 不是会话登录态，不会被读取
 
-Codex 与 Antigravity 的 WSL 凭据只在发行版**已经在运行**时读取。读取停止的发行版会启动它的虚拟机，而这项检查是按计划执行的，因此更筹不会为此唤醒 WSL。需要时可先启动发行版，再从右键菜单的**服务商访问权限 → 重新探测服务商**触发一次检查。
+Codex、Antigravity 与 Grok 的 WSL 凭据只在发行版**已经在运行**时读取。读取停止的发行版会启动它的虚拟机，而这项检查是按计划执行的，因此更筹不会为此唤醒 WSL。需要时可先启动发行版，再从右键菜单的**服务商访问权限 → 重新探测服务商**触发一次检查。
 
 更筹会自动寻找可用的 Claude 会话。Anthropic 用量接口确认 Windows 侧 Claude Code 凭据失效后，更筹可在隐藏的后台进程中运行已安装 CLI 的 `claude update`（60 秒超时），确认本地凭据确实变化，再重试用量接口。如果没有可用的 CLI 凭据或根本没有安装 CLI，则改用 Windows 当前用户 Claude Desktop 会话中符合条件且尚未过期的访问令牌。两条路径均默认启用，不提供设置菜单项；WSL 凭据不会调用 Windows CLI，网络错误和限流也不会触发凭据来源切换。
 
@@ -147,7 +148,7 @@ Codex 与 Antigravity 的 WSL 凭据只在发行版**已经在运行**时读取�
 
 卸载前，如已启用**开机启动**，请先在菜单中关闭，然后删除可执行文件、`%APPDATA%\Gengchou` 和 `%LOCALAPPDATA%\Gengchou` 两个目录。
 
-网络请求会直接发往已启用且获得明确授权的服务商（Anthropic、ChatGPT/Codex、Google）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
+网络请求会直接发往已启用且获得明确授权的服务商（Anthropic、ChatGPT/Codex、Google、xAI）查询用量；检查更新或用户确认更新时还会连接 GitHub。本应用不会：
 
 - 收集分析或遥测数据，或上传任何文件；
 - 将凭据发送给签发者以外的任何一方；
@@ -171,6 +172,6 @@ Codex 与 Antigravity 的 WSL 凭据只在发行版**已经在运行**时读取�
 
 ## 致谢与许可证
 
-更筹原名 **AI Usage Monitor**，最初派生自 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) v1.4.8（提交 `9b29972`），现已独立开发（[项目起源](PROVENANCE.md)）。托盘图标的呈现方式，以及部分 Claude 用量轮询、缓存、冷却和速率限制处理，改编自或参考了 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)。本项目与 Code Zeno Pty Ltd、Anthropic、OpenAI 或 Google 不存在从属、认可或赞助关系。产品名仅用于说明兼容性；所有商标归各自权利人所有。
+更筹原名 **AI Usage Monitor**，最初派生自 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) v1.4.8（提交 `9b29972`），现已独立开发（[项目起源](PROVENANCE.md)）。托盘图标的呈现方式，以及部分 Claude 用量轮询、缓存、冷却和速率限制处理，改编自或参考了 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)。本项目与 Code Zeno Pty Ltd、Anthropic、OpenAI、Google 或 xAI 不存在从属、认可或赞助关系。产品名仅用于说明兼容性；所有商标归各自权利人所有。
 
 MIT License。保留的许可与归属声明见 [LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [DEPENDENCY_LICENSES.md](DEPENDENCY_LICENSES.md)。
