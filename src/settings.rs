@@ -216,7 +216,10 @@ pub(crate) struct SettingsFile {
     pub antigravity_credential_access_decided: bool,
     #[serde(default)]
     pub grok_credential_access_decided: bool,
-    #[serde(default = "legacy_provider_order")]
+    #[serde(
+        default = "legacy_provider_order",
+        deserialize_with = "deserialize_provider_order"
+    )]
     pub provider_order: Vec<TrayIconKind>,
     #[serde(default)]
     pub notify_session_reset: bool,
@@ -264,6 +267,35 @@ impl Default for SettingsFile {
             notify_weekly_reset: false,
         }
     }
+}
+
+/// Drop provider names this build does not know instead of rejecting the file.
+///
+/// A settings file written by a newer version can name a provider that does not
+/// exist in this one. serde's default for an unknown enum variant is an error,
+/// and an error on any field fails the whole file: the loader then falls back
+/// to defaults, and the next normalized save overwrites the user's layout,
+/// language, and provider selection with them. Dropping the unknown entry is
+/// safe because `normalize_provider_order` re-appends every kind missing from a
+/// stored order.
+fn deserialize_provider_order<'de, D>(deserializer: D) -> Result<Vec<TrayIconKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeKind {
+        Known(TrayIconKind),
+        Unknown(serde::de::IgnoredAny),
+    }
+
+    Ok(Vec::<MaybeKind>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            MaybeKind::Known(kind) => Some(kind),
+            MaybeKind::Unknown(_) => None,
+        })
+        .collect())
 }
 
 pub fn default_provider_order() -> Vec<TrayIconKind> {
@@ -731,6 +763,50 @@ pub(crate) fn save(settings: &SettingsFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider name from a newer build must not take the whole settings file
+    /// down with it: the loader falls back to defaults on a parse error, and the
+    /// next save would then overwrite the user's layout and provider selection.
+    #[test]
+    fn unknown_provider_names_are_dropped_instead_of_failing_the_file() {
+        let json = r#"{
+            "provider_order": ["codex", "not_a_provider", "claude"],
+            "poll_interval_ms": 120000,
+            "show_antigravity": true
+        }"#;
+        let mut settings: SettingsFile =
+            serde_json::from_str(json).expect("an unknown provider must not fail the whole file");
+
+        // Everything else in the file survives, which is the point.
+        assert_eq!(settings.poll_interval_ms, 120_000);
+        assert!(settings.show_antigravity);
+        assert_eq!(
+            settings.provider_order,
+            vec![TrayIconKind::Codex, TrayIconKind::Claude]
+        );
+
+        // Normalization then restores the providers this build does know.
+        normalize(&mut settings);
+        assert_eq!(
+            settings.provider_order,
+            vec![
+                TrayIconKind::Codex,
+                TrayIconKind::Claude,
+                TrayIconKind::Antigravity,
+                TrayIconKind::Grok,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entirely_unknown_provider_order_still_loads() {
+        let json = r#"{"provider_order": ["mystery", 7, null]}"#;
+        let mut settings: SettingsFile =
+            serde_json::from_str(json).expect("unknown entries must not fail the file");
+        assert!(settings.provider_order.is_empty());
+        normalize(&mut settings);
+        assert_eq!(settings.provider_order, default_provider_order());
+    }
 
     #[test]
     fn provider_order_is_deduplicated_and_completed() {

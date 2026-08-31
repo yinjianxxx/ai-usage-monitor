@@ -29,6 +29,13 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   visibility and explicit provider permission.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
+- When a release adds a provider, state the downgrade consequence in the
+  release notes. `provider_order` stores provider names, and a build that does
+  not know one of them cannot use the file: v2.5.0 and later drop the unknown
+  entry and keep the rest, but **v2.4.2 and earlier reject the whole settings
+  file**, fall back to defaults, and overwrite the user's layout, language, and
+  provider selection on the next save. Downgrading across that boundary is a
+  settings reset, not a rollback.
 - Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
   and principal dependencies and record whether an upgrade is justified.
   Between minor releases, review them immediately only for a security advisory,

@@ -66,7 +66,11 @@ the best proxy for what a fourth one touches — appears on **600 lines** across
 - `settings::SettingsFile` — `show_*`, `allow_*_credentials`, and
   `*_credential_access_decided` triples. `provider_order` needs no migration:
   `settings::normalize_provider_order` already appends any kind missing from a
-  stored order and de-duplicates it.
+  stored order and de-duplicates it. It is, however, a **persisted enum**:
+  the name written there must be readable by every build that might open the
+  file. Since v2.5.0 an unknown name is dropped rather than rejected, but a
+  build older than that fails the whole file and resets every setting, so a
+  provider addition is a one-way door for anyone who downgrades past it.
 - `compact_view::build` and `compact_view::placeholder_model` — match arms per
   kind.
 - `window.rs` — by far the largest surface; refresh states, cached widget data,
