@@ -70,7 +70,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - With Codex and Antigravity credentials only inside WSL, confirm they are read
   from a **running** distribution (`$CODEX_HOME/auth.json` and
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`) and that a stopped
-  distribution is never started by the scheduled check.
+  distribution is never started by the scheduled check. Actually place a
+  credential inside a distribution and watch it appear: this row failed
+  silently for every provider until now, because `wsl.exe --` re-parsed the
+  probe script in the login shell and dropped its quoting, and a WSL-only
+  credential is indistinguishable from an absent one on the surfaces.
 - Force a WSL credential probe spawn failure, timeout, and unexpected exit;
   each must follow the transient request-failure path and must not show an
   authentication warning. A concrete credential file that is present but

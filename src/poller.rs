@@ -1232,7 +1232,14 @@ fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialPr
         Command::new("wsl.exe")
             .arg("-d")
             .arg(distro)
-            .arg("--")
+            // `-e` and not `--`: with `--`, wsl.exe hands the remaining
+            // arguments to the distribution's login shell as one command line,
+            // which re-parses them and drops the quoting around the script. The
+            // script then runs statement by statement in that outer shell, so
+            // any variable it assigns is gone by the next statement and every
+            // path check silently fails. `-e` executes the binary directly, so
+            // the script reaches `sh -lc` as a single argument.
+            .arg("-e")
             .arg("sh")
             .arg("-lc")
             .arg(WSL_CREDENTIAL_READ_SCRIPT)
@@ -1283,7 +1290,14 @@ fn read_wsl_script_output(distro: &str, script: &'static str) -> Option<Vec<u8>>
         Command::new("wsl.exe")
             .arg("-d")
             .arg(distro)
-            .arg("--")
+            // `-e` and not `--`: with `--`, wsl.exe hands the remaining
+            // arguments to the distribution's login shell as one command line,
+            // which re-parses them and drops the quoting around the script. The
+            // script then runs statement by statement in that outer shell, so
+            // any variable it assigns is gone by the next statement and every
+            // path check silently fails. `-e` executes the binary directly, so
+            // the script reaches `sh -lc` as a single argument.
+            .arg("-e")
             .arg("sh")
             .arg("-lc")
             .arg(script)
@@ -1349,7 +1363,14 @@ fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
         Command::new("wsl.exe")
             .arg("-d")
             .arg(distro)
-            .arg("--")
+            // `-e` and not `--`: with `--`, wsl.exe hands the remaining
+            // arguments to the distribution's login shell as one command line,
+            // which re-parses them and drops the quoting around the script. The
+            // script then runs statement by statement in that outer shell, so
+            // any variable it assigns is gone by the next statement and every
+            // path check silently fails. `-e` executes the binary directly, so
+            // the script reaches `sh -lc` as a single argument.
+            .arg("-e")
             .arg("sh")
             .arg("-lc")
             .arg(WSL_CREDENTIAL_PATH_SCRIPT)
