@@ -1411,6 +1411,8 @@ struct UsageCacheFile {
     codex: Option<UsageCacheProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     antigravity: Option<UsageCacheProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grok: Option<UsageCacheProvider>,
 }
 
 struct RevisionedSnapshot<T> {
@@ -1513,20 +1515,42 @@ fn fresh_cached_provider(
     })
 }
 
-fn write_usage_cache(snapshot: &UsageCacheSnapshot) -> std::io::Result<()> {
-    let data = &snapshot.data;
-    // The on-disk shape stays a field per provider: it is a published format,
-    // and a stored key that no longer maps to a provider must stay readable.
+/// The on-disk shape stays a field per provider: it is a published format, and
+/// a stored key that no longer maps to a provider must stay readable.
+///
+/// Split from the file write so the provider-to-field mapping is testable.
+/// Forgetting one provider here is invisible at runtime - that provider simply
+/// never survives a restart - so it needs a test, not just review.
+fn usage_cache_file_from(data: &AppUsageData, saved_unix: u64) -> UsageCacheFile {
     let to_cache = |kind: tray_icon::TrayIconKind| {
         data.usage(kind)
             .map(|usage| usage_provider_to_cache(usage, data.provider(kind).updated_unix))
     };
-    let file = UsageCacheFile {
-        saved_unix: snapshot.saved_unix,
+    UsageCacheFile {
+        saved_unix,
         claude_code: to_cache(tray_icon::TrayIconKind::Claude),
         codex: to_cache(tray_icon::TrayIconKind::Codex),
         antigravity: to_cache(tray_icon::TrayIconKind::Antigravity),
-    };
+        grok: to_cache(tray_icon::TrayIconKind::Grok),
+    }
+}
+
+fn usage_cache_file_sections(
+    file: &UsageCacheFile,
+) -> [(tray_icon::TrayIconKind, Option<&UsageCacheProvider>); tray_icon::TrayIconKind::COUNT] {
+    [
+        (tray_icon::TrayIconKind::Claude, file.claude_code.as_ref()),
+        (tray_icon::TrayIconKind::Codex, file.codex.as_ref()),
+        (
+            tray_icon::TrayIconKind::Antigravity,
+            file.antigravity.as_ref(),
+        ),
+        (tray_icon::TrayIconKind::Grok, file.grok.as_ref()),
+    ]
+}
+
+fn write_usage_cache(snapshot: &UsageCacheSnapshot) -> std::io::Result<()> {
+    let file = usage_cache_file_from(&snapshot.data, snapshot.saved_unix);
     let path = usage_cache_path()?;
     let json = serde_json::to_string(&file).map_err(std::io::Error::other)?;
     settings::write_file_atomic(&path, &json).map_err(|error| {
@@ -1584,14 +1608,7 @@ fn load_usage_cache() -> Option<(AppUsageData, u64)> {
         return None;
     }
     let mut data = AppUsageData::default();
-    for (kind, cached) in [
-        (tray_icon::TrayIconKind::Claude, file.claude_code.as_ref()),
-        (tray_icon::TrayIconKind::Codex, file.codex.as_ref()),
-        (
-            tray_icon::TrayIconKind::Antigravity,
-            file.antigravity.as_ref(),
-        ),
-    ] {
+    for (kind, cached) in usage_cache_file_sections(&file) {
         if let Some((usage, updated_unix)) = fresh_cached_provider(cached, file.saved_unix, now) {
             let slot = data.provider_mut(kind);
             slot.usage = Some(usage);
@@ -16425,6 +16442,44 @@ mod reset_notification_tests {
         assert_eq!(usage.windows.len(), 1);
         assert_eq!(usage.windows[0].percentage, 12.0);
         assert_eq!(usage.windows[0].duration_seconds, Some(ONE_WEEK_SECONDS));
+    }
+
+    /// Every provider must survive the usage cache, not just the ones that
+    /// happened to be wired when the file format was last touched. A provider
+    /// missing from `UsageCacheFile` fails silently: it polls and displays
+    /// normally, and only a restart shows it lost its cached value.
+    #[test]
+    fn usage_cache_carries_every_provider() {
+        let mut data = AppUsageData::default();
+        for (index, kind) in tray_icon::TrayIconKind::ALL.into_iter().enumerate() {
+            let percent = 10.0 + index as f64;
+            let slot = data.provider_mut(kind);
+            slot.usage = Some(UsageData::from_windows(vec![UsageWindow::new(
+                percent,
+                Some(UNIX_EPOCH + Duration::from_secs(1_000 + index as u64)),
+                Some(FIVE_HOURS_SECONDS),
+            )]));
+            slot.updated_unix = Some(500 + index as u64);
+        }
+
+        let file = usage_cache_file_from(&data, 900);
+        // Round-trip through the serialized form, so a field that exists on the
+        // struct but is never written would still be caught.
+        let json = serde_json::to_string(&file).expect("cache should serialize");
+        let parsed: UsageCacheFile = serde_json::from_str(&json).expect("cache should parse");
+
+        for (index, (kind, section)) in usage_cache_file_sections(&parsed).into_iter().enumerate() {
+            let section = section
+                .unwrap_or_else(|| panic!("{kind:?} is missing from the serialized usage cache"));
+            assert_eq!(section.updated_unix, Some(500 + index as u64), "{kind:?}");
+            let restored = usage_provider_from_cache(section);
+            assert_eq!(restored.windows.len(), 1, "{kind:?}");
+            assert_eq!(
+                restored.windows[0].percentage,
+                10.0 + index as f64,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
