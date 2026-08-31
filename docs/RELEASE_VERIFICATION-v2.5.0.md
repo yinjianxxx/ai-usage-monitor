@@ -15,7 +15,7 @@
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --all-targets --locked -- -D warnings` | Pass |
 | `cargo test --locked` | Pass: 314 passed, 0 failed, 0 ignored |
-| RustSec (`cargo-audit`) | Not run locally; not installed here. CI enforces it |
+| RustSec (`cargo-audit`) | Pass in CI: 1233 advisories, 122 dependencies, 0 vulnerabilities, 0 warnings. Not run locally; not installed here |
 | `tools/check-retired-identity.ps1` | Pass (13 historical lines) |
 | current updater inbound readiness E2E | Pass |
 | updater helper E2E: `Success` | Pass |
@@ -23,6 +23,7 @@
 | `cargo build --release --locked` | Pass |
 | `tools/check-portable-runtime.ps1` | Pass |
 | preceding tag ancestry (`v2.4.2` is an ancestor of the candidate) | Pass |
+| GitHub `verify` workflow on the release candidate | Pass (run 33398398858) |
 
 The final local EXE reports FileVersion/ProductVersion `2.5.0`, ProductName
 `Gengchou`, and CompanyName `ynjmxn`. Its local pre-release SHA-256 is
@@ -115,7 +116,6 @@ returned a no-go. Its three findings were reproduced here before being fixed:
 
 ## Not verified
 
-- `cargo-audit` locally; CI is the gate.
 - Fresh-profile first run, both consent and decline paths.
 - The one-time detection notification for Grok on an upgraded profile. The
   periodic sweep runs every 30 minutes, and the run was verified by enabling
