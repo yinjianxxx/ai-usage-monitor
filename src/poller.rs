@@ -1479,43 +1479,102 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
 /// `scope` is honoured before any source is touched: every probe below is
 /// guarded by it, and `&&` short-circuits, so a provider outside the scope has
 /// none of its files, keyring entries or WSL distros read at all.
-pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
+/// The credential sources a detection pass can probe.
+///
+/// A trait only so a test can count the calls: the invariant that a provider
+/// outside the scope is never probed lives in the wiring below, not in the
+/// probes, and reading the wiring is how it was checked until now.
+trait DetectionProbes {
+    fn claude_windows(&self) -> bool;
+    fn claude_desktop(&self) -> bool;
+    fn claude_wsl(&self, running: &[String]) -> bool;
+    fn codex_windows(&self) -> bool;
+    fn codex_wsl(&self, running: &[String]) -> bool;
+    fn antigravity_windows(&self) -> bool;
+    fn antigravity_wsl(&self, running: &[String]) -> bool;
+    fn grok_windows(&self) -> bool;
+    fn grok_wsl(&self, running: &[String]) -> bool;
+}
+
+/// The real sources: a Windows file or Credential Manager entry, the Claude
+/// Desktop cache, and the running WSL distributions.
+struct LocalDetectionProbes;
+
+impl DetectionProbes for LocalDetectionProbes {
+    fn claude_windows(&self) -> bool {
+        windows_credential_source()
+            .is_some_and(|source| read_credentials_from_source(&source).is_ok())
+    }
+
+    fn claude_desktop(&self) -> bool {
+        claude_desktop::enabled() && claude_desktop::read_candidates(now_unix_millis()).is_ok()
+    }
+
+    fn claude_wsl(&self, running: &[String]) -> bool {
+        running.iter().any(|distro| {
+            read_credentials_from_source(&CredentialSource::Wsl {
+                distro: distro.clone(),
+            })
+            .is_ok()
+        })
+    }
+
+    fn codex_windows(&self) -> bool {
+        read_windows_codex_credentials().is_usable()
+    }
+
+    fn codex_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_codex_credentials_from_wsl(running).is_some()
+    }
+
+    fn antigravity_windows(&self) -> bool {
+        read_windows_antigravity_credentials().is_usable()
+    }
+
+    fn antigravity_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_antigravity_credentials_from_wsl(running).is_some()
+    }
+
+    fn grok_windows(&self) -> bool {
+        read_windows_grok_credentials().is_usable()
+    }
+
+    fn grok_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_grok_credentials_from_wsl(running).is_some()
+    }
+}
+
+/// Probe exactly the sources the scope allows.
+///
+/// `&&` short-circuits, so a `false` in the plan means the probe on its right
+/// is never called - that is the whole privacy guarantee, and
+/// `a_provider_outside_the_scope_is_never_probed` asserts it by counting.
+fn detect_with_probes(
+    scope: DetectionScope,
+    running: &[String],
+    probes: &dyn DetectionProbes,
+) -> DetectedProviders {
     let plan = detection_probe_plan(scope);
+    detect_from(DetectionInputs {
+        claude_windows: plan.claude_windows && probes.claude_windows(),
+        claude_desktop: plan.claude_desktop && probes.claude_desktop(),
+        claude_wsl: plan.claude_wsl && probes.claude_wsl(running),
+        codex_windows: plan.codex_windows && probes.codex_windows(),
+        codex_wsl: plan.codex_wsl && probes.codex_wsl(running),
+        antigravity_windows: plan.antigravity_windows && probes.antigravity_windows(),
+        antigravity_wsl: plan.antigravity_wsl && probes.antigravity_wsl(running),
+        grok_windows: plan.grok_windows && probes.grok_windows(),
+        grok_wsl: plan.grok_wsl && probes.grok_wsl(running),
+    })
+}
+
+pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
     if !scope.any() {
         diagnose::log("provider detection skipped: no provider is in scope");
         return DetectedProviders::default();
     }
     let running = list_running_wsl_distros();
-    let claude_wsl = plan.claude_wsl
-        && running.iter().any(|distro| {
-            read_credentials_from_source(&CredentialSource::Wsl {
-                distro: distro.clone(),
-            })
-            .is_ok()
-        });
-    let inputs = DetectionInputs {
-        claude_windows: plan.claude_windows
-            && windows_credential_source()
-                .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
-        claude_desktop: plan.claude_desktop
-            && claude_desktop::enabled()
-            && claude_desktop::read_candidates(now_unix_millis()).is_ok(),
-        claude_wsl,
-        codex_windows: plan.codex_windows && read_windows_codex_credentials().is_usable(),
-        codex_wsl: plan.codex_wsl
-            && !running.is_empty()
-            && read_codex_credentials_from_wsl(&running).is_some(),
-        antigravity_windows: plan.antigravity_windows
-            && read_windows_antigravity_credentials().is_usable(),
-        antigravity_wsl: plan.antigravity_wsl
-            && !running.is_empty()
-            && read_antigravity_credentials_from_wsl(&running).is_some(),
-        grok_windows: plan.grok_windows && read_windows_grok_credentials().is_usable(),
-        grok_wsl: plan.grok_wsl
-            && !running.is_empty()
-            && read_grok_credentials_from_wsl(&running).is_some(),
-    };
-    let detected = detect_from(inputs);
+    let detected = detect_with_probes(scope, &running, &LocalDetectionProbes);
     diagnose::log(format!(
         "provider detection: claude={} codex={} antigravity={} grok={} (scope: claude={} codex={} antigravity={} grok={}, running WSL distros: {})",
         detected.claude,
@@ -4225,6 +4284,101 @@ mod tests {
         assert!(!plan.codex_windows && !plan.codex_wsl);
         assert!(!plan.antigravity_windows && !plan.antigravity_wsl);
         assert!(plan.grok_windows && plan.grok_wsl);
+    }
+
+    /// Records every probe it is asked for and claims a credential exists, so
+    /// a case can assert both what was read and what was not.
+    #[derive(Default)]
+    struct RecordingProbes {
+        calls: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordingProbes {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, name: &'static str) -> bool {
+            self.calls.borrow_mut().push(name);
+            true
+        }
+    }
+
+    impl DetectionProbes for RecordingProbes {
+        fn claude_windows(&self) -> bool {
+            self.record("claude_windows")
+        }
+        fn claude_desktop(&self) -> bool {
+            self.record("claude_desktop")
+        }
+        fn claude_wsl(&self, _running: &[String]) -> bool {
+            self.record("claude_wsl")
+        }
+        fn codex_windows(&self) -> bool {
+            self.record("codex_windows")
+        }
+        fn codex_wsl(&self, _running: &[String]) -> bool {
+            self.record("codex_wsl")
+        }
+        fn antigravity_windows(&self) -> bool {
+            self.record("antigravity_windows")
+        }
+        fn antigravity_wsl(&self, _running: &[String]) -> bool {
+            self.record("antigravity_wsl")
+        }
+        fn grok_windows(&self) -> bool {
+            self.record("grok_windows")
+        }
+        fn grok_wsl(&self, _running: &[String]) -> bool {
+            self.record("grok_wsl")
+        }
+    }
+
+    /// The invariant itself, asserted by counting rather than by reading the
+    /// wiring: a provider outside the scope has no source touched at all - no
+    /// Windows file, no Credential Manager entry, no Desktop cache, no WSL
+    /// probe. The previous version of this case asserted on
+    /// `detection_probe_plan`, which is a copy of the scope and would have
+    /// stayed green if a probe had been wired up without its gate.
+    #[test]
+    fn a_provider_outside_the_scope_is_never_probed() {
+        let running = vec!["Ubuntu".to_string()];
+        for kind in TrayIconKind::ALL {
+            let mut flags = [false; TrayIconKind::COUNT];
+            flags[kind.index()] = true;
+            let probes = RecordingProbes::default();
+            let detected = detect_with_probes(DetectionScope::from_flags(flags), &running, &probes);
+
+            let expected: Vec<&'static str> = match kind {
+                TrayIconKind::Claude => vec!["claude_windows", "claude_desktop", "claude_wsl"],
+                TrayIconKind::Codex => vec!["codex_windows", "codex_wsl"],
+                TrayIconKind::Antigravity => vec!["antigravity_windows", "antigravity_wsl"],
+                TrayIconKind::Grok => vec!["grok_windows", "grok_wsl"],
+            };
+            assert_eq!(
+                probes.calls(),
+                expected,
+                "{kind:?} probed the wrong sources"
+            );
+            let mut expected_detected = DetectedProviders::default();
+            match kind {
+                TrayIconKind::Claude => expected_detected.claude = true,
+                TrayIconKind::Codex => expected_detected.codex = true,
+                TrayIconKind::Antigravity => expected_detected.antigravity = true,
+                TrayIconKind::Grok => expected_detected.grok = true,
+            }
+            assert_eq!(
+                detected, expected_detected,
+                "{kind:?} did not report itself as detected"
+            );
+        }
+
+        // Nothing in scope: no probe at all, even with a running distro and
+        // credentials that would answer yes.
+        let probes = RecordingProbes::default();
+        let detected = detect_with_probes(DetectionScope::default(), &running, &probes);
+        assert!(probes.calls().is_empty());
+        assert_eq!(detected, DetectedProviders::default());
     }
 
     #[test]

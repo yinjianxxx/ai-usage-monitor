@@ -596,6 +596,53 @@ pub(crate) struct ProviderVisibility {
     pub grok_credential_access_pending: bool,
 }
 
+impl ProviderVisibility {
+    pub(crate) fn shown(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.show_claude_code,
+            TrayIconKind::Codex => self.show_codex,
+            TrayIconKind::Antigravity => self.show_antigravity,
+            TrayIconKind::Grok => self.show_grok,
+        }
+    }
+
+    pub(crate) fn allow(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.allow_claude_credentials,
+            TrayIconKind::Codex => self.allow_codex_credentials,
+            TrayIconKind::Antigravity => self.allow_antigravity_credentials,
+            TrayIconKind::Grok => self.allow_grok_credentials,
+        }
+    }
+
+    pub(crate) fn announced(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_announced,
+            TrayIconKind::Codex => self.codex_announced,
+            TrayIconKind::Antigravity => self.antigravity_announced,
+            TrayIconKind::Grok => self.grok_announced,
+        }
+    }
+
+    pub(crate) fn revoked(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_revoked,
+            TrayIconKind::Codex => self.codex_credential_access_revoked,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_revoked,
+            TrayIconKind::Grok => self.grok_credential_access_revoked,
+        }
+    }
+
+    pub(crate) fn pending(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_pending,
+            TrayIconKind::Codex => self.codex_credential_access_pending,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_pending,
+            TrayIconKind::Grok => self.grok_credential_access_pending,
+        }
+    }
+}
+
 /// Turn on exactly the providers detected right after the user granted
 /// access.
 ///

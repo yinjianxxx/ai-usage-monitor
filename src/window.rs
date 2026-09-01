@@ -4051,39 +4051,12 @@ fn credential_access_granted(consent_granted: bool, provider_allowed: bool) -> b
     consent_granted && provider_allowed
 }
 
-fn provider_allow_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
-        tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
-        tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
-        tray_icon::TrayIconKind::Grok => state.allow_grok_credentials,
-    }
-}
-
 fn provider_pending_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
     match kind {
         tray_icon::TrayIconKind::Claude => state.claude_credential_access_pending,
         tray_icon::TrayIconKind::Codex => state.codex_credential_access_pending,
         tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_pending,
         tray_icon::TrayIconKind::Grok => state.grok_credential_access_pending,
-    }
-}
-
-fn provider_revoked_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => state.claude_credential_access_revoked,
-        tray_icon::TrayIconKind::Codex => state.codex_credential_access_revoked,
-        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_revoked,
-        tray_icon::TrayIconKind::Grok => state.grok_credential_access_revoked,
-    }
-}
-
-fn provider_announced_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    match kind {
-        tray_icon::TrayIconKind::Claude => state.claude_credential_access_decided,
-        tray_icon::TrayIconKind::Codex => state.codex_credential_access_decided,
-        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_decided,
-        tray_icon::TrayIconKind::Grok => state.grok_credential_access_decided,
     }
 }
 
@@ -4126,24 +4099,6 @@ fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> b
             state.credential_consent_decided,
             provider_has_credential_access(state, kind),
         )
-}
-
-/// Which providers a poll pass may contact, indexed like `AppUsageData`.
-///
-/// Deliberately an array rather than a tuple: the tuple version was read with
-/// `.0 || .1 || .2` at the worker gate, which silently excluded the fourth
-/// provider for a whole release. An array cannot be consumed that way by
-/// accident.
-#[cfg(test)]
-fn credential_poll_selection(
-    shown: [bool; tray_icon::TrayIconKind::COUNT],
-    allowed: [bool; tray_icon::TrayIconKind::COUNT],
-) -> [bool; tray_icon::TrayIconKind::COUNT] {
-    let mut selection = [false; tray_icon::TrayIconKind::COUNT];
-    for kind in tray_icon::TrayIconKind::ALL {
-        selection[kind.index()] = shown[kind.index()] && allowed[kind.index()];
-    }
-    selection
 }
 
 /// Whether a poll pass has anything to contact. The gate `request_poll_with`
@@ -4584,20 +4539,38 @@ fn credential_read_allowed(
 }
 
 /// Policy source of truth for every silent credential-read path.
-fn credential_read_scope(state: &AppState, reason: CredentialReadReason) -> poller::DetectionScope {
+///
+/// Split from `AppState` so the per-provider wiring is reachable from a test:
+/// `credential_read_allowed` is a pure predicate that tests already pin, but
+/// the loop that feeds it one provider's five flags is where a copy-paste
+/// reaches the wrong field - the shape that once excluded Grok from the poll
+/// gate for a whole release.
+fn credential_read_scope_for(
+    visibility: &settings::ProviderVisibility,
+    consent_granted: bool,
+    reason: CredentialReadReason,
+) -> poller::DetectionScope {
     let mut flags = [false; tray_icon::TrayIconKind::COUNT];
     for kind in tray_icon::TrayIconKind::ALL {
         flags[kind.index()] = credential_read_allowed(
-            state.credential_consent_granted,
-            provider_allow_flag(state, kind),
-            provider_revoked_flag(state, kind),
-            provider_pending_flag(state, kind),
-            provider_is_shown(state, kind),
-            provider_announced_flag(state, kind),
+            consent_granted,
+            visibility.allow(kind),
+            visibility.revoked(kind),
+            visibility.pending(kind),
+            visibility.shown(kind),
+            visibility.announced(kind),
             reason,
         );
     }
     poller::DetectionScope::from_flags(flags)
+}
+
+fn credential_read_scope(state: &AppState, reason: CredentialReadReason) -> poller::DetectionScope {
+    credential_read_scope_for(
+        &state_provider_visibility(state),
+        state.credential_consent_granted,
+        reason,
+    )
 }
 
 fn state_provider_visibility(state: &AppState) -> settings::ProviderVisibility {
@@ -11341,6 +11314,32 @@ unsafe fn arm_poll_timer(state: &mut AppState, hwnd: HWND, interval_ms: u32) {
         armed.then(|| Instant::now() + Duration::from_millis(interval_ms as u64));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialWatchOutcome {
+    /// The stored snapshot describes the providers that are still watched and
+    /// one of their credentials changed: re-poll.
+    Repoll,
+    /// The watched set changed since the stored snapshot was taken, so the two
+    /// are not comparable. Adopt the new snapshot as the baseline and do not
+    /// read a credential change into a set difference.
+    Rebaseline,
+    Unchanged,
+}
+
+/// Without the `Rebaseline` answer, narrowing the watched set - revoking a
+/// provider, hiding one - made the next tick compare snapshots of two
+/// different provider sets, report a change, and request a poll that no
+/// credential had earned.
+fn credential_watch_outcome(baseline_matches: bool, changed: bool) -> CredentialWatchOutcome {
+    if !baseline_matches {
+        CredentialWatchOutcome::Rebaseline
+    } else if changed {
+        CredentialWatchOutcome::Repoll
+    } else {
+        CredentialWatchOutcome::Unchanged
+    }
+}
+
 /// Re-poll as soon as the credentials on disk change, so re-authenticating is
 /// picked up promptly instead of waiting out the poll interval.
 ///
@@ -11366,25 +11365,39 @@ fn spawn_credential_watch_check() {
                     scope.antigravity,
                     scope.grok,
                 ) else {
+                    diagnose::log(
+                        "credential watch stopped: no provider is in scope for a credential read",
+                    );
                     s.auth_watch_active = false;
                     s.auth_watch_snapshot.clear();
                     return None;
                 };
-                Some((mode, s.auth_watch_snapshot.clone()))
+                Some((
+                    mode,
+                    s.auth_watch_mode == mode,
+                    s.auth_watch_snapshot.clone(),
+                ))
             })
         };
-        if let Some((watch_mode, previous_snapshot)) = watch {
+        if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
             let current_snapshot = poller::credential_watch_snapshot(watch_mode);
             let changed = current_snapshot != previous_snapshot;
-            if changed {
-                let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
-                    if s.auth_watch_active && s.auth_watch_mode == watch_mode {
-                        s.auth_watch_snapshot = current_snapshot;
+            match credential_watch_outcome(baseline_matches, changed) {
+                CredentialWatchOutcome::Unchanged => {}
+                outcome => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if s.auth_watch_active {
+                                s.auth_watch_mode = watch_mode;
+                                s.auth_watch_snapshot = current_snapshot;
+                            }
+                        }
+                    }
+                    if outcome == CredentialWatchOutcome::Repoll {
+                        request_poll();
                     }
                 }
-                drop(state);
-                request_poll();
             }
         }
         CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
@@ -15381,37 +15394,173 @@ mod reset_notification_tests {
         assert!(!announced);
     }
 
+    /// Build the visibility projection the scope is really derived from, so a
+    /// case states only which providers are on and in what state.
+    fn visibility(
+        shown: [bool; tray_icon::TrayIconKind::COUNT],
+        allowed: [bool; tray_icon::TrayIconKind::COUNT],
+    ) -> settings::ProviderVisibility {
+        settings::ProviderVisibility {
+            show_claude_code: shown[tray_icon::TrayIconKind::Claude.index()],
+            show_codex: shown[tray_icon::TrayIconKind::Codex.index()],
+            show_antigravity: shown[tray_icon::TrayIconKind::Antigravity.index()],
+            show_grok: shown[tray_icon::TrayIconKind::Grok.index()],
+            allow_claude_credentials: allowed[tray_icon::TrayIconKind::Claude.index()],
+            allow_codex_credentials: allowed[tray_icon::TrayIconKind::Codex.index()],
+            allow_antigravity_credentials: allowed[tray_icon::TrayIconKind::Antigravity.index()],
+            allow_grok_credentials: allowed[tray_icon::TrayIconKind::Grok.index()],
+            claude_announced: true,
+            codex_announced: true,
+            antigravity_announced: true,
+            grok_announced: true,
+            ..Default::default()
+        }
+    }
+
+    fn poll_scope(
+        shown: [bool; tray_icon::TrayIconKind::COUNT],
+        allowed: [bool; tray_icon::TrayIconKind::COUNT],
+    ) -> [bool; tray_icon::TrayIconKind::COUNT] {
+        credential_read_scope_for(
+            &visibility(shown, allowed),
+            true,
+            CredentialReadReason::Poll,
+        )
+        .flags()
+    }
+
     #[test]
-    fn credential_poll_selection_requires_visibility_and_explicit_consent() {
+    fn the_poll_scope_requires_visibility_and_explicit_consent() {
         assert_eq!(
-            credential_poll_selection([true, true, true, true], [false, false, false, false]),
+            poll_scope([true, true, true, true], [false, false, false, false]),
             [false, false, false, false]
         );
         assert_eq!(
-            credential_poll_selection([false, false, false, false], [true, true, true, true]),
+            poll_scope([false, false, false, false], [true, true, true, true]),
             [false, false, false, false]
         );
         assert_eq!(
-            credential_poll_selection([true, false, true, true], [true, true, false, true]),
+            poll_scope([true, false, true, true], [true, true, false, true]),
             [true, false, false, true]
+        );
+        // Global consent gates everything, whatever the per-provider state.
+        assert_eq!(
+            credential_read_scope_for(
+                &visibility([true, true, true, true], [true, true, true, true]),
+                false,
+                CredentialReadReason::Poll,
+            )
+            .flags(),
+            [false, false, false, false]
         );
     }
 
     /// The worker gate used to read the selection as `.0 || .1 || .2`, so a
     /// profile whose only usable provider was the fourth one never started a
     /// poll at all - a fresh install that detects Grok alone lands exactly
-    /// there. The gate is asserted here, not just the selection, because the
-    /// selection was already correct while the gate was not.
+    /// there. Asserted on the scope the running app builds, not on a test-only
+    /// copy of it: the copy stayed correct while the gate was wrong.
     #[test]
     fn a_profile_whose_only_usable_provider_is_last_still_polls() {
-        let grok_only =
-            credential_poll_selection([false, false, false, true], [false, false, false, true]);
+        let grok_only = poll_scope([false, false, false, true], [false, false, false, true]);
         assert_eq!(grok_only, [false, false, false, true]);
         assert!(poll_selection_has_target(grok_only));
-        assert!(!poll_selection_has_target(credential_poll_selection(
+        assert!(!poll_selection_has_target(poll_scope(
             [false, false, false, false],
             [true, true, true, true]
         )));
+    }
+
+    /// Each provider's five flags must reach the predicate for that same
+    /// provider. A test that only pins `credential_read_allowed` cannot see a
+    /// crossed field here, which is where this project's worst defects live.
+    #[test]
+    fn every_provider_reads_its_own_flags() {
+        for kind in tray_icon::TrayIconKind::ALL {
+            let mut shown = [false; tray_icon::TrayIconKind::COUNT];
+            shown[kind.index()] = true;
+            let mut expected = [false; tray_icon::TrayIconKind::COUNT];
+            expected[kind.index()] = true;
+            let only_this_one = visibility(shown, shown);
+            for reason in [
+                CredentialReadReason::Poll,
+                CredentialReadReason::CredentialWatch,
+                CredentialReadReason::Manual,
+            ] {
+                assert_eq!(
+                    credential_read_scope_for(&only_this_one, true, reason).flags(),
+                    expected,
+                    "{kind:?} under {reason:?}"
+                );
+            }
+
+            // A revocation must silence exactly the provider it names.
+            let all_on = [true; tray_icon::TrayIconKind::COUNT];
+            let mut revoked_one = visibility(all_on, all_on);
+            match kind {
+                tray_icon::TrayIconKind::Claude => {
+                    revoked_one.claude_credential_access_revoked = true
+                }
+                tray_icon::TrayIconKind::Codex => {
+                    revoked_one.codex_credential_access_revoked = true
+                }
+                tray_icon::TrayIconKind::Antigravity => {
+                    revoked_one.antigravity_credential_access_revoked = true
+                }
+                tray_icon::TrayIconKind::Grok => revoked_one.grok_credential_access_revoked = true,
+            }
+            let mut expected_after_revocation = all_on;
+            expected_after_revocation[kind.index()] = false;
+            assert_eq!(
+                credential_read_scope_for(&revoked_one, true, CredentialReadReason::Poll).flags(),
+                expected_after_revocation,
+                "revoking {kind:?} must not silence anyone else"
+            );
+
+            // Same for a pending review, which is a different field.
+            let mut pending_one = visibility(all_on, all_on);
+            match kind {
+                tray_icon::TrayIconKind::Claude => {
+                    pending_one.claude_credential_access_pending = true
+                }
+                tray_icon::TrayIconKind::Codex => {
+                    pending_one.codex_credential_access_pending = true
+                }
+                tray_icon::TrayIconKind::Antigravity => {
+                    pending_one.antigravity_credential_access_pending = true
+                }
+                tray_icon::TrayIconKind::Grok => pending_one.grok_credential_access_pending = true,
+            }
+            assert_eq!(
+                credential_read_scope_for(&pending_one, true, CredentialReadReason::Poll).flags(),
+                expected_after_revocation,
+                "a pending {kind:?} must not silence anyone else"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrowed_credential_watch_rebaselines_instead_of_polling() {
+        // Same watched set, a credential changed: that is what the watch is for.
+        assert_eq!(
+            credential_watch_outcome(true, true),
+            CredentialWatchOutcome::Repoll
+        );
+        assert_eq!(
+            credential_watch_outcome(true, false),
+            CredentialWatchOutcome::Unchanged
+        );
+        // The watched set itself changed, so the snapshots are not comparable.
+        // Reporting a change here spends a poll no credential earned, and the
+        // stale mode used to make the next tick do it again.
+        assert_eq!(
+            credential_watch_outcome(false, true),
+            CredentialWatchOutcome::Rebaseline
+        );
+        assert_eq!(
+            credential_watch_outcome(false, false),
+            CredentialWatchOutcome::Rebaseline
+        );
     }
 
     /// The version entry should state what is known, not offer a chore. Before

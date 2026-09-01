@@ -20,14 +20,16 @@
 ## Automated gates
 
 Run locally on Windows 11 26200 on 2026-09-01, all against the final tree: the
-version bump to `2.5.1` plus the pending-review dialog and copy fix that the
-walk-through below produced. An earlier run at `cb0ceac` reported 324 tests;
-the 20 added by `7bbdd96` and the 3 added with the dialog fix are the
-difference, so the earlier runs are superseded rather than repeated here.
+version bump to `2.5.1`, the pending-review dialog and copy fix that the
+walk-through below produced, and the test and credential-watch work that closed
+the review follow-ups. An earlier run at `cb0ceac` reported 324 tests; the 20
+added by `7bbdd96`, the 3 added with the dialog fix and the net 3 added while
+closing the follow-ups are the difference, so the earlier runs are superseded
+rather than repeated here.
 
 - `cargo fmt --all -- --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 347 passed, 0 failed
+- `cargo test --locked` - 350 passed, 0 failed
 - `cargo build --release --locked` - clean, at `target\release\gengchou.exe`.
   An intermediate run needed `CARGO_TARGET_DIR=target\release-gate` because an
   older build was still running from that path and the linker cannot replace a
@@ -453,20 +455,37 @@ Accepted and fixed in this round:
   than the context menu at large; the Chinese, Japanese and Korean variants had
   drifted further, saying only "the context menu".
 
-Reported by both reviewers and **not fixed**, recorded as follow-ups:
+Reported by both reviewers and **fixed after the walk-through**, rather than
+deferred:
 
-- `a_disabled_provider_has_no_windows_wsl_desktop_or_keyring_probes` asserts on
-  `detection_probe_plan`, which is a field-for-field copy of `DetectionScope`,
-  so it would survive a revert of the probe gate itself.
-  `a_pending_result_cannot_reenable_a_provider` asserts on `mask_detection`,
-  which this release did not change. Neither is worthless, but neither guards
-  what its name claims. The behaviour they aim at is covered at runtime by the
-  scoped smoke runs below and by
-  `pending_and_revoked_providers_are_excluded_from_every_silent_read`, which
-  does feed `pending=true` through all five reasons.
-- `credential_poll_selection` is now `#[cfg(test)]`, so the regression test
-  that commemorates the Grok-only poll gate guards a test-only helper. The
-  production path is covered by the Grok-only smoke run below, not by a test.
+- The probe gate is now asserted by counting. `detect_signed_in_providers` was
+  split into `detect_with_probes(scope, running, probes)` plus a
+  `LocalDetectionProbes` implementation that performs exactly the reads it
+  performed before; `a_provider_outside_the_scope_is_never_probed` drives it
+  with a recording stub and asserts that a provider outside the scope has no
+  Windows file, Credential Manager entry, Desktop cache or WSL probe touched at
+  all. Mutation-checked: ungating a single probe (`grok_windows`) fails it,
+  where the previous version - which asserted on `detection_probe_plan`, a copy
+  of the scope - stayed green.
+- The poll scope is now asserted on the production path. The `#[cfg(test)]`
+  `credential_poll_selection` helper, which the Grok-only regression test used
+  to exercise, is deleted; `credential_read_scope` is split into a pure
+  `credential_read_scope_for(visibility, consent, reason)` that a test can
+  drive, and `a_profile_whose_only_usable_provider_is_last_still_polls` now
+  runs through that. `every_provider_reads_its_own_flags` additionally pins the
+  per-provider wiring - each provider's shown/allow/revoked/pending/announced
+  flags must reach the predicate for that same provider, and revoking or
+  suspending one must silence exactly that one. Mutation-checked: crossing a
+  single field (reading Claude's `pending` for every provider) fails it. Three
+  `AppState` accessors left with no callers were removed.
+- The credential watch no longer spends a poll when its watched set narrows.
+  It captured a fresh mode, compared its snapshot against one taken for a
+  different set of sources, reported a change, and requested a poll - then
+  failed its own `auth_watch_mode` guard, so the snapshot was never stored and
+  the next tick repeated it until a poll corrected the mode.
+  `credential_watch_outcome` now separates `Repoll` from `Rebaseline`, and the
+  watch stores mode and snapshot together. Its deactivation path also logs,
+  since the diagnostic log is this project's audit trail for read scope.
 
 ## Owner walk-through on the machine, 2026-09-01
 
@@ -505,6 +524,13 @@ settings and cache it wrote.
   balloon was accepted by Windows and silently dropped from v2.4.1 through
   v2.5.0. Repeated on a light system theme after switching Windows over:
   balloon and its supplied image both render.
+- **Re-verified after the detection refactor.** Splitting
+  `detect_signed_in_providers` into a probe trait is behaviour-preserving on
+  paper, so it was re-run on the machine as well: a profile with Codex revoked
+  produced the sweep scope `claude=false codex=false antigravity=false
+  grok=true`, found and announced Grok, and touched no Codex source; a
+  Grok-only profile polled and wrote a cache containing only `grok`, with no
+  mention of the other three providers anywhere in its log.
 - **High Contrast on a real High Contrast desktop**, both the dark and the
   light variant, with all four surfaces open at once (taskbar widget, floating
   window, four detailed tray icons, detail popup) and one provider in
@@ -523,12 +549,13 @@ settings and cache it wrote.
 
 ## Open
 
-- Follow-ups accepted for a later release, none of them a release gate: the two
-  tests that assert on `detection_probe_plan` and `mask_detection` rather than
-  on the behaviour their names claim; `credential_poll_selection` being
-  `#[cfg(test)]`, which leaves the Grok-only poll gate covered by the smoke run
-  and not by a test; and the credential watch spending one extra poll when its
-  scope narrows mid-watch, which self-heals.
+- One follow-up remains for a later release, and it is not a release gate:
+  `a_pending_result_cannot_reenable_a_provider` still asserts on
+  `mask_detection` rather than on `apply_provider_detection`, because
+  `AppState` has no test constructor - contrary to a review claim, nothing in
+  the suite builds one. Closing it properly means giving `AppState` a test
+  builder or serializing tests around the global `STATE`, which is not work for
+  a patch release. The behaviour is covered by the revocation smoke runs.
 - Everything the release checklist can reach on this machine has been walked.
   What remains is the release itself: push, merge to `main`, tag, then the
   draft-release rows (six attachments, `SHA256SUMS`, attestation re-verify) and
