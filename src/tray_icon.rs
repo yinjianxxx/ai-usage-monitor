@@ -579,26 +579,27 @@ pub enum BalloonTone {
 /// balloon is silently dropped. Blanket-leaking is not the answer either -
 /// `load_embedded_app_icon_of_size` can fall back to `ExtractIconExW`, whose
 /// handles we own. Keep one handle per DPI instead.
-static BALLOON_ICON: Mutex<Option<(u32, isize)>> = Mutex::new(None);
+///
+/// Nothing is ever evicted. Evicting on a DPI change would destroy a handle
+/// the shell may still be about to draw - the same premature destruction this
+/// cache exists to avoid - and a caller reads its handle after releasing the
+/// lock, so a concurrent notification at another DPI could pull it out from
+/// under that caller. The set is bounded by the number of distinct DPIs the
+/// window ever reports, which is a handful.
+static BALLOON_ICONS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
 
 fn cached_balloon_icon(hwnd: HWND) -> HICON {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
-    let mut cached = BALLOON_ICON
+    let mut cached = BALLOON_ICONS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if let Some((cached_dpi, handle)) = *cached {
-        if cached_dpi == dpi {
-            return HICON(handle as *mut std::ffi::c_void);
-        }
-        unsafe {
-            let _ = DestroyIcon(HICON(handle as *mut std::ffi::c_void));
-        }
-        *cached = None;
+    if let Some((_, handle)) = cached.iter().find(|(cached_dpi, _)| *cached_dpi == dpi) {
+        return HICON(*handle as *mut std::ffi::c_void);
     }
     let icon = load_embedded_app_icon_of_size(hwnd, true);
     if !icon.is_invalid() {
-        *cached = Some((dpi, icon.0 as isize));
+        cached.push((dpi, icon.0 as isize));
     }
     icon
 }

@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1200,6 +1200,26 @@ unsafe fn revive_execute() {
     REVIVE_ATTEMPTS.store(0, Ordering::SeqCst);
     clear_reviving();
     diagnose::log("revival: complete");
+}
+
+/// Process-lifetime copy of the icons above.
+///
+/// `ExtractIconExW` hands back handles this process owns. The window class
+/// takes its pair once at startup and holds them for good, but the consent
+/// dialog can be opened again every time the user declines and then enables a
+/// provider by hand, so extracting a fresh pair per open leaked two handles
+/// each time.
+static APP_ICONS: OnceLock<(isize, isize)> = OnceLock::new();
+
+fn cached_app_icons() -> (HICON, HICON) {
+    let (large, small) = *APP_ICONS.get_or_init(|| {
+        let (large, small) = load_embedded_app_icons();
+        (large.0 as isize, small.0 as isize)
+    });
+    (
+        HICON(large as *mut std::ffi::c_void),
+        HICON(small as *mut std::ffi::c_void),
+    )
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
@@ -3926,7 +3946,7 @@ unsafe extern "system" fn credential_consent_task_dialog_callback(
     _data: isize,
 ) -> windows::core::HRESULT {
     if msg == TDN_CREATED {
-        let (large_icon, small_icon) = load_embedded_app_icons();
+        let (large_icon, small_icon) = cached_app_icons();
         if !large_icon.is_invalid() {
             let _ = SendMessageW(
                 hwnd,
