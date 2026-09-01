@@ -3333,7 +3333,8 @@ fn update_provider_refresh_state(
     }
 
     let previous_failures = state.consecutive_failures;
-    // Only a rejected existing credential is worth a balloon; see
+    // Only an existing credential that cannot be used is worth a balloon -
+    // rejected by the provider, or unreadable here; see
     // `ProviderStatus::warrants_credential_alert`.
     let auth_transition =
         status.is_some_and(ProviderStatus::warrants_credential_alert) && !state.auth_failure_active;

@@ -563,8 +563,8 @@ pub enum BalloonTone {
     /// elapsed quota window, a newly detected provider. Carries the app icon
     /// and no sound.
     Info,
-    /// Monitoring is stopped until the user acts, currently only a credential
-    /// that the provider rejected.
+    /// Monitoring is stopped until the user acts: a credential the provider
+    /// rejected, or one on this machine that cannot be used.
     ActionRequired,
 }
 

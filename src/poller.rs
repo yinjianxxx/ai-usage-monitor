@@ -336,6 +336,15 @@ struct CredentialW {
     user_name: *mut u16,
 }
 
+/// `CredReadW` reports a target that does not exist with this code; anything
+/// else it fails with means an entry is there and could not be read.
+const ERROR_NOT_FOUND: u32 = 1168;
+
+#[link(name = "Kernel32")]
+extern "system" {
+    fn GetLastError() -> u32;
+}
+
 #[link(name = "Advapi32")]
 extern "system" {
     fn CredReadW(
@@ -1330,6 +1339,13 @@ enum LocalCredential<T> {
 impl<T> LocalCredential<T> {
     fn is_usable(&self) -> bool {
         matches!(self, Self::Usable(_))
+    }
+
+    fn usable(self) -> Option<T> {
+        match self {
+            Self::Usable(value) => Some(value),
+            _ => None,
+        }
     }
 
     /// Fall back to another source, keeping the more specific verdict.
@@ -3015,18 +3031,21 @@ fn read_windows_codex_credentials() -> LocalCredential<CodexTokenData> {
             let Some(target) = codex_direct_keyring_target(&codex_home) else {
                 return LocalCredential::Missing;
             };
-            let Some(content) = read_windows_generic_credential_quiet(&target) else {
-                return LocalCredential::Missing;
-            };
-            match codex_tokens_from_auth_json(&content) {
-                Some(tokens) => {
-                    diagnose::log("loaded Codex credentials from Windows Credential Manager");
-                    LocalCredential::Usable(tokens)
-                }
-                None => {
-                    diagnose::log("Codex credentials in the Windows keyring could not be parsed");
-                    LocalCredential::Unusable
-                }
+            match read_windows_generic_credential_classified(&target) {
+                LocalCredential::Usable(content) => match codex_tokens_from_auth_json(&content) {
+                    Some(tokens) => {
+                        diagnose::log("loaded Codex credentials from Windows Credential Manager");
+                        LocalCredential::Usable(tokens)
+                    }
+                    None => {
+                        diagnose::log(
+                            "Codex credentials in the Windows keyring could not be parsed",
+                        );
+                        LocalCredential::Unusable
+                    }
+                },
+                LocalCredential::Unusable => LocalCredential::Unusable,
+                LocalCredential::Missing => LocalCredential::Missing,
             }
         });
 
@@ -3052,14 +3071,20 @@ fn read_codex_credentials() -> LocalCredential<CodexTokenData> {
 }
 
 fn read_windows_antigravity_credentials() -> LocalCredential<AntigravityTokenData> {
-    let Some(content) = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET) else {
-        return LocalCredential::Missing;
-    };
-    match antigravity_token_from_auth_json(&content) {
-        Some(tokens) => LocalCredential::Usable(tokens),
-        None => {
-            diagnose::log("Antigravity credentials in the Windows keyring could not be parsed");
-            LocalCredential::Unusable
+    match read_windows_generic_credential_classified(ANTIGRAVITY_CREDENTIAL_TARGET) {
+        LocalCredential::Usable(content) => match antigravity_token_from_auth_json(&content) {
+            Some(tokens) => LocalCredential::Usable(tokens),
+            None => {
+                diagnose::log("Antigravity credentials in the Windows keyring could not be parsed");
+                LocalCredential::Unusable
+            }
+        },
+        LocalCredential::Unusable => LocalCredential::Unusable,
+        LocalCredential::Missing => {
+            diagnose::log(format!(
+                "no Windows credential entry {ANTIGRAVITY_CREDENTIAL_TARGET}"
+            ));
+            LocalCredential::Missing
         }
     }
 }
@@ -3188,7 +3213,19 @@ fn read_windows_generic_credential(target: &str) -> Option<String> {
     result
 }
 
+/// Any failure at all, for callers that only need the bytes.
 fn read_windows_generic_credential_quiet(target: &str) -> Option<String> {
+    read_windows_generic_credential_classified(target).usable()
+}
+
+/// Read a Credential Manager entry, separating "no such entry" from an entry
+/// that is there and cannot be used.
+///
+/// Only `ERROR_NOT_FOUND` is missing. A read that fails for any other reason,
+/// an empty blob, and a blob that is not UTF-8 all mean something is stored
+/// that cannot be turned into a credential - which the user has to act on, and
+/// which used to be reported as if they had never signed in.
+fn read_windows_generic_credential_classified(target: &str) -> LocalCredential<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
     let mut target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
@@ -3203,24 +3240,43 @@ fn read_windows_generic_credential_quiet(target: &str) -> Option<String> {
         )
     };
 
-    if ok == 0 || credential.is_null() {
-        return None;
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_NOT_FOUND {
+            return LocalCredential::Missing;
+        }
+        diagnose::log(format!(
+            "Windows credential target {target} exists but could not be read (error {error})"
+        ));
+        return LocalCredential::Unusable;
+    }
+    if credential.is_null() {
+        return LocalCredential::Missing;
     }
 
-    let result = unsafe {
+    unsafe {
         let cred = &*credential;
         if cred.credential_blob_size == 0 || cred.credential_blob.is_null() {
             CredFree(credential as *mut c_void);
-            return None;
+            diagnose::log(format!(
+                "Windows credential target {target} holds an empty blob"
+            ));
+            return LocalCredential::Unusable;
         }
         let bytes =
             std::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize);
-        let text = String::from_utf8(bytes.to_vec()).ok();
+        let text = String::from_utf8(bytes.to_vec());
         CredFree(credential as *mut c_void);
-        text
-    };
-
-    result
+        match text {
+            Ok(text) => LocalCredential::Usable(text),
+            Err(_) => {
+                diagnose::log(format!(
+                    "Windows credential target {target} is not valid UTF-8"
+                ));
+                LocalCredential::Unusable
+            }
+        }
+    }
 }
 
 fn read_wsl_credentials(distro: &str) -> Result<Credentials, ClaudeCredentialProblem> {
