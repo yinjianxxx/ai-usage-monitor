@@ -113,14 +113,34 @@ shim-free binary restored `running WSL distros: 1`.
 - A provider whose credentials exist only inside WSL while WSL is stopped. That
   would require moving the owner's real credential file.
 - High Contrast on an actual High Contrast desktop.
-- Any balloon on a light system theme. See the open question below.
+- Any balloon on a light system theme.
+
+## Known limitation: the toast attribution icon is inverted
+
+Windows renders the small attribution icon in the top-left of a toast as a
+colour inversion of the tray icon it was anchored to. Established from a
+screenshot rather than assumed: the application icon's `#202124` tile inverts
+to exactly `(223, 222, 219)`, which is the value sampled from the toast, and
+the same inversion turns the orange bar teal and the blue bar orange - which
+is what made the icon look like a light-theme variant with its bars reordered.
+
+This is not a theme-selection defect. The application icon is a single fixed
+dark design (`src/icons/icon.ico`, one design at seven sizes, all within 2
+units of the same mean luminance), no code path selects a light variant for
+it, and the icon resource in the WinGet-installed v2.4.2 executable is
+identical. Only the provider tiles have dark and light variants, and only for
+Claude and Antigravity.
+
+Nothing can be done about it from here: `Shell_NotifyIcon` has no parameter for
+the attribution icon. The three other places the application icon appears - the
+notification area, the main window and detail popup title bars, and the
+credential dialog title bar - are unaffected.
+
+The balloon image that Gengchou does supply is rendered faithfully. Measured on
+an informational balloon: top bar `(235, 102, 68)`, middle `(244, 243, 243)`,
+bottom `(57, 137, 248)`, tile `(33, 33, 38)` - the source asset, not inverted.
+The owner's decision to keep the Gengchou mark in that slot therefore stands.
 
 ## Open
 
-- The application icon is a single fixed dark design (`src/icons/icon.ico`,
-  one design at seven sizes). No code path selects a light variant for it,
-  unlike the provider tiles, which have dark and light variants for Claude and
-  Antigravity. The owner reported that the icon in a notification looked like a
-  light-theme rendering while the tray icon looked correct; the cause is not
-  yet established and no change has been made.
 - `Cargo.toml` still reads `2.5.0`; bump before tagging.
