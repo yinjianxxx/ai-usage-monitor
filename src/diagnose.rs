@@ -17,7 +17,16 @@ use windows::Win32::System::Threading::{
 /// previous generation is kept as `diagnose.log.old`.
 const MAX_LOG_BYTES: u64 = 1_000_000;
 const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
-const DIAGNOSTIC_LOG_MUTEX_NAME: &str = "Global\\Gengchou-DiagnosticLog-v1";
+/// Base name of the mutex that serializes writes to one log file.
+///
+/// The file lives under `%LOCALAPPDATA%`, so it is per user, while a `Global\`
+/// name is machine wide. Two consequences, both fixed by deriving the name
+/// from the path: unrelated users no longer wait on each other, and a user who
+/// cannot create objects in the global namespace - that needs
+/// `SeCreateGlobalPrivilege`, which an ordinary interactive account does not
+/// have - falls back to the session namespace instead of losing diagnostics
+/// altogether.
+const DIAGNOSTIC_LOG_MUTEX_BASE: &str = "Gengchou-DiagnosticLog-v2";
 
 struct DiagnoseState {
     path: PathBuf,
@@ -82,13 +91,37 @@ fn log_path() -> Result<PathBuf, String> {
     Ok(base.join("Gengchou").join("diagnose.log"))
 }
 
-fn create_log_mutex() -> Result<HANDLE, String> {
-    let name: Vec<u16> = OsStr::new(DIAGNOSTIC_LOG_MUTEX_NAME)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe { CreateMutexW(None, false, PCWSTR::from_raw(name.as_ptr())) }
-        .map_err(|error| format!("Unable to create diagnostic log mutex: {error}"))
+/// The mutex names to try, most to least privileged.
+///
+/// `Global\` first so two sessions of the same account still serialize on one
+/// file; `Local\` as the fallback, which covers a session that may not create
+/// global objects. The suffix is the log path, lowercased before hashing
+/// because Windows paths compare case-insensitively.
+fn log_mutex_names(path: &Path) -> [String; 2] {
+    let key = path.to_string_lossy().to_lowercase();
+    let digest = crate::updater::sha256_hex(key.as_bytes()).unwrap_or_default();
+    let short = digest.get(..16).unwrap_or("unhashed");
+    [
+        format!("Global\\{DIAGNOSTIC_LOG_MUTEX_BASE}-{short}"),
+        format!("Local\\{DIAGNOSTIC_LOG_MUTEX_BASE}-{short}"),
+    ]
+}
+
+fn create_log_mutex(path: &Path) -> Result<HANDLE, String> {
+    let mut last_error = String::from("no mutex name was tried");
+    for name in log_mutex_names(path) {
+        let wide: Vec<u16> = OsStr::new(&name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        match unsafe { CreateMutexW(None, false, PCWSTR::from_raw(wide.as_ptr())) } {
+            Ok(handle) => return Ok(handle),
+            Err(error) => last_error = format!("{name}: {error}"),
+        }
+    }
+    Err(format!(
+        "Unable to create diagnostic log mutex ({last_error})"
+    ))
 }
 
 fn acquire_log_mutex(handle: HANDLE) -> Result<LogMutexGuard, String> {
@@ -122,7 +155,7 @@ pub fn init() -> Result<PathBuf, String> {
     let state = DiagnoseState {
         path: path.clone(),
         local_writer: Mutex::new(()),
-        cross_process_mutex: create_log_mutex()?,
+        cross_process_mutex: create_log_mutex(&path)?,
     };
     state.write_line(&format!(
         "[{} pid={}] --- diagnostic logging started v{} ---\n",
@@ -261,6 +294,37 @@ pub fn log_error(context: &str, error: impl std::fmt::Display) {
 
 #[cfg(test)]
 mod tests {
+    /// The log file is per user, so the lock that serializes writes to it must
+    /// be too. A single machine-wide name made unrelated accounts wait on each
+    /// other and, worse, gave a session that may not create global objects no
+    /// lock at all - diagnostics were then lost, silently, which is the failure
+    /// mode this log exists to expose.
+    #[test]
+    fn the_log_mutex_is_scoped_to_the_log_file() {
+        let mine = log_mutex_names(Path::new(
+            r"C:\Users\alice\AppData\Local\Gengchou\diagnose.log",
+        ));
+        let theirs = log_mutex_names(Path::new(
+            r"C:\Users\bob\AppData\Local\Gengchou\diagnose.log",
+        ));
+        assert_ne!(mine[0], theirs[0], "two users must not share one lock");
+
+        // Global first so two sessions of the same account still serialize.
+        assert!(mine[0].starts_with(r"Global\"));
+        assert!(mine[1].starts_with(r"Local\"));
+        assert_eq!(
+            mine[0].trim_start_matches(r"Global\"),
+            mine[1].trim_start_matches(r"Local\"),
+            "the fallback must lock the same thing, in a different namespace"
+        );
+
+        // Windows paths compare case-insensitively; the name must agree.
+        let shouted = log_mutex_names(Path::new(
+            r"C:\USERS\ALICE\AppData\Local\Gengchou\DIAGNOSE.LOG",
+        ));
+        assert_eq!(mine, shouted);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

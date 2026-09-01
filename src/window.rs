@@ -857,6 +857,23 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "GENGCHOU_LAST_RELAUNCH_UNIX";
 /// keeps failing. The child is flagged via `ENV_RELAUNCH` so it waits for this
 /// instance's single-instance mutex to be released before taking over (see the
 /// guard in `run`).
+/// The command a watchdog relaunch runs.
+///
+/// Split out so a test can assert what it does to the environment: this is the
+/// only child that inherits the whole environment, so it is where an update
+/// transaction's readiness marker has to be cleared. A relaunched process that
+/// inherited it would take a finished transaction for an active one and refuse
+/// to start.
+fn relaunch_command(exe: &std::path::Path, args: &[String], now: u64) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .env(ENV_RELAUNCH, "1")
+        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .env_remove(updater::UPDATE_READY_ENV);
+    command
+}
+
 fn relaunch_self() {
     // Back off if we are relaunching very soon after the relaunch that spawned
     // us: that signals the shell is crash-looping, not a one-off restart.
@@ -879,12 +896,7 @@ fn relaunch_self() {
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
+    match relaunch_command(&exe, &args, now).spawn() {
         Ok(_) => {
             diagnose::log("watchdog: relaunched fresh instance, exiting old one");
             std::process::exit(0);
@@ -1225,6 +1237,17 @@ unsafe fn revive_execute() {
     // therefore did not stop while this taskbar child was absent.
     schedule_countdown_timer();
     schedule_auto_update_check(hwnd);
+    // Timers belong to the window they were set on, so a recreated widget
+    // starts with none. The WinEvent hook that `attach_to_taskbar` reinstalls
+    // catches a drag, but the periodic sample is what notices an order change
+    // the hook missed - without this it stopped for good at the first Explorer
+    // restart.
+    arm_timer(
+        hwnd,
+        TIMER_TRAY_ORDER,
+        TRAY_ORDER_SAMPLE_MS,
+        "tray order sample",
+    );
 
     REVIVE_ATTEMPTS.store(0, Ordering::SeqCst);
     clear_reviving();
@@ -4664,6 +4687,50 @@ fn spawn_provider_detection(reason: DetectionReason) {
     });
 }
 
+/// What a finished detection pass is allowed to change.
+struct DetectionOutcome {
+    after: settings::ProviderVisibility,
+    announcements: Vec<tray_icon::TrayIconKind>,
+    changed: bool,
+}
+
+/// Decide a finished pass against the scope that is current *now*.
+///
+/// The worker sampled its scope before it started, and a provider can be
+/// revoked or moved to pending while it was out reading credentials - a WSL
+/// probe alone can take seconds. Applying the raw result would let a stale
+/// "found it" undo a revocation the user made in the meantime, and on the
+/// Manual path that also re-enables the provider, so its token goes out on the
+/// next poll. Kept as a pure function so that guarantee is testable without an
+/// `AppState`; the caller's remaining job is to sample the scope and the
+/// visibility in the same locked section it writes the answer back to.
+fn resolve_detection(
+    reason: DetectionReason,
+    detected: poller::DetectedProviders,
+    before: settings::ProviderVisibility,
+    scope: poller::DetectionScope,
+) -> DetectionOutcome {
+    let detected = mask_detection(detected, scope);
+    let mut after = before;
+    let announcements = match reason {
+        DetectionReason::FirstRun => {
+            settings::apply_first_run_detection(&mut after, detected);
+            Vec::new()
+        }
+        DetectionReason::Manual => {
+            settings::apply_manual_detection(&mut after, detected);
+            Vec::new()
+        }
+        DetectionReason::Rescan => settings::take_detection_announcements(&mut after, detected),
+    };
+    let changed = after != before;
+    DetectionOutcome {
+        after,
+        announcements,
+        changed,
+    }
+}
+
 fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedProviders) {
     let (changed, announcements, language) = {
         let mut state = lock_state();
@@ -4674,24 +4741,20 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
         if !s.credential_consent_granted {
             return;
         }
-        // A single provider can be revoked or moved to pending mid-pass too.
-        // The scope was sampled before the worker started, so a stale result
-        // must be masked against the current reason-specific scope.
-        let detected = mask_detection(detected, credential_read_scope(s, reason.into()));
-        let before = state_provider_visibility(s);
-        let mut after = before;
-        let announcements = match reason {
-            DetectionReason::FirstRun => {
-                settings::apply_first_run_detection(&mut after, detected);
-                Vec::new()
-            }
-            DetectionReason::Manual => {
-                settings::apply_manual_detection(&mut after, detected);
-                Vec::new()
-            }
-            DetectionReason::Rescan => settings::take_detection_announcements(&mut after, detected),
-        };
-        let changed = after != before;
+        // Scope, decision and write-back all inside this one lock: a
+        // revocation cannot slip between reading the scope and applying the
+        // answer.
+        let outcome = resolve_detection(
+            reason,
+            detected,
+            state_provider_visibility(s),
+            credential_read_scope(s, reason.into()),
+        );
+        let DetectionOutcome {
+            after,
+            announcements,
+            changed,
+        } = outcome;
         if changed {
             apply_provider_visibility(s, after);
             s.provider_refresh_states.reset_hidden(
@@ -15579,6 +15642,40 @@ mod reset_notification_tests {
         );
     }
 
+    /// The watchdog relaunch is the only child that inherits this process's
+    /// whole environment, so an update transaction's readiness marker has to be
+    /// cleared on its command. A relaunched process that inherited it would
+    /// treat a finished transaction as an active one and refuse to start - the
+    /// shape of the v2.4.0 startup failure. This used to be handled by removing
+    /// the variable from the running process, which Rust 2024 turns into an
+    /// `unsafe` operation because worker threads are already reading the
+    /// environment by then.
+    #[test]
+    fn a_relaunch_does_not_inherit_an_update_readiness_marker() {
+        let command = relaunch_command(
+            std::path::Path::new(r"C:\gengchou.exe"),
+            &["--flag".to_string()],
+            1_700_000_000,
+        );
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&(updater::UPDATE_READY_ENV.to_string(), None)),
+            "the readiness marker must be removed, got {envs:?}"
+        );
+        assert!(envs.contains(&(ENV_RELAUNCH.to_string(), Some("1".to_string()))));
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == ENV_LAST_RELAUNCH_UNIX && value.is_some()));
+    }
+
     /// The version entry should state what is known, not offer a chore. Before
     /// the last result was persisted it reset to "check for updates" on every
     /// launch, even though the answer from yesterday was still valid.
@@ -16195,22 +16292,110 @@ mod reset_notification_tests {
         assert!(merged.usage(tray_icon::TrayIconKind::Codex).is_none());
     }
 
-    #[test]
-    fn a_pending_result_cannot_reenable_a_provider() {
-        let found_everything = poller::DetectedProviders {
+    fn found_everything() -> poller::DetectedProviders {
+        poller::DetectedProviders {
             claude: true,
             codex: true,
             antigravity: true,
             grok: true,
-        };
-        let now_pending = poller::DetectionScope {
+        }
+    }
+
+    /// Everything in scope except Claude, which the user just revoked or left
+    /// pending while the pass was out reading credentials.
+    fn scope_without_claude() -> poller::DetectionScope {
+        poller::DetectionScope {
             claude: false,
             codex: true,
             antigravity: true,
             grok: true,
+        }
+    }
+
+    /// The race this guards: the user revokes a provider while a detection
+    /// worker is still out - a WSL probe alone can take seconds - and the
+    /// worker then reports that provider as found. Asserted on
+    /// `resolve_detection`, which is what the running app calls, rather than
+    /// on `mask_detection`, which is only the helper it uses: a revert that
+    /// dropped the mask from the decision would leave the helper untouched.
+    #[test]
+    fn a_result_that_arrives_after_a_revocation_cannot_reenable_a_provider() {
+        // Manual is the dangerous one: it assigns visibility from what it
+        // found, so an unmasked result puts the provider back on screen and
+        // back in the poll.
+        let before = settings::ProviderVisibility {
+            show_codex: true,
+            allow_codex_credentials: true,
+            codex_announced: true,
+            claude_announced: true,
+            ..Default::default()
         };
-        let applied = mask_detection(found_everything, now_pending);
-        assert!(!applied.claude);
+        let outcome = resolve_detection(
+            DetectionReason::Manual,
+            found_everything(),
+            before,
+            scope_without_claude(),
+        );
+        assert!(
+            !outcome.after.show_claude_code,
+            "a revoked provider must not be shown again by a stale result"
+        );
+        assert!(
+            !outcome.after.allow_claude_credentials,
+            "and it must not regain credential access"
+        );
+        assert!(outcome.after.show_antigravity && outcome.after.show_grok);
+    }
+
+    /// Same for the periodic sweep, where the damage would be a balloon for a
+    /// provider the user just closed rather than a re-enable.
+    #[test]
+    fn a_revoked_provider_is_not_announced_by_a_stale_sweep() {
+        let before = settings::ProviderVisibility {
+            claude_announced: false,
+            codex_announced: true,
+            antigravity_announced: true,
+            grok_announced: true,
+            ..Default::default()
+        };
+        let outcome = resolve_detection(
+            DetectionReason::Rescan,
+            found_everything(),
+            before,
+            scope_without_claude(),
+        );
+        assert!(
+            !outcome
+                .announcements
+                .contains(&tray_icon::TrayIconKind::Claude),
+            "a provider outside the scope owes no balloon"
+        );
+        assert!(!outcome.after.claude_announced);
+    }
+
+    /// First run assigns from what it found, so an out-of-scope provider must
+    /// not be assigned either - and the pass must still report no change when
+    /// the scope leaves nothing to apply.
+    #[test]
+    fn first_run_assigns_only_what_the_scope_allows() {
+        let outcome = resolve_detection(
+            DetectionReason::FirstRun,
+            found_everything(),
+            settings::ProviderVisibility::default(),
+            scope_without_claude(),
+        );
+        assert!(!outcome.after.show_claude_code && !outcome.after.allow_claude_credentials);
+        assert!(outcome.after.show_codex && outcome.after.allow_codex_credentials);
+        assert!(outcome.changed);
+
+        let nothing_in_scope = resolve_detection(
+            DetectionReason::Manual,
+            found_everything(),
+            settings::ProviderVisibility::default(),
+            poller::DetectionScope::default(),
+        );
+        assert!(!nothing_in_scope.changed);
+        assert!(nothing_in_scope.announcements.is_empty());
     }
 
     /// Build a watch set from the fixed Claude/Codex/Antigravity/Grok order

@@ -24,7 +24,7 @@ const RELEASE_ASSET_NAME: &str = "gengchou.exe";
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
-const UPDATE_READY_ENV: &str = "GENGCHOU_UPDATE_READY_FILE";
+pub(crate) const UPDATE_READY_ENV: &str = "GENGCHOU_UPDATE_READY_FILE";
 #[cfg(debug_assertions)]
 const UPDATE_TEST_READY_DIR_ENV: &str = "GENGCHOU_UPDATE_TEST_READY_DIR";
 #[cfg(debug_assertions)]
@@ -401,8 +401,13 @@ pub fn confirm_update_ready() -> Result<(), String> {
         (|| {
             validate_ready_marker_path(&marker)?;
             write_ready_marker(&marker)?;
-            // Do not let a later helper inherit a marker for this transaction.
-            std::env::remove_var(UPDATE_READY_ENV);
+            // A later child must not inherit this transaction's marker. Every
+            // process this app starts clears the variable on its own command -
+            // the helper at `spawn_update_helper`, the update spawn, and the
+            // watchdog relaunch, which is the only one that inherits the whole
+            // environment. Removing it from this process instead would be a
+            // global mutation while worker threads are already running, which
+            // Rust 2024 makes an `unsafe` operation for exactly that reason.
             Ok(())
         })()
     } else {
