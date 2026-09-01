@@ -29,8 +29,9 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, TASKDIALOGCONFIG,
-    TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TASKDIALOG_NOTIFICATIONS, TDCBF_NO_BUTTON,
-    TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED, TDN_CREATED,
+    TASKDIALOG_BUTTON, TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TASKDIALOG_NOTIFICATIONS,
+    TDCBF_NO_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED,
+    TDF_USE_COMMAND_LINKS, TDN_CREATED,
 };
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -222,6 +223,10 @@ struct AppState {
     codex_credential_access_revoked: bool,
     antigravity_credential_access_revoked: bool,
     grok_credential_access_revoked: bool,
+    claude_credential_access_pending: bool,
+    codex_credential_access_pending: bool,
+    antigravity_credential_access_pending: bool,
+    grok_credential_access_pending: bool,
     provider_order: Vec<tray_icon::TrayIconKind>,
     pending_provider_order: Option<Vec<tray_icon::TrayIconKind>>,
     pending_provider_order_samples: u8,
@@ -1741,6 +1746,11 @@ fn save_state_settings() {
                 codex_credential_access_revoked: s.codex_credential_access_revoked,
                 antigravity_credential_access_revoked: s.antigravity_credential_access_revoked,
                 grok_credential_access_revoked: s.grok_credential_access_revoked,
+                claude_credential_access_pending: s.claude_credential_access_pending,
+                codex_credential_access_pending: s.codex_credential_access_pending,
+                antigravity_credential_access_pending: s.antigravity_credential_access_pending,
+                grok_credential_access_pending: s.grok_credential_access_pending,
+                incoming: settings::IncomingAccess::Canonical,
                 provider_order: s.provider_order.clone(),
                 notify_session_reset: s.notify_session_reset,
                 notify_weekly_reset: s.notify_weekly_reset,
@@ -3461,19 +3471,16 @@ fn update_refresh_states_for_pass(
 fn merge_missing_provider_data(
     previous: Option<&AppUsageData>,
     mut next: AppUsageData,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    show_grok: bool,
+    keep: [bool; tray_icon::TrayIconKind::COUNT],
 ) -> AppUsageData {
+    for kind in tray_icon::TrayIconKind::ALL {
+        if !keep[kind.index()] {
+            *next.provider_mut(kind) = Default::default();
+        }
+    }
     if let Some(previous) = previous {
-        for (kind, shown) in [
-            (tray_icon::TrayIconKind::Claude, show_claude_code),
-            (tray_icon::TrayIconKind::Codex, show_codex),
-            (tray_icon::TrayIconKind::Antigravity, show_antigravity),
-            (tray_icon::TrayIconKind::Grok, show_grok),
-        ] {
-            if shown && next.provider(kind).usage.is_none() {
+        for kind in tray_icon::TrayIconKind::ALL {
+            if keep[kind.index()] && next.provider(kind).usage.is_none() {
                 let carried = previous.provider(kind).clone();
                 let slot = next.provider_mut(kind);
                 slot.usage = carried.usage;
@@ -3661,7 +3668,7 @@ impl PollPassPlan {
             now,
         );
         // Mirrors `state_credential_poll_selection`; see the note there.
-        let selection = state_credential_poll_selection(state);
+        let selection = credential_read_scope(state, CredentialReadReason::Poll).flags();
         let show_claude_code = selection[tray_icon::TrayIconKind::Claude.index()];
         let show_codex = selection[tray_icon::TrayIconKind::Codex.index()];
         let show_antigravity = selection[tray_icon::TrayIconKind::Antigravity.index()];
@@ -4044,6 +4051,42 @@ fn credential_access_granted(consent_granted: bool, provider_allowed: bool) -> b
     consent_granted && provider_allowed
 }
 
+fn provider_allow_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.allow_claude_credentials,
+        tray_icon::TrayIconKind::Codex => state.allow_codex_credentials,
+        tray_icon::TrayIconKind::Antigravity => state.allow_antigravity_credentials,
+        tray_icon::TrayIconKind::Grok => state.allow_grok_credentials,
+    }
+}
+
+fn provider_pending_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.claude_credential_access_pending,
+        tray_icon::TrayIconKind::Codex => state.codex_credential_access_pending,
+        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_pending,
+        tray_icon::TrayIconKind::Grok => state.grok_credential_access_pending,
+    }
+}
+
+fn provider_revoked_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.claude_credential_access_revoked,
+        tray_icon::TrayIconKind::Codex => state.codex_credential_access_revoked,
+        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_revoked,
+        tray_icon::TrayIconKind::Grok => state.grok_credential_access_revoked,
+    }
+}
+
+fn provider_announced_flag(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
+        tray_icon::TrayIconKind::Claude => state.claude_credential_access_decided,
+        tray_icon::TrayIconKind::Codex => state.codex_credential_access_decided,
+        tray_icon::TrayIconKind::Antigravity => state.antigravity_credential_access_decided,
+        tray_icon::TrayIconKind::Grok => state.grok_credential_access_decided,
+    }
+}
+
 /// A provider that is visible but has no access sits on a placeholder with no
 /// explanation, so the detail popup says how to turn it back on.
 ///
@@ -4077,11 +4120,12 @@ fn provider_is_shown(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
 }
 
 fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    access_is_revoked(
-        provider_is_shown(state, kind),
-        state.credential_consent_decided,
-        provider_has_credential_access(state, kind),
-    )
+    !provider_pending_flag(state, kind)
+        && access_is_revoked(
+            provider_is_shown(state, kind),
+            state.credential_consent_decided,
+            provider_has_credential_access(state, kind),
+        )
 }
 
 /// Which providers a poll pass may contact, indexed like `AppUsageData`.
@@ -4090,6 +4134,7 @@ fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> b
 /// `.0 || .1 || .2` at the worker gate, which silently excluded the fourth
 /// provider for a whole release. An array cannot be consumed that way by
 /// accident.
+#[cfg(test)]
 fn credential_poll_selection(
     shown: [bool; tray_icon::TrayIconKind::COUNT],
     allowed: [bool; tray_icon::TrayIconKind::COUNT],
@@ -4112,13 +4157,7 @@ fn state_credential_poll_selection(state: &AppState) -> [bool; tray_icon::TrayIc
     // a poll worker starts at all, that decides what the pass targets. If the
     // two disagree a worker can start with nothing to do, or worse, a target
     // can be polled without a running worker to commit it.
-    let mut shown = [false; tray_icon::TrayIconKind::COUNT];
-    let mut allowed = [false; tray_icon::TrayIconKind::COUNT];
-    for kind in tray_icon::TrayIconKind::ALL {
-        shown[kind.index()] = provider_is_shown(state, kind);
-        allowed[kind.index()] = provider_has_credential_access(state, kind);
-    }
-    credential_poll_selection(shown, allowed)
+    credential_read_scope(state, CredentialReadReason::Poll).flags()
 }
 
 fn clear_provider_usage(state: &mut AppState, kind: tray_icon::TrayIconKind) {
@@ -4153,6 +4192,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                     s.allow_claude_credentials = allowed;
                     s.claude_credential_access_decided = true;
                     s.claude_credential_access_revoked = !allowed;
+                    s.claude_credential_access_pending = false;
                     if allowed {
                         s.show_claude_code = true;
                     }
@@ -4161,6 +4201,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                     s.allow_codex_credentials = allowed;
                     s.codex_credential_access_decided = true;
                     s.codex_credential_access_revoked = !allowed;
+                    s.codex_credential_access_pending = false;
                     if allowed {
                         s.show_codex = true;
                     }
@@ -4169,6 +4210,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                     s.allow_antigravity_credentials = allowed;
                     s.antigravity_credential_access_decided = true;
                     s.antigravity_credential_access_revoked = !allowed;
+                    s.antigravity_credential_access_pending = false;
                     if allowed {
                         s.show_antigravity = true;
                     }
@@ -4177,6 +4219,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                     s.allow_grok_credentials = allowed;
                     s.grok_credential_access_decided = true;
                     s.grok_credential_access_revoked = !allowed;
+                    s.grok_credential_access_pending = false;
                     if allowed {
                         s.show_grok = true;
                     }
@@ -4271,6 +4314,127 @@ fn show_credential_consent_prompt(hwnd: HWND, language: LanguageId) -> bool {
     allowed
 }
 
+/// Ask whether a LegacyNeedsReview provider may be read. `Some(true)` allows
+/// access, `Some(false)` keeps it closed, `None` leaves the pending state.
+fn confirm_pending_provider_access(
+    hwnd: HWND,
+    kind: tray_icon::TrayIconKind,
+    language: LanguageId,
+) -> Option<bool> {
+    let strings = language.strings();
+    let provider = localized_provider_name(kind, strings);
+    let title = strings.pending_access_title.replace("{provider}", provider);
+    let message = strings.pending_access_body.replace("{provider}", provider);
+    diagnose::log(format!(
+        "showing pending access review for {}",
+        kind.diagnostic_label()
+    ));
+    let answered = unsafe {
+        let title_wide = native_interop::wide_str(&title);
+        let message_wide = native_interop::wide_str(&message);
+        let allow_wide = native_interop::wide_str(strings.access_allow);
+        let keep_wide = native_interop::wide_str(strings.access_keep_closed);
+        let buttons = [
+            TASKDIALOG_BUTTON {
+                nButtonID: IDYES.0,
+                pszButtonText: PCWSTR::from_raw(allow_wide.as_ptr()),
+            },
+            TASKDIALOG_BUTTON {
+                nButtonID: IDNO.0,
+                pszButtonText: PCWSTR::from_raw(keep_wide.as_ptr()),
+            },
+        ];
+        let config = TASKDIALOGCONFIG {
+            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            hwndParent: hwnd,
+            dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS,
+            pszWindowTitle: PCWSTR::from_raw(title_wide.as_ptr()),
+            pszMainInstruction: PCWSTR::from_raw(title_wide.as_ptr()),
+            pszContent: PCWSTR::from_raw(message_wide.as_ptr()),
+            cButtons: buttons.len() as u32,
+            pButtons: buttons.as_ptr(),
+            nDefaultButton: IDNO.0,
+            pfCallback: Some(credential_consent_task_dialog_callback),
+            ..Default::default()
+        };
+        let mut selected_button = IDNO.0;
+        match call_task_dialog_indirect_if_available(&config, &mut selected_button) {
+            Some(result) if result.is_ok() => match selected_button {
+                id if id == IDYES.0 => Some(true),
+                id if id == IDNO.0 => Some(false),
+                _ => None,
+            },
+            result => {
+                diagnose::log(format!(
+                    "pending access task dialog unavailable ({}); using message box fallback",
+                    result
+                        .map(|error| windows::core::Error::from(error).to_string())
+                        .unwrap_or_else(|| "TaskDialogIndirect entry point missing".to_string())
+                ));
+                match MessageBoxW(
+                    hwnd,
+                    PCWSTR::from_raw(message_wide.as_ptr()),
+                    PCWSTR::from_raw(title_wide.as_ptr()),
+                    MB_YESNOCANCEL | MB_DEFBUTTON2 | MB_ICONQUESTION,
+                ) {
+                    IDYES => Some(true),
+                    IDNO => Some(false),
+                    _ => None,
+                }
+            }
+        }
+    };
+    diagnose::log(format!(
+        "{} pending access review: {}",
+        kind.diagnostic_label(),
+        match answered {
+            Some(true) => "allow",
+            Some(false) => "keep closed",
+            None => "cancelled",
+        }
+    ));
+    answered
+}
+
+fn review_pending_provider(hwnd: HWND, kind: tray_icon::TrayIconKind) {
+    let language = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language)
+            .unwrap_or(LanguageId::English)
+    };
+    if !ensure_credential_consent(hwnd) {
+        return;
+    }
+    match confirm_pending_provider_access(hwnd, kind, language) {
+        Some(true) => set_provider_credential_access(kind, true),
+        Some(false) => set_provider_credential_access(kind, false),
+        None => {}
+    }
+}
+
+fn confirm_pending_providers_for_manual(hwnd: HWND) {
+    let (language, pending) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        let pending = tray_icon::TrayIconKind::ALL
+            .into_iter()
+            .filter(|kind| provider_pending_flag(s, *kind))
+            .collect::<Vec<_>>();
+        (s.language, pending)
+    };
+    for kind in pending {
+        match confirm_pending_provider_access(hwnd, kind, language) {
+            Some(true) => set_provider_credential_access(kind, true),
+            Some(false) => set_provider_credential_access(kind, false),
+            None => {}
+        }
+    }
+}
+
 /// Record the answer to the one-time prompt.
 ///
 /// Declining clears every provider's usage so nothing read under a previous
@@ -4356,6 +4520,64 @@ enum DetectionReason {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialReadReason {
+    FirstRun,
+    Rescan,
+    Manual,
+    Poll,
+    CredentialWatch,
+}
+
+impl From<DetectionReason> for CredentialReadReason {
+    fn from(reason: DetectionReason) -> Self {
+        match reason {
+            DetectionReason::FirstRun => Self::FirstRun,
+            DetectionReason::Rescan => Self::Rescan,
+            DetectionReason::Manual => Self::Manual,
+        }
+    }
+}
+
+fn credential_read_allowed(
+    consent_granted: bool,
+    allow: bool,
+    revoked: bool,
+    pending: bool,
+    shown: bool,
+    announced: bool,
+    reason: CredentialReadReason,
+) -> bool {
+    if !consent_granted {
+        return false;
+    }
+    match reason {
+        CredentialReadReason::FirstRun => !revoked && !pending,
+        CredentialReadReason::Rescan => !revoked && !pending && !shown && !announced,
+        CredentialReadReason::Manual => allow && !revoked && !pending,
+        CredentialReadReason::Poll | CredentialReadReason::CredentialWatch => {
+            shown && allow && !revoked && !pending
+        }
+    }
+}
+
+/// Policy source of truth for every silent credential-read path.
+fn credential_read_scope(state: &AppState, reason: CredentialReadReason) -> poller::DetectionScope {
+    let mut flags = [false; tray_icon::TrayIconKind::COUNT];
+    for kind in tray_icon::TrayIconKind::ALL {
+        flags[kind.index()] = credential_read_allowed(
+            state.credential_consent_granted,
+            provider_allow_flag(state, kind),
+            provider_revoked_flag(state, kind),
+            provider_pending_flag(state, kind),
+            provider_is_shown(state, kind),
+            provider_announced_flag(state, kind),
+            reason,
+        );
+    }
+    poller::DetectionScope::from_flags(flags)
+}
+
 fn state_provider_visibility(state: &AppState) -> settings::ProviderVisibility {
     settings::ProviderVisibility {
         show_claude_code: state.show_claude_code,
@@ -4370,6 +4592,14 @@ fn state_provider_visibility(state: &AppState) -> settings::ProviderVisibility {
         codex_announced: state.codex_credential_access_decided,
         antigravity_announced: state.antigravity_credential_access_decided,
         grok_announced: state.grok_credential_access_decided,
+        claude_credential_access_revoked: state.claude_credential_access_revoked,
+        codex_credential_access_revoked: state.codex_credential_access_revoked,
+        antigravity_credential_access_revoked: state.antigravity_credential_access_revoked,
+        grok_credential_access_revoked: state.grok_credential_access_revoked,
+        claude_credential_access_pending: state.claude_credential_access_pending,
+        codex_credential_access_pending: state.codex_credential_access_pending,
+        antigravity_credential_access_pending: state.antigravity_credential_access_pending,
+        grok_credential_access_pending: state.grok_credential_access_pending,
     }
 }
 
@@ -4386,26 +4616,14 @@ fn apply_provider_visibility(state: &mut AppState, visibility: settings::Provide
     state.codex_credential_access_decided = visibility.codex_announced;
     state.antigravity_credential_access_decided = visibility.antigravity_announced;
     state.grok_credential_access_decided = visibility.grok_announced;
-}
-
-/// Detection shells out to `wsl.exe` and reads the Windows keyring, so it runs
-/// on its own short-lived thread and never on the UI thread.
-/// Providers a detection pass may read credentials for.
-///
-/// Access is granted for every provider at once, but the Provider access menu
-/// revokes one at a time. Without this, the sweep at startup and the one every
-/// half hour would read a revoked provider's credentials for as long as the
-/// app runs. Only an explicit revocation narrows the scope - see
-/// `AppState::claude_credential_access_revoked` for why the `allow_*` switch
-/// on its own would also exclude providers an old install was never asked
-/// about, and so would hide a provider the user installed later.
-fn detection_scope(state: &AppState) -> poller::DetectionScope {
-    poller::DetectionScope {
-        claude: !state.claude_credential_access_revoked,
-        codex: !state.codex_credential_access_revoked,
-        antigravity: !state.antigravity_credential_access_revoked,
-        grok: !state.grok_credential_access_revoked,
-    }
+    state.claude_credential_access_revoked = visibility.claude_credential_access_revoked;
+    state.codex_credential_access_revoked = visibility.codex_credential_access_revoked;
+    state.antigravity_credential_access_revoked = visibility.antigravity_credential_access_revoked;
+    state.grok_credential_access_revoked = visibility.grok_credential_access_revoked;
+    state.claude_credential_access_pending = visibility.claude_credential_access_pending;
+    state.codex_credential_access_pending = visibility.codex_credential_access_pending;
+    state.antigravity_credential_access_pending = visibility.antigravity_credential_access_pending;
+    state.grok_credential_access_pending = visibility.grok_credential_access_pending;
 }
 
 /// Drop whatever a pass found for providers that are no longer in scope.
@@ -4421,6 +4639,8 @@ fn mask_detection(
     }
 }
 
+/// Detection shells out to `wsl.exe` and reads the Windows keyring, so it runs
+/// on its own short-lived thread and never on the UI thread.
 fn spawn_provider_detection(reason: DetectionReason) {
     let scope = {
         let state = lock_state();
@@ -4430,7 +4650,12 @@ fn spawn_provider_detection(reason: DetectionReason) {
         if !s.credential_consent_granted {
             return;
         }
-        detection_scope(s)
+        let scope = credential_read_scope(s, reason.into());
+        diagnose::log(format!(
+            "provider detection starting reason={reason:?} scope: claude={} codex={} antigravity={} grok={}",
+            scope.claude, scope.codex, scope.antigravity, scope.grok
+        ));
+        scope
     };
     std::thread::spawn(move || {
         let detected = poller::detect_signed_in_providers(scope);
@@ -4448,12 +4673,10 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
         if !s.credential_consent_granted {
             return;
         }
-        // A single provider can be revoked mid-pass too. The scope was
-        // sampled before the worker started, so a stale result could
-        // otherwise re-enable a provider the user just turned off - manual
-        // detection assigns `allow_*` from what it found - and send its token
-        // on the poll that follows.
-        let detected = mask_detection(detected, detection_scope(s));
+        // A single provider can be revoked or moved to pending mid-pass too.
+        // The scope was sampled before the worker started, so a stale result
+        // must be masked against the current reason-specific scope.
+        let detected = mask_detection(detected, credential_read_scope(s, reason.into()));
         let before = state_provider_visibility(s);
         let mut after = before;
         let announcements = match reason {
@@ -4853,7 +5076,14 @@ fn detail_popup_snapshot() -> DetailPopupState {
         // "waiting for usage data" row forever. Say what happened and where
         // to undo it. Applied here rather than inside the group builder
         // because permission is application state, not poll state.
-        if provider_access_revoked(s, kind) {
+        if provider_pending_flag(s, kind) {
+            group.hint = Some(DetailHint {
+                action: strings
+                    .detail_access_pending_hint
+                    .replace("{provider}", name),
+                outcome: strings.detail_access_pending_outcome.to_string(),
+            });
+        } else if provider_access_revoked(s, kind) {
             group.hint = Some(DetailHint {
                 action: strings
                     .detail_access_revoked_hint
@@ -11102,10 +11332,23 @@ fn spawn_credential_watch_check() {
     }
     std::thread::spawn(|| {
         let watch = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| {
-                s.auth_watch_active
-                    .then(|| (s.auth_watch_mode, s.auth_watch_snapshot.clone()))
+            let mut state = lock_state();
+            state.as_mut().and_then(|s| {
+                if !s.auth_watch_active {
+                    return None;
+                }
+                let scope = credential_read_scope(s, CredentialReadReason::CredentialWatch);
+                let Some(mode) = credential_watch_mode_for_shown(
+                    scope.claude,
+                    scope.codex,
+                    scope.antigravity,
+                    scope.grok,
+                ) else {
+                    s.auth_watch_active = false;
+                    s.auth_watch_snapshot.clear();
+                    return None;
+                };
+                Some((mode, s.auth_watch_snapshot.clone()))
             })
         };
         if let Some((watch_mode, previous_snapshot)) = watch {
@@ -11658,6 +11901,11 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 antigravity_credential_access_revoked: settings
                     .antigravity_credential_access_revoked,
                 grok_credential_access_revoked: settings.grok_credential_access_revoked,
+                claude_credential_access_pending: settings.claude_credential_access_pending,
+                codex_credential_access_pending: settings.codex_credential_access_pending,
+                antigravity_credential_access_pending: settings
+                    .antigravity_credential_access_pending,
+                grok_credential_access_pending: settings.grok_credential_access_pending,
                 provider_order: settings.provider_order.clone(),
                 pending_provider_order: None,
                 pending_provider_order_samples: 0,
@@ -12317,10 +12565,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 let merged = merge_missing_provider_data(
                     s.data.as_ref(),
                     data,
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.show_grok,
+                    credential_read_scope(s, CredentialReadReason::Poll).flags(),
                 );
                 // A cached previous snapshot is from an earlier run: any
                 // reset that elapsed while the app was closed is old news,
@@ -12536,10 +12781,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     let merged = merge_missing_provider_data(
                         s.data.as_ref(),
                         failed_data,
-                        s.show_claude_code,
-                        s.show_codex,
-                        s.show_antigravity,
-                        s.show_grok,
+                        credential_read_scope(s, CredentialReadReason::Poll).flags(),
                     );
                     s.data = Some(merged);
                     s.manual_refresh_in_progress = false;
@@ -13532,7 +13774,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         IDM_MODEL_GROK => tray_icon::TrayIconKind::Grok,
                         _ => unreachable!(),
                     };
-                    {
+                    let (is_shown, pending) = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             match id {
@@ -13583,58 +13825,31 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             set_widget_placeholders(s, "...");
                             s.pending_provider_order = None;
                             s.pending_provider_order_samples = 0;
-                            let is_shown = match kind {
-                                tray_icon::TrayIconKind::Claude => s.show_claude_code,
-                                tray_icon::TrayIconKind::Codex => s.show_codex,
-                                tray_icon::TrayIconKind::Antigravity => s.show_antigravity,
-                                tray_icon::TrayIconKind::Grok => s.show_grok,
-                            };
-                            // Turning a provider on is a request to monitor
-                            // it, so it also restores access. Without this the
-                            // provider would appear and immediately report
-                            // that its access was declined.
-                            let grant = is_shown && s.credential_consent_granted;
+                            let is_shown = provider_is_shown(s, kind);
+                            let pending = provider_pending_flag(s, kind);
                             match kind {
                                 tray_icon::TrayIconKind::Claude => {
-                                    s.allow_claude_credentials |= grant;
-                                    // Toggling by hand settles whether the user
-                                    // knows this provider exists, so detection
-                                    // never announces it afterwards.
                                     s.claude_credential_access_decided = true;
-                                    // Showing a provider again restores access,
-                                    // so it is no longer revoked. Leaving the
-                                    // flag set would let access and detection
-                                    // drift apart: polled and read, yet never
-                                    // detectable again.
-                                    if grant {
-                                        s.claude_credential_access_revoked = false;
-                                    }
                                 }
                                 tray_icon::TrayIconKind::Codex => {
-                                    s.allow_codex_credentials |= grant;
                                     s.codex_credential_access_decided = true;
-                                    if grant {
-                                        s.codex_credential_access_revoked = false;
-                                    }
                                 }
                                 tray_icon::TrayIconKind::Antigravity => {
-                                    s.allow_antigravity_credentials |= grant;
                                     s.antigravity_credential_access_decided = true;
-                                    if grant {
-                                        s.antigravity_credential_access_revoked = false;
-                                    }
                                 }
                                 tray_icon::TrayIconKind::Grok => {
-                                    s.allow_grok_credentials |= grant;
                                     s.grok_credential_access_decided = true;
-                                    if grant {
-                                        s.grok_credential_access_revoked = false;
-                                    }
                                 }
                             }
+                            (is_shown, pending)
+                        } else {
+                            (false, false)
                         }
-                    }
+                    };
                     save_state_settings();
+                    if is_shown && pending {
+                        review_pending_provider(hwnd, kind);
+                    }
                     position_at_taskbar();
                     render_layered();
                     refresh_floating_monitor();
@@ -13644,6 +13859,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 }
                 IDM_REDETECT_PROVIDERS => {
                     if ensure_credential_consent(hwnd) {
+                        confirm_pending_providers_for_manual(hwnd);
                         spawn_provider_detection(DetectionReason::Manual);
                     }
                 }
@@ -13658,17 +13874,21 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         IDM_ACCESS_GROK => tray_icon::TrayIconKind::Grok,
                         _ => unreachable!(),
                     };
-                    let currently_allowed = {
+                    let (currently_allowed, pending) = {
                         let state = lock_state();
                         state
                             .as_ref()
-                            .is_some_and(|s| provider_has_credential_access(s, kind))
+                            .map(|s| {
+                                (
+                                    provider_has_credential_access(s, kind),
+                                    provider_pending_flag(s, kind),
+                                )
+                            })
+                            .unwrap_or((false, false))
                     };
-                    // Access was already granted once for every provider, so
-                    // restoring one is a plain toggle - unless the one-time
-                    // prompt was declined, in which case it has to be asked
-                    // again before anything is read.
-                    if currently_allowed {
+                    if pending {
+                        review_pending_provider(hwnd, kind);
+                    } else if currently_allowed {
                         set_provider_credential_access(kind, false);
                     } else if ensure_credential_consent(hwnd) {
                         set_provider_credential_access(kind, true);
@@ -13868,6 +14088,10 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             allow_codex_credentials,
             allow_antigravity_credentials,
             allow_grok_credentials,
+            pending_claude_credentials,
+            pending_codex_credentials,
+            pending_antigravity_credentials,
+            pending_grok_credentials,
             notify_session_reset,
             notify_weekly_reset,
             widget_placement,
@@ -13893,6 +14117,10 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     s.allow_codex_credentials,
                     s.allow_antigravity_credentials,
                     s.allow_grok_credentials,
+                    s.claude_credential_access_pending,
+                    s.codex_credential_access_pending,
+                    s.antigravity_credential_access_pending,
+                    s.grok_credential_access_pending,
                     s.notify_session_reset,
                     s.notify_weekly_reset,
                     s.widget_placement.clone(),
@@ -13909,6 +14137,10 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
                     false,
                     true,
                     true,
+                    false,
+                    false,
+                    false,
+                    false,
                     false,
                     false,
                     false,
@@ -14040,26 +14272,41 @@ fn show_context_menu(hwnd: HWND, anchor: Option<POINT>) {
             let _ = DestroyMenu(menu);
             return;
         };
-        for (id, label, allowed) in [
+        for (id, name, allowed, pending) in [
             (
                 IDM_ACCESS_CLAUDE_CODE,
                 strings.claude_model,
                 allow_claude_credentials,
+                pending_claude_credentials,
             ),
             (
                 IDM_ACCESS_CODEX,
                 strings.codex_model,
                 allow_codex_credentials,
+                pending_codex_credentials,
             ),
             (
                 IDM_ACCESS_ANTIGRAVITY,
                 strings.antigravity_model,
                 allow_antigravity_credentials,
+                pending_antigravity_credentials,
             ),
-            (IDM_ACCESS_GROK, strings.grok_model, allow_grok_credentials),
+            (
+                IDM_ACCESS_GROK,
+                strings.grok_model,
+                allow_grok_credentials,
+                pending_grok_credentials,
+            ),
         ] {
-            let label = native_interop::wide_str(label);
-            let flags = if allowed {
+            let label_owned = if pending {
+                strings.access_needs_review.replace("{provider}", name)
+            } else {
+                name.to_string()
+            };
+            let label = native_interop::wide_str(&label_owned);
+            let flags = if pending {
+                MENU_ITEM_FLAGS(0)
+            } else if allowed {
                 MF_CHECKED
             } else {
                 MENU_ITEM_FLAGS(0)
@@ -15476,9 +15723,9 @@ mod reset_notification_tests {
     }
 
     /// A pass samples its scope before the worker starts, so a revocation
-    /// landing while it runs must not be undone by the stale result: manual
-    /// detection assigns `allow_*` from what it found, which would re-enable
-    /// the provider and send its token on the poll that follows.
+    /// landing while it runs must not be undone by the stale result:
+    /// `mask_detection` reapplies the current `credential_read_scope` before
+    /// the findings are consumed.
     #[test]
     fn a_revocation_during_a_detection_pass_survives_the_result() {
         let found_everything = poller::DetectedProviders {
@@ -15498,6 +15745,242 @@ mod reset_notification_tests {
 
         assert!(!applied.claude);
         assert!(applied.codex && applied.antigravity && applied.grok);
+    }
+
+    #[test]
+    fn pending_and_revoked_providers_are_excluded_from_every_silent_read() {
+        let pending = credential_read_allowed(
+            true,
+            false,
+            false,
+            true,
+            true,
+            true,
+            CredentialReadReason::Rescan,
+        );
+        let revoked = credential_read_allowed(
+            true,
+            false,
+            true,
+            false,
+            true,
+            true,
+            CredentialReadReason::Rescan,
+        );
+        let allowed_hidden = credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            CredentialReadReason::Rescan,
+        );
+        assert!(!pending);
+        assert!(!revoked);
+        assert!(allowed_hidden);
+
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            false,
+            true,
+            true,
+            true,
+            CredentialReadReason::FirstRun
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            false,
+            true,
+            true,
+            true,
+            CredentialReadReason::Manual
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            CredentialReadReason::Poll
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            CredentialReadReason::CredentialWatch
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            true,
+            false,
+            true,
+            true,
+            CredentialReadReason::Poll
+        ));
+        assert!(!credential_read_allowed(
+            false,
+            true,
+            false,
+            false,
+            true,
+            true,
+            CredentialReadReason::Poll
+        ));
+    }
+
+    #[test]
+    fn rescan_only_reads_unshown_unannounced_providers() {
+        assert!(!credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            true,
+            false,
+            CredentialReadReason::Rescan
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            CredentialReadReason::Rescan
+        ));
+        assert!(credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            CredentialReadReason::Rescan
+        ));
+    }
+
+    #[test]
+    fn manual_reads_only_explicitly_allowed_providers() {
+        assert!(credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            CredentialReadReason::Manual
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            false,
+            true,
+            false,
+            true,
+            CredentialReadReason::Manual
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            CredentialReadReason::Manual
+        ));
+    }
+
+    #[test]
+    fn poll_and_watch_require_shown_allow_and_no_pending() {
+        assert!(credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            CredentialReadReason::Poll
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            CredentialReadReason::Poll
+        ));
+        assert!(!credential_read_allowed(
+            true,
+            false,
+            false,
+            false,
+            true,
+            true,
+            CredentialReadReason::Poll
+        ));
+        assert_eq!(
+            credential_read_allowed(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                CredentialReadReason::Poll
+            ),
+            credential_read_allowed(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                CredentialReadReason::CredentialWatch
+            )
+        );
+    }
+
+    #[test]
+    fn merge_drops_providers_outside_the_current_poll_scope() {
+        let usage =
+            UsageData::from_windows(vec![UsageWindow::new(7.0, None, Some(FIVE_HOURS_SECONDS))]);
+        let previous = AppUsageData::default()
+            .with_usage(tray_icon::TrayIconKind::Claude, usage.clone())
+            .with_usage(tray_icon::TrayIconKind::Codex, usage.clone());
+        let next = AppUsageData::default()
+            .with_usage(tray_icon::TrayIconKind::Claude, usage.clone())
+            .with_usage(tray_icon::TrayIconKind::Codex, usage);
+        let merged =
+            merge_missing_provider_data(Some(&previous), next, [true, false, false, false]);
+        assert!(merged.usage(tray_icon::TrayIconKind::Claude).is_some());
+        assert!(merged.usage(tray_icon::TrayIconKind::Codex).is_none());
+    }
+
+    #[test]
+    fn a_pending_result_cannot_reenable_a_provider() {
+        let found_everything = poller::DetectedProviders {
+            claude: true,
+            codex: true,
+            antigravity: true,
+            grok: true,
+        };
+        let now_pending = poller::DetectionScope {
+            claude: false,
+            codex: true,
+            antigravity: true,
+            grok: true,
+        };
+        let applied = mask_detection(found_everything, now_pending);
+        assert!(!applied.claude);
     }
 
     /// Build a watch set from the fixed Claude/Codex/Antigravity/Grok order
@@ -16905,7 +17388,7 @@ mod reset_notification_tests {
             .with_error(tray_icon::TrayIconKind::Claude, ProviderStatus::RateLimited);
         stamp_provider_updates(&mut next, 200);
 
-        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false, false);
+        let merged = merge_missing_provider_data(Some(&previous), next, [true, true, false, false]);
         assert!(merged.usage(tray_icon::TrayIconKind::Claude).is_some());
         assert_eq!(
             merged
@@ -16944,7 +17427,7 @@ mod reset_notification_tests {
                 ProviderStatus::AuthenticationFailed,
             );
 
-        let merged = merge_missing_provider_data(Some(&previous), next, true, true, false, false);
+        let merged = merge_missing_provider_data(Some(&previous), next, [true, true, false, false]);
 
         assert!(merged.usage(tray_icon::TrayIconKind::Claude).is_some());
         assert!(merged.usage(tray_icon::TrayIconKind::Codex).is_some());

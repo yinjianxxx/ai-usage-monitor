@@ -10,9 +10,10 @@
   poll-controller self-deadlock), a credential-state classification fix for
   Codex/Antigravity/Grok, one behaviour change (detection sweep also runs at
   startup on an existing install), and three interface fixes; no change to the
-  executable, settings directory, tray, or update identities. Four new
-  `*_credential_access_revoked` settings fields are additive and default to
-  `false`, so older files load unchanged.
+  executable, settings directory, tray, or update identities. Consent schema
+  3 adds per-provider LegacyNeedsReview (`*_credential_access_pending`). Older
+  `allow=false` values become pending rather than guessed revocations; they
+  are not read until the user allows access or keeps the provider closed.
 - Signing: not in scope (owner has no signing certificate)
 
 ## Automated gates
@@ -285,14 +286,15 @@ reported by both. Each was re-checked against the source before being accepted.
 - **Accepted.** Two comments still described `ActionRequired` and the
   credential balloon as "rejected by the provider" only, which stopped being
   the whole story once a locally unusable credential could raise one.
-- **Open, needs a decision.** A revocation made in v2.5.0 is not carried
-  forward: the new flag defaults to `false`, so that provider is read again
-  until the user turns it off once more. One reviewer calls this a release
-  blocker and wants a migration that treats `decided && !allow` as revoked; the
-  other analysed the same migration and recommended against it, because that
-  state also covers "hidden and never granted", which would silently and
-  permanently stop detection for those installs. The two costs are real and
-  opposite. Recorded in the release notes as a caveat pending that decision.
+- **Closed by schema 3.** Older `allow=false` is no longer guessed. Consent
+  schema 3 classifies it as LegacyNeedsReview (`pending`) after the existing
+  schema-1/2 migrations. Explicit `revoked=true` from this unreleased branch
+  is kept. Grok on a consent-granted upgrade stays `allow=true` and unseen
+  (`show=false`, announced=false) so Rescan can still find it. Isolated
+  diagnose.log scope, a credentials-focused review of the five silent read
+  paths, and isolated pending-review UI (Keep closed, cancel, Providers
+  visibility, Detect providers again, Allow access) have passed. An upgraded
+  `allow=false` is pending until that choice; it is not a guessed revocation.
 - **Not acted on.** Claude's locally unusable credentials still arm the bounded
   service recheck, because they map to `AuthRequired`. Asymmetric with
   `CredentialUnusable`, but the recheck fails locally without a request; only

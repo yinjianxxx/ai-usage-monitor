@@ -17,12 +17,15 @@ identity, or release automation.
 - Never log, persist, commit, or include in diagnostics any token, cookie,
   account identifier, or raw credential/CLI response.
 - Read provider credentials only after explicit consent, and never for a
-  provider the user has turned off under Provider access - detection and the
+  provider the user has turned off under Provider access or that is waiting
+  for a LegacyNeedsReview choice - detection and the
   credential watch included, at every start, on every sweep, and on every poll
-  pass. A provider that was never turned off stays
+  pass. A provider that is not pending and not revoked stays
   in scope even when it is not currently enabled: detection is the only way a
-  newly installed provider is ever noticed. Send a credential only to the
-  provider that issued it.
+  newly installed provider is ever noticed. An upgraded `allow=false` whose
+  reason cannot be recovered is pending until the user allows access or keeps
+  it closed; it is not guessed to be a revocation. Send a credential only to
+  the provider that issued it.
 - A missing credential is **Not detected**. A Windows-local credential source
   that is unreadable or malformed, and any credential the provider expires or
   rejects, is grouped as **Authentication failed**, because the user recovery

@@ -1389,6 +1389,54 @@ impl DetectionScope {
     pub fn any(self) -> bool {
         self.claude || self.codex || self.antigravity || self.grok
     }
+
+    pub fn from_flags(flags: [bool; TrayIconKind::COUNT]) -> Self {
+        Self {
+            claude: flags[TrayIconKind::Claude.index()],
+            codex: flags[TrayIconKind::Codex.index()],
+            antigravity: flags[TrayIconKind::Antigravity.index()],
+            grok: flags[TrayIconKind::Grok.index()],
+        }
+    }
+
+    pub fn flags(self) -> [bool; TrayIconKind::COUNT] {
+        let mut flags = [false; TrayIconKind::COUNT];
+        flags[TrayIconKind::Claude.index()] = self.claude;
+        flags[TrayIconKind::Codex.index()] = self.codex;
+        flags[TrayIconKind::Antigravity.index()] = self.antigravity;
+        flags[TrayIconKind::Grok.index()] = self.grok;
+        flags
+    }
+}
+
+/// Which source probes a detection pass may touch. Every flag is false when
+/// that provider is outside `scope`, so a disabled provider's Windows file,
+/// Credential Manager entry, Desktop cache, and WSL distros are not read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectionProbePlan {
+    pub claude_windows: bool,
+    pub claude_desktop: bool,
+    pub claude_wsl: bool,
+    pub codex_windows: bool,
+    pub codex_wsl: bool,
+    pub antigravity_windows: bool,
+    pub antigravity_wsl: bool,
+    pub grok_windows: bool,
+    pub grok_wsl: bool,
+}
+
+pub fn detection_probe_plan(scope: DetectionScope) -> DetectionProbePlan {
+    DetectionProbePlan {
+        claude_windows: scope.claude,
+        claude_desktop: scope.claude,
+        claude_wsl: scope.claude,
+        codex_windows: scope.codex,
+        codex_wsl: scope.codex,
+        antigravity_windows: scope.antigravity,
+        antigravity_wsl: scope.antigravity,
+        grok_windows: scope.grok,
+        grok_wsl: scope.grok,
+    }
 }
 
 /// The raw source probes the detector reduces to an answer.
@@ -1432,12 +1480,13 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
 /// guarded by it, and `&&` short-circuits, so a provider outside the scope has
 /// none of its files, keyring entries or WSL distros read at all.
 pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
+    let plan = detection_probe_plan(scope);
     if !scope.any() {
         diagnose::log("provider detection skipped: no provider is in scope");
         return DetectedProviders::default();
     }
     let running = list_running_wsl_distros();
-    let claude_wsl = scope.claude
+    let claude_wsl = plan.claude_wsl
         && running.iter().any(|distro| {
             read_credentials_from_source(&CredentialSource::Wsl {
                 distro: distro.clone(),
@@ -1445,24 +1494,24 @@ pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
             .is_ok()
         });
     let inputs = DetectionInputs {
-        claude_windows: scope.claude
+        claude_windows: plan.claude_windows
             && windows_credential_source()
                 .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
-        claude_desktop: scope.claude
+        claude_desktop: plan.claude_desktop
             && claude_desktop::enabled()
             && claude_desktop::read_candidates(now_unix_millis()).is_ok(),
         claude_wsl,
-        codex_windows: scope.codex && read_windows_codex_credentials().is_usable(),
-        codex_wsl: scope.codex
+        codex_windows: plan.codex_windows && read_windows_codex_credentials().is_usable(),
+        codex_wsl: plan.codex_wsl
             && !running.is_empty()
             && read_codex_credentials_from_wsl(&running).is_some(),
-        antigravity_windows: scope.antigravity
+        antigravity_windows: plan.antigravity_windows
             && read_windows_antigravity_credentials().is_usable(),
-        antigravity_wsl: scope.antigravity
+        antigravity_wsl: plan.antigravity_wsl
             && !running.is_empty()
             && read_antigravity_credentials_from_wsl(&running).is_some(),
-        grok_windows: scope.grok && read_windows_grok_credentials().is_usable(),
-        grok_wsl: scope.grok
+        grok_windows: plan.grok_windows && read_windows_grok_credentials().is_usable(),
+        grok_wsl: plan.grok_wsl
             && !running.is_empty()
             && read_grok_credentials_from_wsl(&running).is_some(),
     };
@@ -4149,6 +4198,33 @@ mod tests {
             detect_signed_in_providers(DetectionScope::default()),
             DetectedProviders::default()
         );
+    }
+
+    #[test]
+    fn a_disabled_provider_has_no_windows_wsl_desktop_or_keyring_probes() {
+        let three_on_one_off = DetectionScope {
+            claude: true,
+            codex: true,
+            antigravity: true,
+            grok: false,
+        };
+        let plan = detection_probe_plan(three_on_one_off);
+        assert!(plan.claude_windows && plan.claude_desktop && plan.claude_wsl);
+        assert!(plan.codex_windows && plan.codex_wsl);
+        assert!(plan.antigravity_windows && plan.antigravity_wsl);
+        assert!(!plan.grok_windows && !plan.grok_wsl);
+
+        let only_grok = DetectionScope {
+            claude: false,
+            codex: false,
+            antigravity: false,
+            grok: true,
+        };
+        let plan = detection_probe_plan(only_grok);
+        assert!(!plan.claude_windows && !plan.claude_desktop && !plan.claude_wsl);
+        assert!(!plan.codex_windows && !plan.codex_wsl);
+        assert!(!plan.antigravity_windows && !plan.antigravity_wsl);
+        assert!(plan.grok_windows && plan.grok_wsl);
     }
 
     #[test]

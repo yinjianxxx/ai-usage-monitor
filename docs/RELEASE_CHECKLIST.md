@@ -25,8 +25,10 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - `tools\check-portable-runtime.ps1` rejects external MSVC/UCRT runtime DLLs
   so the portable executable starts without a separate redistributable.
 - Confirm tests cover settings that predate provider permissions, the
-  default-deny permission state, and the hard poll gate that requires both
-  visibility and explicit provider permission.
+  default-deny permission state, the hard poll gate that requires both
+  visibility and explicit provider permission, schema-3 LegacyNeedsReview
+  pending classification, and zero credential reads for pending/revoked
+  providers on FirstRun, Rescan, Manual, poll, and the credential watch.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
 - When a release adds a provider, state the downgrade consequence in the
@@ -68,17 +70,27 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   notices the first sign-in. After declining, confirm nothing is read or
   polled.
 - On an upgrade from settings that predate the one-time prompt, confirm no
-  prompt appears and the existing provider selection and permissions are
-  preserved exactly. Repeat from settings that had declined every provider.
+  prompt appears and previously allowed providers stay allowed. Providers whose
+  older file only has `allow=false` appear under Provider access as **needs
+  review** and are not read until **Allow access** or **Keep closed** is
+  chosen. Repeat from settings that had declined every provider: they stay
+  declined and pending, not silently re-enabled.
 - Sign in to a provider that was not previously detected and confirm
-  **Provider access → Detect providers again** picks it up immediately. Confirm
+  **Provider access → Detect providers again** picks it up immediately when it
+  is already allowed. Pending providers must be confirmed first; the prompt
+  says local credentials will be read for ongoing monitoring. Confirm
   the periodic sweep notifies once per provider and never changes what is
-  displayed on its own, and stays quiet about providers the user turned off.
-  Confirm the sweep also runs shortly after start on an install that has
-  already answered the access prompt, so a provider added by an upgrade does
-  not wait out a full interval. Revoke one provider, then confirm neither the
-  startup sweep, the periodic sweep, nor **Detect providers again** reads its
-  credentials at all - the diagnostic log records the scope of every pass.
+  displayed on its own, and stays quiet about providers the user turned off
+  or left pending. Confirm the sweep also runs shortly after start on an
+  install that has already answered the access prompt, so a provider added by
+  an upgrade that is not pending or revoked does not wait out a full interval.
+  Revoke one provider, then confirm neither the startup sweep, the periodic
+  sweep, nor **Detect providers again** reads its credentials at all - the
+  diagnostic log records the scope of every pass. Showing a provider under
+  **Providers** must not grant access. Confirm an upgraded `allow=false` is
+  pending rather than a guessed revocation, and that startup Rescan, poll, and
+  Detect providers again stay out of scope until **Allow access** or **Keep
+  closed**.
 - With Codex, Antigravity, and Grok credentials only inside WSL, confirm they
   are read from a **running** distribution (`$CODEX_HOME/auth.json`,
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, and

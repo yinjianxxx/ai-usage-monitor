@@ -313,6 +313,17 @@ pub struct Strings {
     pub detail_access_revoked_hint: &'static str,
     pub detail_access_revoked_outcome: &'static str,
     /// "{provider}" is replaced with the localized provider name.
+    pub access_needs_review: &'static str,
+    pub access_allow: &'static str,
+    pub access_keep_closed: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub pending_access_title: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub pending_access_body: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
+    pub detail_access_pending_hint: &'static str,
+    pub detail_access_pending_outcome: &'static str,
+    /// "{provider}" is replaced with the localized provider name.
     pub provider_detected_title: &'static str,
     pub provider_detected_body: &'static str,
     pub redetect_providers: &'static str,
@@ -427,6 +438,13 @@ mod tests {
                 strings.detail_not_signed_in_action,
                 strings.detail_access_revoked_hint,
                 strings.detail_access_revoked_outcome,
+                strings.access_needs_review,
+                strings.access_allow,
+                strings.access_keep_closed,
+                strings.pending_access_title,
+                strings.pending_access_body,
+                strings.detail_access_pending_hint,
+                strings.detail_access_pending_outcome,
                 strings.provider_detected_title,
                 strings.provider_detected_body,
                 strings.redetect_providers,
@@ -442,6 +460,10 @@ mod tests {
                 strings.detail_sign_in_again_action,
                 strings.detail_not_signed_in_action,
                 strings.detail_access_revoked_hint,
+                strings.access_needs_review,
+                strings.pending_access_title,
+                strings.pending_access_body,
+                strings.detail_access_pending_hint,
                 strings.provider_detected_title,
             ] {
                 assert!(

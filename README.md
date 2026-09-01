@@ -269,18 +269,30 @@ provider, but revoking stays per provider: use **Provider access** in the
 context menu to turn any single one off at any time. Turning a provider off
 also stops it being read at all: neither the check at start, the periodic
 check, nor **Detect providers again** touches its credentials until you turn
-it back on. Gengchou re-reads the original file or Windows Credential Manager
-entry as needed, so provider-side token refresh continues to work without
-copying the token into Gengchou.
+it back on. Showing or hiding a provider under **Providers** only changes
+visibility; it does not grant credential access. Gengchou re-reads the original
+file or Windows Credential Manager entry as needed, so provider-side token
+refresh continues to work without copying the token into Gengchou.
 
 Upgrading from an earlier version does not show the prompt again and keeps the
-existing provider selection and permissions as they are. To pick up a newly
-installed provider, use **Provider access → Detect providers again**. Gengchou
-also checks once shortly after each start and periodically thereafter, and
-shows a single notification when it finds a newly signed-in provider; it never
-changes what is displayed on its own. The check at startup is what tells you
-about a provider added by an upgrade, rather than making you wait out the
-first interval.
+existing provider selection. A provider that was allowed stays allowed. A
+provider whose older file only has `allow=false`, with no record of whether
+you revoked it, is marked **needs review** and is not read until you choose
+**Allow access** or **Keep closed** under Provider access. **Detect providers
+again** asks the same choice for each pending provider and states that it will
+read that provider's local credentials for ongoing monitoring. A provider added
+by an upgrade that was never pending or revoked can still be discovered
+automatically. To pick up a newly installed provider that is already allowed,
+use **Provider access → Detect providers again**. Gengchou also checks once
+shortly after each start and periodically thereafter, and shows a single
+notification when it finds a newly signed-in provider; it never changes what
+is displayed on its own. The check at startup is what tells you about a
+provider added by an upgrade, rather than making you wait out the first
+interval.
+
+`gengchou.exe --claude-auth-diagnostics` is a separate, user-triggered
+exception: it reads local Claude credentials only to print a redacted
+diagnostic report.
 
 A provider with no credential on this machine shows **Not detected** in the
 detail popup along with a note that it is recognized automatically after
