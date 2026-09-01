@@ -1109,6 +1109,80 @@ mod tests {
         assert!(take_detection_announcements(&mut visibility, detected).is_empty());
     }
 
+    /// The startup sweep exists for exactly this install: it upgraded into a
+    /// version that added a provider, so migration granted access but left the
+    /// announcement unpaid. Providers it had already decided on stay quiet
+    /// even when they are detected too.
+    #[test]
+    fn a_migrated_install_still_owes_a_balloon_for_a_provider_an_update_added() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "consent_schema_version": 1,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "claude_credential_access_decided": true,
+                "codex_credential_access_decided": true,
+                "antigravity_credential_access_decided": true,
+                "show_codex": true,
+                "allow_codex_credentials": true
+            }"#,
+        )
+        .expect("settings from before Grok shipped should remain readable");
+
+        normalize(&mut settings);
+
+        assert!(settings.allow_grok_credentials);
+        assert!(!settings.show_grok);
+        assert!(!settings.grok_credential_access_decided);
+
+        let mut visibility = ProviderVisibility {
+            show_claude_code: settings.show_claude_code,
+            show_codex: settings.show_codex,
+            show_antigravity: settings.show_antigravity,
+            show_grok: settings.show_grok,
+            allow_claude_credentials: settings.allow_claude_credentials,
+            allow_codex_credentials: settings.allow_codex_credentials,
+            allow_antigravity_credentials: settings.allow_antigravity_credentials,
+            allow_grok_credentials: settings.allow_grok_credentials,
+            claude_announced: settings.claude_credential_access_decided,
+            codex_announced: settings.codex_credential_access_decided,
+            antigravity_announced: settings.antigravity_credential_access_decided,
+            grok_announced: settings.grok_credential_access_decided,
+        };
+
+        let announced = take_detection_announcements(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: true,
+                antigravity: false,
+                grok: true,
+            },
+        );
+
+        assert_eq!(announced, vec![TrayIconKind::Grok]);
+        assert!(!visibility.show_grok);
+    }
+
+    /// Why the startup sweep must not run on a fresh install: it is only
+    /// silent once first-run detection has finished claiming the providers it
+    /// enables, so running the two concurrently would announce providers that
+    /// pass is in the middle of turning on.
+    #[test]
+    fn first_run_detection_leaves_a_following_sweep_nothing_to_announce() {
+        let mut visibility = ProviderVisibility::default();
+        let detected = DetectedProviders {
+            claude: true,
+            codex: false,
+            antigravity: false,
+            grok: true,
+        };
+
+        apply_first_run_detection(&mut visibility, detected);
+
+        assert!(take_detection_announcements(&mut visibility, detected).is_empty());
+    }
+
     /// A provider the user hid by hand counts as announced, so the sweep
     /// leaves it alone instead of nagging.
     #[test]

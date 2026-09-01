@@ -4399,13 +4399,26 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
 /// Only meaningful once access has been granted; the timer checks again when
 /// it fires, so a user who grants access later still gets swept.
 ///
+/// `sweep_now` runs one pass without waiting for the first interval. The
+/// sweep is the only path that can announce a provider which appeared after
+/// first run, including one that shipped in the update the user just
+/// installed, so waiting a full interval detaches that balloon from the
+/// upgrade that earned it - and a user who quits before the interval elapses
+/// defers it again. Tray icons already exist by this point and the pass runs
+/// on a background thread, so there is nothing to wait for.
+///
+/// It is deliberately not passed on a fresh install: `FirstRun` detection is
+/// already in flight there and is what marks detected providers as announced,
+/// so a concurrent sweep would race it and balloon about providers first-run
+/// detection is in the middle of enabling.
+///
 /// Armed on the process-level helper rather than the embedded widget, for the
 /// same reason as the poll timer: explorer destroying the taskbar stops the
 /// embedded child receiving any message, `WM_TIMER` included. `WM_TIMER` is
 /// delivered to the window it was armed on, so arming it anywhere whose window
 /// procedure lacks a `TIMER_PROVIDER_DETECT` arm drops the sweep silently -
 /// which is exactly how this went unnoticed from v2.4.1 to v2.5.0.
-fn schedule_provider_detection() {
+fn schedule_provider_detection(sweep_now: bool) {
     unsafe {
         SetTimer(
             poll_controller_hwnd(),
@@ -4413,6 +4426,9 @@ fn schedule_provider_detection() {
             PROVIDER_DETECT_INTERVAL_MS,
             None,
         );
+        if sweep_now {
+            handle_provider_detect_timer();
+        }
     }
 }
 
@@ -11682,8 +11698,14 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         // credential-backed operation can run before the user decides.
         // Existing installs are migrated in `settings::normalize` and never
         // reach the prompt.
+        // Read before the prompt: an install that has already answered it is
+        // a migrated one, and migrated installs are exactly those that may
+        // still owe a balloon for a provider added by an update.
+        let migrated_install = lock_state()
+            .as_ref()
+            .is_some_and(|s| s.credential_consent_decided);
         prompt_for_initial_consent(hwnd);
-        schedule_provider_detection();
+        schedule_provider_detection(migrated_install);
 
         schedule_countdown_timer();
         show_pending_persistence_warning_once();
