@@ -3,11 +3,16 @@
 - Date: 2026-09-01
 - Candidate: in progress on `claude/v2.5.1-fixes`, based on `v2.5.0` /
   `0b478f1`. Not tagged, not pushed; `Cargo.toml` still reads `2.5.0`.
-- Scope: two defects that had shipped silently since v2.4.1 (informational tray
-  balloons never displayed, periodic provider detection never ran), one
-  behaviour change (detection sweep also runs at startup on an existing
-  install), and three interface fixes; no change to the executable, settings
-  directory, tray, or update identities
+- Scope: three defects that had shipped silently since v2.4.1 or earlier
+  (informational tray balloons never displayed, periodic provider detection
+  never ran, detection ignoring a revoked provider's per-provider switch), a
+  Grok-only profile never polling, two silent-failure repairs (poll-timer arm,
+  poll-controller self-deadlock), a credential-state classification fix for
+  Codex/Antigravity/Grok, one behaviour change (detection sweep also runs at
+  startup on an existing install), and three interface fixes; no change to the
+  executable, settings directory, tray, or update identities. Four new
+  `*_credential_access_revoked` settings fields are additive and default to
+  `false`, so older files load unchanged.
 - Signing: not in scope (owner has no signing certificate)
 
 ## Automated gates
@@ -16,7 +21,7 @@ Run locally on Windows 11 26200:
 
 - `cargo fmt --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 317 passed, 0 failed
+- `cargo test --locked` - 323 passed, 0 failed
 - `cargo audit` against the committed `Cargo.lock` - 122 dependencies scanned,
   no advisories, exit 0. `.cargo/audit.toml` denies warnings, so that is clean
   too. Run with a locally installed cargo-audit 0.22.1; the newest release
@@ -30,8 +35,11 @@ Run locally on Windows 11 26200:
 - `tests/updater_e2e.ps1 -Scenario ChildExit` - passed: helper rejected the
   child, restored the old hash, relaunched, and retained the verified `.old`
 
-Each of the six commits was type-checked in isolation before being recorded, so
-the branch is bisectable.
+Each commit that touches `src/` was type-checked in isolation when it was
+recorded, so the branch is bisectable. That covered the first six; the four
+added after the first independent review, and the commits from the second,
+were each checked the same way as they were made. The gate results above were
+re-run against the final HEAD, not inherited from an earlier one.
 
 ## Targeted regression evidence
 
@@ -97,6 +105,8 @@ detail popup.
 
 ## Independent review
 
+### First round
+
 A Codex agent in the same workspace reviewed the branch read-only and returned
 a verdict of "does not pass". It independently re-ran fmt, clippy, the test
 suite, a release build, the portable-runtime and retired-identity gates, and
@@ -140,6 +150,89 @@ their disposition:
   been run for this candidate. RustSec and all three updater E2E scenarios have
   since been run and are recorded above. `Cargo.toml` is still `2.5.0`.
 
+### Second round
+
+The whole repository, not just this branch, was reviewed again before tagging:
+once by a Codex agent (gpt-5.6-sol, xhigh) and once by a Claude agent (Opus 5),
+independently and read-only. They disagreed on the verdict - "blocked" and
+"can ship" respectively - and their findings barely overlapped: each missed the
+most severe thing the other found. Only the poll-timer arm was reported by
+both. Every non-overlapping finding was re-checked against the source here
+before being accepted.
+
+- **Accepted, release blocker.** Detection read every provider's credentials
+  regardless of the per-provider access switch, so a provider the user revoked
+  under Provider access was still being read at every start and every sweep -
+  a breach of the invariant in `docs/INVARIANTS.md`, of the README's
+  per-provider revocation promise, and of the release-checklist row that says
+  reads must stop. The underlying full scan is old, but the two sweep fixes in
+  this release are what turned it from a dormant path into steady behaviour.
+  `detect_signed_in_providers` now takes a `DetectionScope` that guards every
+  probe.
+
+  The review phrased this as "only providers whose access is enabled may be
+  read", which overshoots: `allow_*_credentials` defaults to `false`, so read
+  literally it would forbid detection entirely, and detection is the only way
+  an unenabled provider is ever noticed. Worse, the schema-1 migration sets
+  `*_credential_access_decided = true` for every pre-existing provider while
+  carrying an old `false` forward - so on real upgraded installs "not allowed"
+  cannot be distinguished from "never asked", and keying off it would have
+  permanently blinded those installs to a provider added later. That migration
+  already ran on shipped installs, so it cannot be repaired retroactively. Four
+  new `*_credential_access_revoked` fields carry the distinction instead; only
+  the Provider access menu sets them.
+- **Accepted, narrowed.** Codex, Antigravity and Grok mapped every failed
+  credential read to `NoCredentials`, so a malformed `auth.json` displayed as
+  **Not detected** - pointing the user at installing a CLI they already had.
+  The review asked for a four-state result type across every source. Narrowed
+  to the Windows-local reads: a new `PollError::CredentialUnusable` displays as
+  **Authentication failed**, which adds no new user-visible state, since
+  `ProviderStatus` already had it and Claude already used it.
+
+  Deliberately not extended to WSL. A WSL probe cannot separate "no credential
+  in this distro" from "the probe did not answer", so classifying it would
+  raise sign-in warnings for a distro that was merely slow. `INVARIANTS.md`
+  and both READMEs are narrowed to match, rather than leaving a promise the
+  implementation does not keep. `CredentialUnusable` is also deliberately not
+  one of the rejection errors: nothing was rejected remotely, so it must not
+  set `remote_auth_rejection` or arm the bounded service recheck. The
+  credential watch is the correct recovery and fires when the CLI rewrites the
+  file.
+- **Accepted, release blocker.** `poll_controller_hwnd` takes the state lock on
+  its fallback path, and three call sites passed it as an argument while
+  already holding that lock. `STATE` is a plain `Mutex`, so if the
+  process-level helper window could not be created, the UI thread would block
+  on a lock it holds itself - with the widget drawn and the tray icons
+  registered, and nothing in the log. Four other call sites already resolved
+  the window first; those three now do the same, and the helper documents the
+  constraint.
+- **Accepted.** `arm_poll_timer` was the one `SetTimer` left out of the
+  silent-failure sweep, and it drives the whole monitor: nothing else re-arms
+  `TIMER_POLL`. Reported by both reviewers. It now goes through `arm_timer`.
+  A bounded retry was suggested and not added - every other timer here only
+  logs, and a new recovery mechanism is not something to introduce untested on
+  the eve of a release.
+- **Accepted.** Two doc comments had been left attached to the wrong item when
+  new symbols were inserted above their functions.
+- **Accepted.** `PROVENANCE.md` still described the old
+  `taskbar_index + tray_offset` position model, and that file ships inside the
+  release ZIP. The release-checklist rows for the tray icon fallback and for
+  the startup sweep were also never updated.
+- **Accepted.** This document claimed "six commits" after four more had been
+  added, so its bisectability claim covered less than it appeared to. Both
+  reviewers reported this independently.
+- **Not acted on.** `TIMER_TRAY_ORDER` is not re-armed after the widget window
+  is recreated, so the fallback tray-order sampling stops after an Explorer
+  restart. The reviewer that found it recommended leaving it, and its own
+  analysis shows the user-visible path survives: `attach_to_taskbar` reinstalls
+  the WinEvent hook, so a drag is still caught. Out of scope for a fix release.
+- **Not acted on.** `updater.rs` calls `std::env::remove_var` after worker
+  threads that read the environment have started. Sound on Windows today, a
+  hard error whenever the crate moves to edition 2024. Recorded, not changed.
+- **Not acted on.** `diagnose.rs` uses a `Global\` mutex where the log path is
+  per-user, so a second user's session could fail to open it and silently lose
+  diagnostics. Pre-existing, no evidence of it occurring.
+
 ## Deferred v2.5.0 smoke items, now closed
 
 These were recorded as not verified for v2.5.0 and were completed on
@@ -173,6 +266,11 @@ shim-free binary restored `running WSL distros: 1`.
   branch was exercised; the two converge four lines later.
 - A provider whose credentials exist only inside WSL while WSL is stopped. That
   would require moving the owner's real credential file.
+- The revocation scope and the unusable-credential classification are covered
+  by unit tests and by reading the call sites, not by a live end-to-end run on
+  this machine: both would require revoking the owner's own providers and
+  corrupting a real `auth.json`. The release-checklist rows for them are
+  written, and remain to be walked.
 - High Contrast on an actual High Contrast desktop.
 - Any balloon on a light system theme.
 

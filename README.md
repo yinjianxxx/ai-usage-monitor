@@ -266,9 +266,12 @@ machine and shows those providers. If none are detected, it keeps a locally
 polled Codex placeholder visible so the first sign-in can be recognized without
 changing the user's provider selection. Permission is granted once for every
 provider, but revoking stays per provider: use **Provider access** in the
-context menu to turn any single one off at any time. Gengchou re-reads the
-original file or Windows Credential Manager entry as needed, so provider-side
-token refresh continues to work without copying the token into Gengchou.
+context menu to turn any single one off at any time. Turning a provider off
+also stops it being read at all: neither the check at start, the periodic
+check, nor **Detect providers again** touches its credentials until you turn
+it back on. Gengchou re-reads the original file or Windows Credential Manager
+entry as needed, so provider-side token refresh continues to work without
+copying the token into Gengchou.
 
 Upgrading from an earlier version does not show the prompt again and keeps the
 existing provider selection and permissions as they are. To pick up a newly
@@ -282,11 +285,14 @@ first interval.
 A provider with no credential on this machine shows **Not detected** in the
 detail popup along with a note that it is recognized automatically after
 sign-in, and raises no notification — a provider that was never signed in has
-nothing to sign in to *again*. **Authentication failed** means a concrete
-credential source exists but is unreadable, malformed, expired, rejected, or
-otherwise unusable; these cases share the same simple recovery: sign in again.
-If a WSL probe itself cannot start or finish, Gengchou treats that as a
-temporary refresh failure instead and never raises an authentication warning.
+nothing to sign in to *again*. **Authentication failed** means a credential
+really is there and cannot be used: a Windows file or Credential Manager entry
+that is unreadable or malformed, or a credential the provider expires or
+rejects. These cases share the same simple recovery: sign in again. A WSL probe
+is not classified this way, because it cannot tell a distribution that has no
+credential from one that failed to answer; it simply moves on to the next
+source, so a provider that lives only inside an unreachable distribution reads
+as **Not detected** rather than raising a false sign-in warning.
 
 ## Data & privacy
 

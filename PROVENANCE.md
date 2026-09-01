@@ -42,10 +42,15 @@ supported installations completed it, v2.3.0 retired the bridge.
 
 ## Position anchoring
 
-The widget stores `taskbar_index + tray_offset`, not an absolute screen
-coordinate. Startup, explorer.exe recovery, and RDP recovery recalculate the
-current position from that anchor and temporarily clamp it to the available
-taskbar. Only a user drag or **Reset Position** updates the saved anchor.
+The widget stores a semantic anchor, not an absolute screen coordinate:
+`widget_placement` for the docked widget and `floating_placement` for the
+floating window, each naming a monitor, an edge or corner to hold on to, and
+the gap to keep from it. Startup, explorer.exe recovery, and RDP recovery
+recalculate the current position from that anchor and temporarily clamp it to
+the available taskbar. Only a user drag or **Reset Position** updates the saved
+anchor. The older `taskbar_index + tray_offset` fields are still read once, to
+migrate settings written before the semantic anchors, and are not the live
+state afterwards.
 
 ## Third-party provenance
 

@@ -74,6 +74,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   **Provider access → Detect providers again** picks it up immediately. Confirm
   the periodic sweep notifies once per provider and never changes what is
   displayed on its own, and stays quiet about providers the user turned off.
+  Confirm the sweep also runs shortly after start on an install that has
+  already answered the access prompt, so a provider added by an upgrade does
+  not wait out a full interval. Revoke one provider, then confirm neither the
+  startup sweep, the periodic sweep, nor **Detect providers again** reads its
+  credentials at all - the diagnostic log records the scope of every pass.
 - With Codex, Antigravity, and Grok credentials only inside WSL, confirm they
   are read from a **running** distribution (`$CODEX_HOME/auth.json`,
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, and
@@ -178,7 +183,9 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   gives a localized connection action plus an automatic-retry outcome.
 - Disable Provider tray icons and confirm the provider icons are replaced
   by one app icon matching the executable; re-enable it and confirm all enabled
-  provider icons return without duplicates. At each tested DPI, confirm the app
+  provider icons return without duplicates. Confirm the same app icon stands in
+  while no provider has access at all, without rewriting the user's Provider
+  tray icons preference. At each tested DPI, confirm the app
   icon fills the Shell slot without clipping. Exercise this notification
   matrix in both tray-icon modes:
   - provider detection, quota reset, and Claude Code update: Gengchou app icon,

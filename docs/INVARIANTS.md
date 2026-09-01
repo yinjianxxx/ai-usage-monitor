@@ -16,14 +16,19 @@ identity, or release automation.
 
 - Never log, persist, commit, or include in diagnostics any token, cookie,
   account identifier, or raw credential/CLI response.
-- Read provider credentials only after explicit consent and only for providers
-  whose access is enabled. Send a credential only to the provider that issued
-  it.
-- A missing credential is **Not detected**. A concrete credential source that
-  is unreadable, malformed, expired, rejected, or otherwise unusable is grouped
-  as **Authentication failed**, because the user recovery is to sign in again.
-  Failure to start or complete a WSL probe is a transient request failure, not
-  proof of an authentication failure.
+- Read provider credentials only after explicit consent, and never for a
+  provider the user has turned off under Provider access - detection included,
+  at every start and on every sweep. A provider that was never turned off stays
+  in scope even when it is not currently enabled: detection is the only way a
+  newly installed provider is ever noticed. Send a credential only to the
+  provider that issued it.
+- A missing credential is **Not detected**. A Windows-local credential source
+  that is unreadable or malformed, and any credential the provider expires or
+  rejects, is grouped as **Authentication failed**, because the user recovery
+  is to sign in again. Failure to start or complete a WSL probe is not proof of
+  an authentication failure: a WSL probe cannot tell an absent credential from
+  a distro that failed to answer, so it only moves on to the next source and a
+  provider that lives solely in WSL still reads as **Not detected**.
 - Routine notifications use the Gengchou icon and are silent. Only a current
   credential problem requiring user action uses the Windows warning glyph and
   notification sound.
