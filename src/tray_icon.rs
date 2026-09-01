@@ -1200,18 +1200,17 @@ mod tests {
 
     #[test]
     fn icon_guids_are_stable_and_unique() {
-        let guids = [
-            app_icon_guid(),
-            TrayIconKind::Claude.guid(),
-            TrayIconKind::Codex.guid(),
-            TrayIconKind::Antigravity.guid(),
-        ];
-        assert_ne!(guids[0], guids[1]);
-        assert_ne!(guids[1], guids[2]);
-        assert_ne!(guids[0], guids[2]);
-        assert_ne!(guids[0], guids[3]);
-        assert_ne!(guids[1], guids[3]);
-        assert_ne!(guids[2], guids[3]);
+        // Built from `ALL` rather than spelled out: the hand-written list
+        // silently stopped covering every provider the moment a fourth one
+        // was added, which is exactly what this test exists to prevent.
+        let mut guids = vec![app_icon_guid()];
+        guids.extend(TrayIconKind::ALL.into_iter().map(TrayIconKind::guid));
+        assert_eq!(guids.len(), TrayIconKind::COUNT + 1);
+        for (index, guid) in guids.iter().enumerate() {
+            for other in &guids[index + 1..] {
+                assert_ne!(guid, other, "duplicate tray icon GUID");
+            }
+        }
     }
 
     #[test]

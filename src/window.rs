@@ -16447,11 +16447,7 @@ mod reset_notification_tests {
     fn bundled_provider_tiles_use_exact_png_and_hicon_sizes() {
         for dpi in PROVIDER_TILE_BUCKET_DPIS {
             let _dpi = DpiScope::new(dpi);
-            for kind in [
-                tray_icon::TrayIconKind::Claude,
-                tray_icon::TrayIconKind::Codex,
-                tray_icon::TrayIconKind::Antigravity,
-            ] {
+            for kind in tray_icon::TrayIconKind::ALL {
                 for (tile_size, logical_size) in [
                     (TileSize::Chip16, 16),
                     (TileSize::Chip20, 20),
