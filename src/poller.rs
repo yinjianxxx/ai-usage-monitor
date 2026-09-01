@@ -1267,6 +1267,25 @@ impl DetectedProviders {
     }
 }
 
+/// Which providers a detection pass may read credentials for.
+///
+/// Access is granted once for every provider but revoked one at a time, so a
+/// pass that ignored this would read a source the user turned off - at every
+/// start and then every half hour, for as long as the app runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectionScope {
+    pub claude: bool,
+    pub codex: bool,
+    pub antigravity: bool,
+    pub grok: bool,
+}
+
+impl DetectionScope {
+    pub fn any(self) -> bool {
+        self.claude || self.codex || self.antigravity || self.grok
+    }
+}
+
 /// The raw source probes the detector reduces to an answer.
 ///
 /// Split from the probing itself so the decision is testable without a
@@ -1294,7 +1313,8 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
     }
 }
 
-/// Probe every credential source that is cheap to reach.
+/// Probe the credential sources that are cheap to reach, for every provider
+/// the caller's scope still allows.
 ///
 /// "Cheap" excludes stopped WSL distros: reading inside one starts its virtual
 /// machine, and this runs on a timer. Providers that only live in a stopped
@@ -1302,35 +1322,55 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
 /// the full credential resolution including every distro.
 ///
 /// Runs on a worker thread - never call it from the UI thread.
-pub fn detect_signed_in_providers() -> DetectedProviders {
+///
+/// `scope` is honoured before any source is touched: every probe below is
+/// guarded by it, and `&&` short-circuits, so a provider outside the scope has
+/// none of its files, keyring entries or WSL distros read at all.
+pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
+    if !scope.any() {
+        diagnose::log("provider detection skipped: no provider is in scope");
+        return DetectedProviders::default();
+    }
     let running = list_running_wsl_distros();
-    let claude_wsl = running.iter().any(|distro| {
-        read_credentials_from_source(&CredentialSource::Wsl {
-            distro: distro.clone(),
-        })
-        .is_ok()
-    });
+    let claude_wsl = scope.claude
+        && running.iter().any(|distro| {
+            read_credentials_from_source(&CredentialSource::Wsl {
+                distro: distro.clone(),
+            })
+            .is_ok()
+        });
     let inputs = DetectionInputs {
-        claude_windows: windows_credential_source()
-            .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
-        claude_desktop: claude_desktop::enabled()
+        claude_windows: scope.claude
+            && windows_credential_source()
+                .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
+        claude_desktop: scope.claude
+            && claude_desktop::enabled()
             && claude_desktop::read_candidates(now_unix_millis()).is_ok(),
         claude_wsl,
-        codex_windows: read_windows_codex_credentials().is_some(),
-        codex_wsl: !running.is_empty() && read_codex_credentials_from_wsl(&running).is_some(),
-        antigravity_windows: read_windows_antigravity_credentials().is_some(),
-        antigravity_wsl: !running.is_empty()
+        codex_windows: scope.codex && read_windows_codex_credentials().is_some(),
+        codex_wsl: scope.codex
+            && !running.is_empty()
+            && read_codex_credentials_from_wsl(&running).is_some(),
+        antigravity_windows: scope.antigravity && read_windows_antigravity_credentials().is_some(),
+        antigravity_wsl: scope.antigravity
+            && !running.is_empty()
             && read_antigravity_credentials_from_wsl(&running).is_some(),
-        grok_windows: read_windows_grok_credentials().is_some(),
-        grok_wsl: !running.is_empty() && read_grok_credentials_from_wsl(&running).is_some(),
+        grok_windows: scope.grok && read_windows_grok_credentials().is_some(),
+        grok_wsl: scope.grok
+            && !running.is_empty()
+            && read_grok_credentials_from_wsl(&running).is_some(),
     };
     let detected = detect_from(inputs);
     diagnose::log(format!(
-        "provider detection: claude={} codex={} antigravity={} grok={} (running WSL distros: {})",
+        "provider detection: claude={} codex={} antigravity={} grok={} (scope: claude={} codex={} antigravity={} grok={}, running WSL distros: {})",
         detected.claude,
         detected.codex,
         detected.antigravity,
         detected.grok,
+        scope.claude,
+        scope.codex,
+        scope.antigravity,
+        scope.grok,
         running.len()
     ));
     detected
@@ -3905,6 +3945,14 @@ mod tests {
         assert_eq!(
             codex_direct_keyring_target_from_path("abc").as_deref(),
             Some("cli|ba7816bf8f01cfea.Codex Auth")
+        );
+    }
+
+    #[test]
+    fn a_pass_with_nothing_in_scope_reads_no_credential_source() {
+        assert_eq!(
+            detect_signed_in_providers(DetectionScope::default()),
+            DetectedProviders::default()
         );
     }
 

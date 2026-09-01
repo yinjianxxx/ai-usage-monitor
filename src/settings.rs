@@ -216,6 +216,22 @@ pub(crate) struct SettingsFile {
     pub antigravity_credential_access_decided: bool,
     #[serde(default)]
     pub grok_credential_access_decided: bool,
+    /// Whether the user turned this provider's access off themselves.
+    ///
+    /// Distinct from `!allow_*_credentials`: the schema-1 migration marks
+    /// every pre-existing provider as decided while carrying an old `false`
+    /// forward, so "not allowed" there can equally mean "never asked". Only
+    /// the Provider access menu sets this flag, and only it may stop
+    /// detection from reading a provider - otherwise an upgrade could never
+    /// surface a provider that install had never allowed.
+    #[serde(default)]
+    pub claude_credential_access_revoked: bool,
+    #[serde(default)]
+    pub codex_credential_access_revoked: bool,
+    #[serde(default)]
+    pub antigravity_credential_access_revoked: bool,
+    #[serde(default)]
+    pub grok_credential_access_revoked: bool,
     #[serde(
         default = "legacy_provider_order",
         deserialize_with = "deserialize_provider_order"
@@ -262,6 +278,10 @@ impl Default for SettingsFile {
             codex_credential_access_decided: false,
             antigravity_credential_access_decided: false,
             grok_credential_access_decided: false,
+            claude_credential_access_revoked: false,
+            codex_credential_access_revoked: false,
+            antigravity_credential_access_revoked: false,
+            grok_credential_access_revoked: false,
             provider_order: default_provider_order(),
             notify_session_reset: false,
             notify_weekly_reset: false,
@@ -762,6 +782,34 @@ pub(crate) fn save(settings: &SettingsFile) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The schema-1 migration marks every pre-existing provider as decided
+    /// while carrying an old `allow_* = false` forward, so `!allow` there does
+    /// not mean the user said no. Detection keys off the revoked flag instead;
+    /// if the migration ever set it, an upgrade could no longer surface a
+    /// provider that install had never allowed.
+    #[test]
+    fn migrating_an_old_install_revokes_nothing() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "allow_claude_credentials": true,
+                "allow_codex_credentials": false,
+                "allow_antigravity_credentials": false
+            }"#,
+        )
+        .expect("settings parse");
+        assert_eq!(settings.consent_schema_version, 0);
+
+        normalize(&mut settings);
+
+        assert!(settings.codex_credential_access_decided);
+        assert!(settings.antigravity_credential_access_decided);
+        assert!(!settings.allow_codex_credentials);
+        assert!(!settings.codex_credential_access_revoked);
+        assert!(!settings.antigravity_credential_access_revoked);
+        assert!(!settings.claude_credential_access_revoked);
+        assert!(!settings.grok_credential_access_revoked);
+    }
+
     use super::*;
 
     /// A provider name from a newer build must not take the whole settings file

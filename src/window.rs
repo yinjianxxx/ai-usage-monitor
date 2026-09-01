@@ -215,6 +215,13 @@ struct AppState {
     codex_credential_access_decided: bool,
     antigravity_credential_access_decided: bool,
     grok_credential_access_decided: bool,
+    /// Whether the user revoked this provider from the Provider access menu.
+    /// Detection skips a revoked provider; the settings field of the same name
+    /// explains why the `allow_*` switch alone cannot answer this.
+    claude_credential_access_revoked: bool,
+    codex_credential_access_revoked: bool,
+    antigravity_credential_access_revoked: bool,
+    grok_credential_access_revoked: bool,
     provider_order: Vec<tray_icon::TrayIconKind>,
     pending_provider_order: Option<Vec<tray_icon::TrayIconKind>>,
     pending_provider_order_samples: u8,
@@ -1730,6 +1737,10 @@ fn save_state_settings() {
                 codex_credential_access_decided: s.codex_credential_access_decided,
                 antigravity_credential_access_decided: s.antigravity_credential_access_decided,
                 grok_credential_access_decided: s.grok_credential_access_decided,
+                claude_credential_access_revoked: s.claude_credential_access_revoked,
+                codex_credential_access_revoked: s.codex_credential_access_revoked,
+                antigravity_credential_access_revoked: s.antigravity_credential_access_revoked,
+                grok_credential_access_revoked: s.grok_credential_access_revoked,
                 provider_order: s.provider_order.clone(),
                 notify_session_reset: s.notify_session_reset,
                 notify_weekly_reset: s.notify_weekly_reset,
@@ -4132,6 +4143,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                 tray_icon::TrayIconKind::Claude => {
                     s.allow_claude_credentials = allowed;
                     s.claude_credential_access_decided = true;
+                    s.claude_credential_access_revoked = !allowed;
                     if allowed {
                         s.show_claude_code = true;
                     }
@@ -4139,6 +4151,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                 tray_icon::TrayIconKind::Codex => {
                     s.allow_codex_credentials = allowed;
                     s.codex_credential_access_decided = true;
+                    s.codex_credential_access_revoked = !allowed;
                     if allowed {
                         s.show_codex = true;
                     }
@@ -4146,6 +4159,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                 tray_icon::TrayIconKind::Antigravity => {
                     s.allow_antigravity_credentials = allowed;
                     s.antigravity_credential_access_decided = true;
+                    s.antigravity_credential_access_revoked = !allowed;
                     if allowed {
                         s.show_antigravity = true;
                     }
@@ -4153,6 +4167,7 @@ fn set_provider_credential_access(kind: tray_icon::TrayIconKind, allowed: bool) 
                 tray_icon::TrayIconKind::Grok => {
                     s.allow_grok_credentials = allowed;
                     s.grok_credential_access_decided = true;
+                    s.grok_credential_access_revoked = !allowed;
                     if allowed {
                         s.show_grok = true;
                     }
@@ -4366,9 +4381,37 @@ fn apply_provider_visibility(state: &mut AppState, visibility: settings::Provide
 
 /// Detection shells out to `wsl.exe` and reads the Windows keyring, so it runs
 /// on its own short-lived thread and never on the UI thread.
+/// Providers a detection pass may read credentials for.
+///
+/// Access is granted for every provider at once, but the Provider access menu
+/// revokes one at a time. Without this, the sweep at startup and the one every
+/// half hour would read a revoked provider's credentials for as long as the
+/// app runs. Only an explicit revocation narrows the scope - see
+/// `AppState::claude_credential_access_revoked` for why the `allow_*` switch
+/// on its own would also exclude providers an old install was never asked
+/// about, and so would hide a provider the user installed later.
+fn detection_scope(state: &AppState) -> poller::DetectionScope {
+    poller::DetectionScope {
+        claude: !state.claude_credential_access_revoked,
+        codex: !state.codex_credential_access_revoked,
+        antigravity: !state.antigravity_credential_access_revoked,
+        grok: !state.grok_credential_access_revoked,
+    }
+}
+
 fn spawn_provider_detection(reason: DetectionReason) {
+    let scope = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        if !s.credential_consent_granted {
+            return;
+        }
+        detection_scope(s)
+    };
     std::thread::spawn(move || {
-        let detected = poller::detect_signed_in_providers();
+        let detected = poller::detect_signed_in_providers(scope);
         apply_provider_detection(reason, detected);
     });
 }
@@ -4480,16 +4523,8 @@ fn schedule_provider_detection(sweep_now: bool) {
 }
 
 unsafe fn handle_provider_detect_timer() {
-    let granted = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| s.credential_consent_granted)
-            .unwrap_or(false)
-    };
-    if granted {
-        spawn_provider_detection(DetectionReason::Rescan);
-    }
+    // Consent and the per-provider scope are both checked inside.
+    spawn_provider_detection(DetectionReason::Rescan);
 }
 
 /// Exit the process deliberately from the UI thread.
@@ -11590,6 +11625,11 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 antigravity_credential_access_decided: settings
                     .antigravity_credential_access_decided,
                 grok_credential_access_decided: settings.grok_credential_access_decided,
+                claude_credential_access_revoked: settings.claude_credential_access_revoked,
+                codex_credential_access_revoked: settings.codex_credential_access_revoked,
+                antigravity_credential_access_revoked: settings
+                    .antigravity_credential_access_revoked,
+                grok_credential_access_revoked: settings.grok_credential_access_revoked,
                 provider_order: settings.provider_order.clone(),
                 pending_provider_order: None,
                 pending_provider_order_samples: 0,
