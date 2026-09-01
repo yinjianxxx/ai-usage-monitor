@@ -3612,8 +3612,11 @@ impl PollPassPlan {
             now,
         );
         // Mirrors `state_credential_poll_selection`; see the note there.
-        let (show_claude_code, show_codex, show_antigravity, show_grok) =
-            state_credential_poll_selection(state);
+        let selection = state_credential_poll_selection(state);
+        let show_claude_code = selection[tray_icon::TrayIconKind::Claude.index()];
+        let show_codex = selection[tray_icon::TrayIconKind::Codex.index()];
+        let show_antigravity = selection[tray_icon::TrayIconKind::Antigravity.index()];
+        let show_grok = selection[tray_icon::TrayIconKind::Grok.index()];
         Self {
             show_claude_code,
             show_codex,
@@ -4007,51 +4010,58 @@ fn provider_has_credential_access(state: &AppState, kind: tray_icon::TrayIconKin
     )
 }
 
-fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
-    let shown = match kind {
+fn provider_is_shown(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
+    match kind {
         tray_icon::TrayIconKind::Claude => state.show_claude_code,
         tray_icon::TrayIconKind::Codex => state.show_codex,
         tray_icon::TrayIconKind::Antigravity => state.show_antigravity,
         tray_icon::TrayIconKind::Grok => state.show_grok,
-    };
+    }
+}
+
+fn provider_access_revoked(state: &AppState, kind: tray_icon::TrayIconKind) -> bool {
     access_is_revoked(
-        shown,
+        provider_is_shown(state, kind),
         state.credential_consent_decided,
         provider_has_credential_access(state, kind),
     )
 }
 
+/// Which providers a poll pass may contact, indexed like `AppUsageData`.
+///
+/// Deliberately an array rather than a tuple: the tuple version was read with
+/// `.0 || .1 || .2` at the worker gate, which silently excluded the fourth
+/// provider for a whole release. An array cannot be consumed that way by
+/// accident.
 fn credential_poll_selection(
-    shown: (bool, bool, bool, bool),
-    allowed: (bool, bool, bool, bool),
-) -> (bool, bool, bool, bool) {
-    (
-        shown.0 && allowed.0,
-        shown.1 && allowed.1,
-        shown.2 && allowed.2,
-        shown.3 && allowed.3,
-    )
+    shown: [bool; tray_icon::TrayIconKind::COUNT],
+    allowed: [bool; tray_icon::TrayIconKind::COUNT],
+) -> [bool; tray_icon::TrayIconKind::COUNT] {
+    let mut selection = [false; tray_icon::TrayIconKind::COUNT];
+    for kind in tray_icon::TrayIconKind::ALL {
+        selection[kind.index()] = shown[kind.index()] && allowed[kind.index()];
+    }
+    selection
 }
 
-fn state_credential_poll_selection(state: &AppState) -> (bool, bool, bool, bool) {
+/// Whether a poll pass has anything to contact. The gate `request_poll_with`
+/// uses, named so a test can reach it.
+fn poll_selection_has_target(selection: [bool; tray_icon::TrayIconKind::COUNT]) -> bool {
+    selection.into_iter().any(|polled| polled)
+}
+
+fn state_credential_poll_selection(state: &AppState) -> [bool; tray_icon::TrayIconKind::COUNT] {
     // Must stay in step with `PollPassPlan::from_state`: this decides whether
     // a poll worker starts at all, that decides what the pass targets. If the
     // two disagree a worker can start with nothing to do, or worse, a target
     // can be polled without a running worker to commit it.
-    credential_poll_selection(
-        (
-            state.show_claude_code,
-            state.show_codex,
-            state.show_antigravity,
-            state.show_grok,
-        ),
-        (
-            provider_has_credential_access(state, tray_icon::TrayIconKind::Claude),
-            provider_has_credential_access(state, tray_icon::TrayIconKind::Codex),
-            provider_has_credential_access(state, tray_icon::TrayIconKind::Antigravity),
-            provider_has_credential_access(state, tray_icon::TrayIconKind::Grok),
-        ),
-    )
+    let mut shown = [false; tray_icon::TrayIconKind::COUNT];
+    let mut allowed = [false; tray_icon::TrayIconKind::COUNT];
+    for kind in tray_icon::TrayIconKind::ALL {
+        shown[kind.index()] = provider_is_shown(state, kind);
+        allowed[kind.index()] = provider_has_credential_access(state, kind);
+    }
+    credential_poll_selection(shown, allowed)
 }
 
 fn clear_provider_usage(state: &mut AppState, kind: tray_icon::TrayIconKind) {
@@ -12024,7 +12034,7 @@ fn request_poll_with(force_claude_refresh: bool) {
         let has_allowed_provider = state
             .as_ref()
             .map(state_credential_poll_selection)
-            .is_some_and(|selection| selection.0 || selection.1 || selection.2);
+            .is_some_and(poll_selection_has_target);
         if has_allowed_provider {
             (
                 POLL_COORDINATOR.request(force_claude_refresh),
@@ -14957,17 +14967,34 @@ mod reset_notification_tests {
     #[test]
     fn credential_poll_selection_requires_visibility_and_explicit_consent() {
         assert_eq!(
-            credential_poll_selection((true, true, true, true), (false, false, false, false)),
-            (false, false, false, false)
+            credential_poll_selection([true, true, true, true], [false, false, false, false]),
+            [false, false, false, false]
         );
         assert_eq!(
-            credential_poll_selection((false, false, false, false), (true, true, true, true)),
-            (false, false, false, false)
+            credential_poll_selection([false, false, false, false], [true, true, true, true]),
+            [false, false, false, false]
         );
         assert_eq!(
-            credential_poll_selection((true, false, true, true), (true, true, false, true)),
-            (true, false, false, true)
+            credential_poll_selection([true, false, true, true], [true, true, false, true]),
+            [true, false, false, true]
         );
+    }
+
+    /// The worker gate used to read the selection as `.0 || .1 || .2`, so a
+    /// profile whose only usable provider was the fourth one never started a
+    /// poll at all - a fresh install that detects Grok alone lands exactly
+    /// there. The gate is asserted here, not just the selection, because the
+    /// selection was already correct while the gate was not.
+    #[test]
+    fn a_profile_whose_only_usable_provider_is_last_still_polls() {
+        let grok_only =
+            credential_poll_selection([false, false, false, true], [false, false, false, true]);
+        assert_eq!(grok_only, [false, false, false, true]);
+        assert!(poll_selection_has_target(grok_only));
+        assert!(!poll_selection_has_target(credential_poll_selection(
+            [false, false, false, false],
+            [true, true, true, true]
+        )));
     }
 
     /// The version entry should state what is known, not offer a chore. Before
