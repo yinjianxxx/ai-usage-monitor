@@ -10294,6 +10294,19 @@ unsafe fn hide_widget_tooltip(owner: HWND, clear_hover: bool) {
     }
 }
 
+/// The detail popup shows the same numbers with room to spare, so a hover
+/// tooltip beside it is redundant and reads as a stuck window. Clicking the
+/// widget hides the tooltip, but the pointer is still over the badge it came
+/// from, so the very next mouse move would otherwise count as a new hover and
+/// bring it back on top of the popup.
+fn detail_popup_is_open() -> bool {
+    let detail_hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.details_hwnd)
+    };
+    detail_hwnd.is_some_and(|hwnd| unsafe { IsWindow(hwnd).as_bool() })
+}
+
 unsafe fn update_widget_tooltip_hover(owner: HWND, client_x: i32, client_y: i32) {
     let next = widget_tooltip_kind_at(client_x, client_y);
     let changed = {
@@ -10309,13 +10322,20 @@ unsafe fn update_widget_tooltip_hover(owner: HWND, client_x: i32, client_y: i32)
         return;
     }
     hide_widget_tooltip(owner, false);
-    if next.is_some() && SetTimer(owner, TIMER_WIDGET_TOOLTIP, WIDGET_TOOLTIP_DELAY_MS, None) == 0 {
+    if next.is_some()
+        && !detail_popup_is_open()
+        && SetTimer(owner, TIMER_WIDGET_TOOLTIP, WIDGET_TOOLTIP_DELAY_MS, None) == 0
+    {
         diagnose::log("widget tooltip: unable to start hover timer");
     }
 }
 
 unsafe fn show_widget_tooltip_for_hover(owner: HWND) {
     let _ = KillTimer(owner, TIMER_WIDGET_TOOLTIP);
+    if detail_popup_is_open() {
+        hide_widget_tooltip(owner, false);
+        return;
+    }
     let expected = lock_widget_tooltip_runtime().hover_kind;
     let Some(kind) = expected else {
         return;
