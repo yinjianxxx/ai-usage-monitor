@@ -1,9 +1,9 @@
 # v2.5.1 release verification
 
 - Date: 2026-09-01
-- Candidate: `claude/v2.5.1-fixes`, based on `v2.5.0` / `0b478f1`, at `7bbdd96`
-  plus the uncommitted version bump and re-rendered README previews described
-  below. Not tagged, not pushed. `Cargo.toml` and `Cargo.lock` read `2.5.1`.
+- Candidate: `claude/v2.5.1-fixes`, based on `v2.5.0` / `0b478f1`, at the
+  release-prep commit that follows `7bbdd96`. Not tagged, not pushed.
+  `Cargo.toml` and `Cargo.lock` read `2.5.1`.
 - Scope: three defects that had shipped silently since v2.4.1 or earlier
   (informational tray balloons never displayed, periodic provider detection
   never ran, detection ignoring a revoked provider's per-provider switch), a
@@ -405,8 +405,6 @@ The owner's decision to keep the Gengchou mark in that slot therefore stands.
 
 ## Open
 
-- The version bump (`Cargo.toml`, `Cargo.lock`) and the four re-rendered
-  `detail-popup-*.png` are in the working tree and not yet committed.
 - `7bbdd96` - consent schema 3 and the pending-review strings in all eleven
   languages - landed after the third review round and has had no independent
   review. Every earlier round returned at least one accepted blocker.
