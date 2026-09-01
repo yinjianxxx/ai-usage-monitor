@@ -4399,6 +4399,19 @@ fn detection_scope(state: &AppState) -> poller::DetectionScope {
     }
 }
 
+/// Drop whatever a pass found for providers that are no longer in scope.
+fn mask_detection(
+    detected: poller::DetectedProviders,
+    scope: poller::DetectionScope,
+) -> poller::DetectedProviders {
+    poller::DetectedProviders {
+        claude: detected.claude && scope.claude,
+        codex: detected.codex && scope.codex,
+        antigravity: detected.antigravity && scope.antigravity,
+        grok: detected.grok && scope.grok,
+    }
+}
+
 fn spawn_provider_detection(reason: DetectionReason) {
     let scope = {
         let state = lock_state();
@@ -4426,6 +4439,12 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
         if !s.credential_consent_granted {
             return;
         }
+        // A single provider can be revoked mid-pass too. The scope was
+        // sampled before the worker started, so a stale result could
+        // otherwise re-enable a provider the user just turned off - manual
+        // detection assigns `allow_*` from what it found - and send its token
+        // on the poll that follows.
+        let detected = mask_detection(detected, detection_scope(s));
         let before = state_provider_visibility(s);
         let mut after = before;
         let announcements = match reason {
@@ -13573,18 +13592,35 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                     // knows this provider exists, so detection
                                     // never announces it afterwards.
                                     s.claude_credential_access_decided = true;
+                                    // Showing a provider again restores access,
+                                    // so it is no longer revoked. Leaving the
+                                    // flag set would let access and detection
+                                    // drift apart: polled and read, yet never
+                                    // detectable again.
+                                    if grant {
+                                        s.claude_credential_access_revoked = false;
+                                    }
                                 }
                                 tray_icon::TrayIconKind::Codex => {
                                     s.allow_codex_credentials |= grant;
                                     s.codex_credential_access_decided = true;
+                                    if grant {
+                                        s.codex_credential_access_revoked = false;
+                                    }
                                 }
                                 tray_icon::TrayIconKind::Antigravity => {
                                     s.allow_antigravity_credentials |= grant;
                                     s.antigravity_credential_access_decided = true;
+                                    if grant {
+                                        s.antigravity_credential_access_revoked = false;
+                                    }
                                 }
                                 tray_icon::TrayIconKind::Grok => {
                                     s.allow_grok_credentials |= grant;
                                     s.grok_credential_access_decided = true;
+                                    if grant {
+                                        s.grok_credential_access_revoked = false;
+                                    }
                                 }
                             }
                         }
@@ -15426,6 +15462,31 @@ mod reset_notification_tests {
         assert!(watchdog_needs_taskbar_recovery(true, false, true));
         assert!(watchdog_needs_taskbar_recovery(false, false, true));
         assert!(!watchdog_needs_taskbar_recovery(false, false, false));
+    }
+
+    /// A pass samples its scope before the worker starts, so a revocation
+    /// landing while it runs must not be undone by the stale result: manual
+    /// detection assigns `allow_*` from what it found, which would re-enable
+    /// the provider and send its token on the poll that follows.
+    #[test]
+    fn a_revocation_during_a_detection_pass_survives_the_result() {
+        let found_everything = poller::DetectedProviders {
+            claude: true,
+            codex: true,
+            antigravity: true,
+            grok: true,
+        };
+        let claude_revoked_meanwhile = poller::DetectionScope {
+            claude: false,
+            codex: true,
+            antigravity: true,
+            grok: true,
+        };
+
+        let applied = mask_detection(found_everything, claude_revoked_meanwhile);
+
+        assert!(!applied.claude);
+        assert!(applied.codex && applied.antigravity && applied.grok);
     }
 
     #[test]
