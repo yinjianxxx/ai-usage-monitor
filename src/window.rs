@@ -4398,10 +4398,17 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
 ///
 /// Only meaningful once access has been granted; the timer checks again when
 /// it fires, so a user who grants access later still gets swept.
-fn schedule_provider_detection(hwnd: HWND) {
+///
+/// Armed on the process-level helper rather than the embedded widget, for the
+/// same reason as the poll timer: explorer destroying the taskbar stops the
+/// embedded child receiving any message, `WM_TIMER` included. `WM_TIMER` is
+/// delivered to the window it was armed on, so arming it anywhere whose window
+/// procedure lacks a `TIMER_PROVIDER_DETECT` arm drops the sweep silently -
+/// which is exactly how this went unnoticed from v2.4.1 to v2.5.0.
+fn schedule_provider_detection() {
     unsafe {
         SetTimer(
-            hwnd,
+            poll_controller_hwnd(),
             TIMER_PROVIDER_DETECT,
             PROVIDER_DETECT_INTERVAL_MS,
             None,
@@ -11676,7 +11683,7 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         // Existing installs are migrated in `settings::normalize` and never
         // reach the prompt.
         prompt_for_initial_consent(hwnd);
-        schedule_provider_detection(hwnd);
+        schedule_provider_detection();
 
         schedule_countdown_timer();
         show_pending_persistence_warning_once();
@@ -12992,6 +12999,11 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
+                }
+                // `poll_controller_hwnd` falls back to this window when the
+                // helper is gone, so both procs answer for controller timers.
+                TIMER_PROVIDER_DETECT => {
+                    handle_provider_detect_timer();
                 }
                 TIMER_TRAY_ORDER => {
                     migrate_legacy_placements_if_needed();
