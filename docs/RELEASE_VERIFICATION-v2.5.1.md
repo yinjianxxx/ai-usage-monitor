@@ -16,7 +16,19 @@ Run locally on Windows 11 26200:
 
 - `cargo fmt --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 316 passed, 0 failed
+- `cargo test --locked` - 317 passed, 0 failed
+- `cargo audit` against the committed `Cargo.lock` - 122 dependencies scanned,
+  no advisories, exit 0. `.cargo/audit.toml` denies warnings, so that is clean
+  too. Run with a locally installed cargo-audit 0.22.1; the newest release
+  needs rustc 1.88 and this machine is on 1.86. CI pins
+  `rustsec/audit-check@v2.0.0`, which carries its own cargo-audit, so a future
+  advisory could still surface there first.
+- `tests/update_ready_inbound_e2e.ps1` - passed: active readiness and locked
+  confirmed-backup cleanup
+- `tests/updater_e2e.ps1 -Scenario Success` - passed: old process exited, new
+  one alive, target hash, ready hand-off and transaction cleanup verified
+- `tests/updater_e2e.ps1 -Scenario ChildExit` - passed: helper rejected the
+  child, restored the old hash, relaunched, and retained the verified `.old`
 
 Each of the six commits was type-checked in isolation before being recorded, so
 the branch is bisectable.
@@ -124,8 +136,9 @@ their disposition:
   what those tests claim to guard; mutating what they do guard does fail them.
   The valid half - that they do not cover the scheduling entry point, while
   this document implied they did - is corrected above.
-- **Open.** `Cargo.toml` is still `2.5.0`, and the full release gate set
-  (current RustSec, updater E2E) has not been run for this candidate.
+- **Accepted, now closed.** The release gate set beyond fmt/clippy/test had not
+  been run for this candidate. RustSec and all three updater E2E scenarios have
+  since been run and are recorded above. `Cargo.toml` is still `2.5.0`.
 
 ## Deferred v2.5.0 smoke items, now closed
 
@@ -202,4 +215,5 @@ The owner's decision to keep the Gengchou mark in that slot therefore stands.
 
 ## Open
 
-- `Cargo.toml` still reads `2.5.0`; bump before tagging.
+- `Cargo.toml` still reads `2.5.0`; bump before tagging, then re-run the
+  release build so the PE version metadata matches the tag.
