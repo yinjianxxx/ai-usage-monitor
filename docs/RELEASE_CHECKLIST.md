@@ -49,6 +49,16 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - Debug compact-surface gate: `cargo run --locked -- --dump-widget
   tmp/compact-release-check`; inspect every generated theme, warning/error,
   High Contrast, tooltip, and mixed-digit alignment fixture.
+- Every regression test added for this release asserts on the production path,
+  not on a helper or a copy of the value under test, and each one is
+  mutation-checked: revert the behaviour it names and watch it fail. Two v2.5.1
+  tests were written against a field-for-field copy of the detection scope and
+  against an unchanged intersection helper, and stayed green under the exact
+  revert they claimed to guard.
+- An independent agent reviews the release candidate read-only before the tag,
+  with the already-dispositioned findings listed so it does not repeat them.
+  The v2.5.1 final review returned two accepted blockers after four earlier
+  rounds, one of them a regression introduced by the round before it.
 
 ## Manual Windows smoke test
 
@@ -168,6 +178,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   continues while inactive. The widget must stay hidden rather than appearing
   as a desktop popup, then re-embed from cached state as soon as the taskbar
   returns.
+- Walk every entry point of a behaviour that has more than one, not just the
+  one that is easiest to reach. Granting a pending provider is reachable from
+  **Provider access** and from the review inside **Detect providers again**;
+  the v2.5.1 walk-through used the first and shipped a defect that only the
+  second exposed.
 - Confirm Provider tray icons, Widget, and Floating Window appear in that
   order before Settings as direct checked toggles. Confirm the taskbar and
   floating-window position resets remain under Settings and no floating-window
