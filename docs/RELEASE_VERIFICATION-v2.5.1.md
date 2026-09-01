@@ -131,6 +131,17 @@ it, and the icon resource in the WinGet-installed v2.4.2 executable is
 identical. Only the provider tiles have dark and light variants, and only for
 Claude and Antigravity.
 
+Others have reported the same behaviour: Windows applies an automatic contrast
+adjustment to the app icon slot in the notification center, and it is reported
+not to affect the taskbar or the tray icon - which is what we observe with the
+same `HICON`. Reporters found it driven by the icon's own tone rather than by
+the system theme alone, and found no way to opt out or to supply a
+theme-specific icon; the toolkit maintainers only backlogged it. That is a
+community report, not a documented rule, and it does not fully match what we
+see: it claims a multi-hue icon is not inverted, while ours has four hues and
+is. Its neutral dark tile covers most of the area, so a dominant-tone heuristic
+would explain it - but that is inference, not established.
+
 Nothing can be done about it from here: `Shell_NotifyIcon` has no parameter for
 the attribution icon. The three other places the application icon appears - the
 notification area, the main window and detail popup title bars, and the
