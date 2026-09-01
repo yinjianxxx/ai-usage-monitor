@@ -530,6 +530,26 @@ between left it pending and kept it out of the detection scope
 (`scope: ... grok=false`), which is the same run showing that the third answer
 still changes nothing.
 
+Both fixes were sent back to the same reviewer, which re-ran the targeted case,
+the suite (350), clippy and fmt against `08fa3ac` and returned "can ship" with
+no new blockers. It confirmed what the fixes had to get right rather than only
+that they compile: the Manual branch now reaches the same six post-conditions
+in the same order as the Provider access entries; `Keep closed` correctly also
+reports a change, because the cleared usage has to leave the surfaces at once;
+no modal dialog, file write or UI call is made under the state lock, and the
+generation bump inside it still prevents a stale worker from committing. For
+the watch, it walked the four windows in which a credential can change - before
+the snapshot, between snapshot and poll, during the poll, and after the poll's
+own post-snapshot - and found each one covered, and confirmed the self-
+sustaining 15-second repeat is gone because mode and snapshot are now written
+together.
+
+Its one non-blocking note was a wording precision issue: the release note said
+a change of watched set "costs exactly one refresh", while the coordinator can
+merge the watch's request with one the UI path already started, so the total
+can be two passes. The sentence now says the watch asks once and then goes
+quiet, which is the claim that is actually true.
+
 Verified as correct by the same review, and re-checked here: the schema-3
 migration and the five read paths; `IDCANCEL` serving as both the third
 custom button and the cancel result, which is documented behaviour and is
@@ -608,10 +628,12 @@ settings and cache it wrote.
   the suite builds one. Closing it properly means giving `AppState` a test
   builder or serializing tests around the global `STATE`, which is not work for
   a patch release. The behaviour is covered by the revocation smoke runs.
-- The credential-watch repeat is covered by `credential_watch_outcome` and by
-  reading the call site, not by a live run: reproducing it means narrowing the
-  watched set and watching the 15-second parked cadence for a minute. The
-  earlier fault it replaced was diagnosed the same way.
+- The credential-watch behaviour is covered by `credential_watch_outcome`, by
+  reading the call site and by the fifth-round re-check, not by a live run:
+  reproducing it means narrowing the watched set and watching the 15-second
+  parked cadence for a minute. The earlier fault it replaced was diagnosed the
+  same way. Neither fifth-round fix has an `AppState`-level regression test,
+  for the reason in the follow-up above.
 - Everything else the release checklist can reach on this machine has been
   walked.
 - What remains after that is the release itself: push, merge to `main`, tag,
