@@ -619,6 +619,35 @@ settings and cache it wrote.
   and **Allow access** behaved as before. The reworded hint was confirmed on a
   provider that had never been granted access.
 
+## Post-release WinGet walk-through, 2026-09-02
+
+Run against the public package once the WinGet source index picked up 2.5.1;
+the manifest merged into the registry on 2026-09-01 and the index lagged it by
+a few hours.
+
+- `winget upgrade --id ynjmxn.Gengchou --exact` moved the installed package to
+  2.5.1, verifying the installer hash against the manifest as it went.
+- The command alias is `gengchou`, resolving to
+  `%LOCALAPPDATA%\Microsoft\WinGet\Links\gengchou.exe` and reporting
+  ProductVersion 2.5.1.
+- Update detection afterwards reports no available upgrade, so the installed
+  version and the index agree.
+- Launched through that alias against a disposable profile: it starts, writes
+  its diagnostic log and reaches its window.
+- `winget uninstall` removes the package and the alias; `winget install`
+  restores it at 2.5.1.
+
+Stated plainly: the uninstall/reinstall pair ran on this machine's account, not
+on a separate Windows profile - that would need a second local user. The
+fresh-install behaviour the row exists to check (one permission prompt, nothing
+read before it is answered, no settings file written) was verified directly
+against the published zip with an empty `APPDATA`/`LOCALAPPDATA`.
+
+An earlier attempt at this row upgraded the installed package to 2.5.0 by
+mistake: the index-readiness check matched the version number echoed back
+inside `winget show`'s own "version not found" message. It now reads the exit
+code.
+
 ## Open
 
 - One follow-up remains for a later release, and it is not a release gate:
