@@ -29,8 +29,8 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, TASKDIALOGCONFIG,
-    TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON,
-    TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED,
+    TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TASKDIALOG_NOTIFICATIONS, TDCBF_NO_BUTTON,
+    TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_CAN_BE_MINIMIZED, TDN_CREATED,
 };
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -3907,6 +3907,43 @@ fn credential_consent_fallback_message_box_style() -> MESSAGEBOX_STYLE {
     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND
 }
 
+/// Give the consent dialog this application's own icon.
+///
+/// The dialog is deliberately created with no parent so the user can minimize
+/// it and decide later, which also means there is no parent window whose icon
+/// it could inherit: left alone it shows a generic shell icon and does not
+/// look like it came from Gengchou. A task dialog's title-bar icon is not
+/// covered by `hMainIcon` - that only fills the content area - so it is set
+/// here, once the window exists.
+unsafe extern "system" fn credential_consent_task_dialog_callback(
+    hwnd: HWND,
+    msg: TASKDIALOG_NOTIFICATIONS,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    _data: isize,
+) -> windows::core::HRESULT {
+    if msg == TDN_CREATED {
+        let (large_icon, small_icon) = load_embedded_app_icons();
+        if !large_icon.is_invalid() {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_BIG as usize),
+                LPARAM(large_icon.0 as isize),
+            );
+        }
+        if !small_icon.is_invalid() {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_SMALL as usize),
+                LPARAM(small_icon.0 as isize),
+            );
+        }
+    }
+    windows::core::HRESULT(0)
+}
+
 fn credential_consent_task_dialog_flags() -> TASKDIALOG_FLAGS {
     TDF_ALLOW_DIALOG_CANCELLATION | TDF_CAN_BE_MINIMIZED
 }
@@ -4134,6 +4171,7 @@ fn show_credential_consent_prompt(hwnd: HWND, language: LanguageId) -> bool {
             pszMainInstruction: PCWSTR::from_raw(title_wide.as_ptr()),
             pszContent: PCWSTR::from_raw(message_wide.as_ptr()),
             nDefaultButton: credential_consent_default_button(),
+            pfCallback: Some(credential_consent_task_dialog_callback),
             ..Default::default()
         };
         let mut selected_button = credential_consent_default_button();
