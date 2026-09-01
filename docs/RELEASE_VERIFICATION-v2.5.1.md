@@ -1,8 +1,9 @@
 # v2.5.1 release verification
 
 - Date: 2026-09-01
-- Candidate: in progress on `claude/v2.5.1-fixes`, based on `v2.5.0` /
-  `0b478f1`. Not tagged, not pushed; `Cargo.toml` still reads `2.5.0`.
+- Candidate: `claude/v2.5.1-fixes`, based on `v2.5.0` / `0b478f1`, at `7bbdd96`
+  plus the uncommitted version bump and re-rendered README previews described
+  below. Not tagged, not pushed. `Cargo.toml` and `Cargo.lock` read `2.5.1`.
 - Scope: three defects that had shipped silently since v2.4.1 or earlier
   (informational tray balloons never displayed, periodic provider detection
   never ran, detection ignoring a revoked provider's per-provider switch), a
@@ -18,11 +19,35 @@
 
 ## Automated gates
 
-Run locally on Windows 11 26200:
+Run locally on Windows 11 26200 on 2026-09-01, all against the same tree:
+`7bbdd96` with the version bumped to `2.5.1`. An earlier run at `cb0ceac`
+reported 324 tests; the 20 added by `7bbdd96` are the difference, so that run
+is superseded rather than repeated here.
 
-- `cargo fmt --check` - clean
+- `cargo fmt --all -- --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 324 passed, 0 failed
+- `cargo test --locked` - 344 passed, 0 failed
+- `cargo build --release --locked` - clean. Built with `CARGO_TARGET_DIR`
+  pointed at `target\release-gate`, because an earlier branch build (PE version
+  `2.5.0`) was running from `target\release\gengchou.exe` and the linker cannot
+  replace a running image. Nothing in the build depends on the target directory.
+- `tools\check-portable-runtime.ps1 -ExecutablePath
+  target\release-gate\release\gengchou.exe` - passed, no external MSVC/UCRT
+  imports
+- PE properties of that build: ProductName `Gengchou`, ProductVersion and
+  FileVersion `2.5.1`, OriginalFilename `gengchou.exe`, upstream
+  copyright and `Comments` retained
+- `tools\check-retired-identity.ps1` - passed, 13 historical lines
+- compact-surface debug gate: `--dump-widget tmp\compact-release-check` - 37
+  fixtures generated (badges, floating rows, tooltips; dark, light and High
+  Contrast; normal, warning, error, stale, auth and no-data states, plus the
+  mixed-digit alignment pair). All 37 were inspected as images; no clipping,
+  no misalignment, no illegible High Contrast text.
+- README previews re-rendered from this build with
+  `tools\render-readme-images.ps1`. Only the four `detail-popup-*.png` changed,
+  and only in the footer version (`v2.5.0` to `v2.5.1`); the widget, floating
+  and tray strips are byte-identical, which is the expected deterministic
+  result.
 - `cargo audit` against the committed `Cargo.lock` - 122 dependencies scanned,
   no advisories, exit 0. `.cargo/audit.toml` denies warnings, so that is clean
   too. Run with a locally installed cargo-audit 0.22.1; the newest release
@@ -37,10 +62,10 @@ Run locally on Windows 11 26200:
   child, restored the old hash, relaunched, and retained the verified `.old`
 
 Each commit that touches `src/` was type-checked in isolation when it was
-recorded, so the branch is bisectable. That covered the first six; the four
-added after the first independent review, and the commits from the second,
-were each checked the same way as they were made. The gate results above were
-re-run against the final HEAD, not inherited from an earlier one.
+recorded, so the branch is bisectable: the first six, the four added after the
+first independent review, and every commit from the second and third rounds
+were each checked the same way as they were made. The gate results above are
+the re-run at the final tree, not inherited from an earlier one.
 
 ## Targeted regression evidence
 
@@ -380,5 +405,17 @@ The owner's decision to keep the Gengchou mark in that slot therefore stands.
 
 ## Open
 
-- `Cargo.toml` still reads `2.5.0`; bump before tagging, then re-run the
-  release build so the PE version metadata matches the tag.
+- The version bump (`Cargo.toml`, `Cargo.lock`) and the four re-rendered
+  `detail-popup-*.png` are in the working tree and not yet committed.
+- `7bbdd96` - consent schema 3 and the pending-review strings in all eleven
+  languages - landed after the third review round and has had no independent
+  review. Every earlier round returned at least one accepted blocker.
+- The manual smoke rows this release added or changed have not been walked on
+  the machine: revocation scope, the pending/needs-review choices, the
+  `CredentialUnusable` classification, an informational balloon on a light
+  system theme, and High Contrast on a real High Contrast desktop. See
+  "Not verified" above for the rest.
+- Tagging order: merge to `main`, then tag. `git merge-base --is-ancestor
+  v2.5.0 HEAD` already passes, so the workflow's ancestry gate is satisfied,
+  and `.github/workflows/release.yml` additionally requires the tag to equal
+  the `Cargo.toml` version, which the bump above now satisfies.
