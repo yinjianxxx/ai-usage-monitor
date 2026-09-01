@@ -65,7 +65,10 @@ show the exact pixels the shipped code draws. Regenerate them any time with
 - **Tray icons.** One live icon per enabled provider — the number and adaptive
   bars follow whatever quota windows that provider reports; with no data the
   number gives way to the provider's initial. Disable **Provider tray icons**
-  to keep a single neutral app icon instead.
+  to keep a single neutral app icon instead. The app icon also stands in
+  whenever no provider has been granted credential access, since there is no
+  provider whose mark would be honest to show; your preference is untouched
+  and the provider icons return as soon as one is authorized.
 - **Detail popup.** Opens from a left-click on any surface: per-provider
   status badges, exact reset clock times, and a live refresh countdown. Its
   separate pin and position-lock controls can keep it open or stop it moving.
@@ -270,8 +273,11 @@ token refresh continues to work without copying the token into Gengchou.
 Upgrading from an earlier version does not show the prompt again and keeps the
 existing provider selection and permissions as they are. To pick up a newly
 installed provider, use **Provider access → Detect providers again**. Gengchou
-also checks periodically and shows a single notification when it finds a newly
-signed-in provider; it never changes what is displayed on its own.
+also checks once shortly after each start and periodically thereafter, and
+shows a single notification when it finds a newly signed-in provider; it never
+changes what is displayed on its own. The check at startup is what tells you
+about a provider added by an upgrade, rather than making you wait out the
+first interval.
 
 A provider with no credential on this machine shows **Not detected** in the
 detail popup along with a note that it is recognized automatically after

@@ -69,8 +69,12 @@ upgraded install (`allow_grok_credentials` true, `show_grok` false,
 consent migration). `show_grok` remained false afterwards, so the sweep
 notified without changing what was on screen.
 
-Two unit tests were added and both were mutation-checked: reverting the
-behaviour each guards makes the corresponding test fail.
+Two unit tests were added, both mutation-checked: reverting the behaviour each
+guards makes the corresponding test fail. What they guard is the settings-level
+outcome - a migrated install still owes a balloon, and a sweep immediately after
+first-run detection is silent. Neither reaches `schedule_provider_detection`,
+so neither would catch the startup call being passed the wrong flag; that part
+rests on the run above, not on a test.
 
 ### Interface fixes
 
@@ -78,6 +82,50 @@ Confirmed on the machine by the owner: the application icon in the notification
 area while no provider is authorised, the Gengchou icon in the credential
 dialog's title bar, and the hover tooltip no longer reappearing beside an open
 detail popup.
+
+## Independent review
+
+A Codex agent in the same workspace reviewed the branch read-only and returned
+a verdict of "does not pass". It independently re-ran fmt, clippy, the test
+suite, a release build, the portable-runtime and retired-identity gates, and
+confirmed each of the six code commits compiles in isolation. Its findings and
+their disposition:
+
+- **Accepted, release blocker.** The poll worker gate read the four-provider
+  selection as `.0 || .1 || .2`, so a profile whose only shown and authorized
+  provider was Grok never started a poll at all - including a fresh install
+  that detects Grok alone. Present in v2.5.0 as shipped; `git log -S` dates it
+  to `b39e0c7`, not to this branch. This is the same "parallel expression"
+  shape that a review caught in v2.5.0, so the selection is now an array
+  indexed by `TrayIconKind`, which cannot be consumed three-quarters of the way
+  by accident, and a regression test asserts the gate itself rather than the
+  selection.
+- **Accepted.** The balloon image cache held one slot keyed by DPI and
+  destroyed the previous handle on a DPI change, which could free a handle the
+  shell was still about to draw. It now keeps one per DPI and evicts nothing.
+- **Accepted.** `icon_guids_are_stable_and_unique` and
+  `bundled_provider_tiles_use_exact_png_and_hicon_sizes` both spelled out three
+  providers, so neither covered Grok. Both now iterate `TrayIconKind::ALL`.
+- **Accepted.** The consent dialog callback extracted a fresh icon pair on
+  every open and never released it. The pair is now cached for the process.
+- **Accepted in part.** Eleven `SetTimer` call sites discarded the return
+  value; a timer that never armed is exactly the failure shape this release
+  fixes, so they now report it. The review also asked for the same treatment
+  on `Shell_NotifyIconW`. Declined for `NIM_DELETE`: `sync` calls it for every
+  provider that is not shown, most of which were never registered, so failure
+  there is the normal path and logging it would bury real diagnostics. The
+  reasoning is recorded at those call sites so it is not re-litigated.
+- **Accepted.** Both READMEs still described the application icon as appearing
+  only when provider tray icons are disabled, and described detection as
+  periodic only.
+- **Rejected in part.** The review reported that the two new settings tests are
+  not mutation-sensitive, having mutated the argument passed to
+  `schedule_provider_detection` and seen both still pass. That argument is not
+  what those tests claim to guard; mutating what they do guard does fail them.
+  The valid half - that they do not cover the scheduling entry point, while
+  this document implied they did - is corrected above.
+- **Open.** `Cargo.toml` is still `2.5.0`, and the full release gate set
+  (current RustSec, updater E2E) has not been run for this candidate.
 
 ## Deferred v2.5.0 smoke items, now closed
 
