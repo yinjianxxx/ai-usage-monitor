@@ -91,8 +91,13 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - Force a WSL credential probe spawn failure, timeout, and unexpected exit;
   each must follow the transient request-failure path and must not show an
   authentication warning. A concrete credential file that is present but
-  unreadable (including the WSL exit-45 path), malformed, expired, or rejected
-  must still use **Authentication failed** and the sign-in recovery.
+  unreadable, malformed, expired, or rejected must still use **Authentication
+  failed** and the sign-in recovery. Inside WSL that distinction is Claude's
+  only: its probe reports exit 45 for a present-but-unreadable file, while the
+  Codex, Antigravity and Grok probes report only success or nothing and must
+  fall through quietly to the next source. Check the Windows-side paths for
+  those three instead - a malformed `auth.json` or an unparsable Credential
+  Manager entry must show **Authentication failed**, not **Not detected**.
 - Confirm a provider with no credential shows **Not detected** with the
   automatic-recognition note and raises no notification, while a concrete but
   unusable credential shows **Authentication failed**. Both credential states

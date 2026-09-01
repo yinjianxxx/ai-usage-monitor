@@ -17,18 +17,26 @@ identity, or release automation.
 - Never log, persist, commit, or include in diagnostics any token, cookie,
   account identifier, or raw credential/CLI response.
 - Read provider credentials only after explicit consent, and never for a
-  provider the user has turned off under Provider access - detection included,
-  at every start and on every sweep. A provider that was never turned off stays
+  provider the user has turned off under Provider access - detection and the
+  credential watch included, at every start, on every sweep, and on every poll
+  pass. A provider that was never turned off stays
   in scope even when it is not currently enabled: detection is the only way a
   newly installed provider is ever noticed. Send a credential only to the
   provider that issued it.
 - A missing credential is **Not detected**. A Windows-local credential source
   that is unreadable or malformed, and any credential the provider expires or
   rejects, is grouped as **Authentication failed**, because the user recovery
-  is to sign in again. Failure to start or complete a WSL probe is not proof of
-  an authentication failure: a WSL probe cannot tell an absent credential from
-  a distro that failed to answer, so it only moves on to the next source and a
-  provider that lives solely in WSL still reads as **Not detected**.
+  is to sign in again. Failure to start or complete a WSL probe is never proof
+  of an authentication failure and takes the transient request-failure path.
+- How far that reaches into WSL differs per provider, deliberately. Claude's
+  probe reports its own outcome, so an absent credential, a present but
+  unreadable one, and a probe that did not answer stay distinct there. The
+  Codex, Antigravity and Grok probes report only success or nothing, so they
+  cannot separate a distribution that has no credential from one that failed to
+  answer; they move on to the next source instead of guessing, and a credential
+  that lives solely in an unreachable distribution reads as **Not detected**
+  for those three. Do not classify a bare WSL failure as unusable for them: it
+  would raise a sign-in warning for a probe that was merely slow.
 - Routine notifications use the Gengchou icon and are silent. Only a current
   credential problem requiring user action uses the Windows warning glyph and
   notification sound.

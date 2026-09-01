@@ -21,7 +21,7 @@ Run locally on Windows 11 26200:
 
 - `cargo fmt --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 323 passed, 0 failed
+- `cargo test --locked` - 324 passed, 0 failed
 - `cargo audit` against the committed `Cargo.lock` - 122 dependencies scanned,
   no advisories, exit 0. `.cargo/audit.toml` denies warnings, so that is clean
   too. Run with a locally installed cargo-audit 0.22.1; the newest release
@@ -232,6 +232,71 @@ before being accepted.
 - **Not acted on.** `diagnose.rs` uses a `Global\` mutex where the log path is
   per-user, so a second user's session could fail to open it and silently lose
   diagnostics. Pre-existing, no evidence of it occurring.
+
+### Third round
+
+Both reviewers were sent the fixed branch and reviewed it again, still
+read-only and still independently. Their verdicts diverged the same way as
+before - "can ship, one wording item must be settled" and "still blocked" - and
+so did their findings: of the six distinct items between them, exactly one was
+reported by both. Each was re-checked against the source before being accepted.
+
+- **Accepted, both reviewers.** The credential watch read all four providers'
+  credentials whenever more than one provider qualified, because
+  `CredentialWatchMode::AllProviders` named no set. That is a wider hole than
+  the detection sweep it accompanies: the watch samples on every poll pass and
+  every 15 seconds while polling is parked, against the sweep's half hour. The
+  variant now carries `[bool; TrayIconKind::COUNT]`, built from the same
+  shown-and-allowed selection the poll gate uses, and the snapshot probes only
+  the sources in it.
+
+  One reviewer's stated scenario for this was wrong - it assumed the mode was
+  derived from raw `show_*`, when `PollPassPlan` already passes the gated
+  selection - but the defect is real for a different reason: with two providers
+  selected, `AllProviders` still read the other two.
+- **Accepted.** Re-showing a provider from the Providers menu restored
+  `allow_*` without clearing the new revoked flag, so access and detection
+  could disagree permanently: polled and read, yet invisible to every sweep,
+  with nothing on screen to explain it. Both grant paths now clear the flag.
+- **Accepted.** A revocation landing while a detection pass was in flight could
+  be undone by the stale result. The scope is sampled before the worker starts
+  and the result was only re-checked against the global consent; manual
+  detection assigns `allow_*` from what it found, so the provider came back and
+  its token went out on the next poll. The result is now masked with the
+  current scope inside the state lock, with a regression test.
+- **Accepted.** The Credential Manager path still collapsed to "missing": an
+  entry that exists with an empty blob, non-UTF-8 contents, or a `CredReadW`
+  failure that is not `ERROR_NOT_FOUND` read as **Not detected**. That left the
+  wording this release added - "a Windows file *or Credential Manager entry*
+  that is unreadable or malformed" - false for Antigravity, which has no other
+  Windows source. The read is now classified like the file path.
+- **Accepted.** The WSL wording added in the previous round overshot. Claude's
+  WSL probe *does* separate an absent credential (exit 44) from an unreadable
+  one (exit 45) and from a probe that never answered; only the Codex,
+  Antigravity and Grok probes collapse everything into "move on". The
+  invariant, both READMEs and the release checklist now state the difference
+  per provider instead of contradicting each other.
+
+  The other reviewer proposed resolving the same contradiction by deleting the
+  exit-45 requirement from the checklist. Rejected: it read only
+  `read_wsl_script_output`, which serves the other three providers; Claude's
+  probe goes through `read_wsl_credential_bytes` and the requirement is
+  correct there.
+- **Accepted.** Two comments still described `ActionRequired` and the
+  credential balloon as "rejected by the provider" only, which stopped being
+  the whole story once a locally unusable credential could raise one.
+- **Open, needs a decision.** A revocation made in v2.5.0 is not carried
+  forward: the new flag defaults to `false`, so that provider is read again
+  until the user turns it off once more. One reviewer calls this a release
+  blocker and wants a migration that treats `decided && !allow` as revoked; the
+  other analysed the same migration and recommended against it, because that
+  state also covers "hidden and never granted", which would silently and
+  permanently stop detection for those installs. The two costs are real and
+  opposite. Recorded in the release notes as a caveat pending that decision.
+- **Not acted on.** Claude's locally unusable credentials still arm the bounded
+  service recheck, because they map to `AuthRequired`. Asymmetric with
+  `CredentialUnusable`, but the recheck fails locally without a request; only
+  the cadence differs. Pre-existing.
 
 ## Deferred v2.5.0 smoke items, now closed
 

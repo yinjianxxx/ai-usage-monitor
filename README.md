@@ -288,11 +288,14 @@ sign-in, and raises no notification — a provider that was never signed in has
 nothing to sign in to *again*. **Authentication failed** means a credential
 really is there and cannot be used: a Windows file or Credential Manager entry
 that is unreadable or malformed, or a credential the provider expires or
-rejects. These cases share the same simple recovery: sign in again. A WSL probe
-is not classified this way, because it cannot tell a distribution that has no
-credential from one that failed to answer; it simply moves on to the next
-source, so a provider that lives only inside an unreachable distribution reads
-as **Not detected** rather than raising a false sign-in warning.
+rejects. These cases share the same simple recovery: sign in again. A WSL probe that
+cannot start or finish is treated as a temporary refresh failure instead, never
+as an authentication problem. Inside WSL, Claude's probe still separates an
+absent credential from an unreadable one; the Codex, Antigravity and Grok
+probes cannot tell a distribution that has no credential from one that failed
+to answer, so they move on to the next source and a credential that lives only
+inside an unreachable distribution reads as **Not detected** rather than
+raising a false sign-in warning.
 
 ## Data & privacy
 
