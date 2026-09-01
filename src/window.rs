@@ -413,6 +413,23 @@ const DETAIL_REFRESH_MS: u32 = 1_000;
 /// interval is long because it can shell out to `wsl.exe`, and a newly
 /// installed provider is not urgent.
 const TIMER_PROVIDER_DETECT: usize = 15;
+
+/// Arm a window timer, recording a failure instead of discarding it.
+///
+/// `SetTimer` reports failure by returning 0. Most call sites dropped that,
+/// which makes a timer that never armed invisible: the feature it drives
+/// simply never happens, with nothing in the log to say so. That is the same
+/// shape as the provider sweep whose `WM_TIMER` went to a window procedure
+/// with no branch for it, unnoticed across three releases.
+unsafe fn arm_timer(hwnd: HWND, id: usize, interval_ms: u32, label: &str) -> bool {
+    let armed = unsafe { SetTimer(hwnd, id, interval_ms, None) } != 0;
+    if !armed {
+        diagnose::log(format!(
+            "failed to arm {label} timer (id={id}, interval={interval_ms}ms)"
+        ));
+    }
+    armed
+}
 const PROVIDER_DETECT_INTERVAL_MS: u32 = 30 * 60 * 1_000;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 /// Thread message (msg.hwnd == null) handled directly in the message loop:
@@ -3020,7 +3037,7 @@ fn schedule_auto_update_check(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
         if let Some(delay_ms) = delay_ms {
-            SetTimer(hwnd, TIMER_UPDATE_CHECK, delay_ms.max(1), None);
+            arm_timer(hwnd, TIMER_UPDATE_CHECK, delay_ms.max(1), "update check");
         }
     }
 }
@@ -4450,11 +4467,11 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
 /// which is exactly how this went unnoticed from v2.4.1 to v2.5.0.
 fn schedule_provider_detection(sweep_now: bool) {
     unsafe {
-        SetTimer(
+        arm_timer(
             poll_controller_hwnd(),
             TIMER_PROVIDER_DETECT,
             PROVIDER_DETECT_INTERVAL_MS,
-            None,
+            "provider detection",
         );
         if sweep_now {
             handle_provider_detect_timer();
@@ -11258,7 +11275,12 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // -edge throttle would act on an intermediate state and drop the
         // last message.
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE | WM_DPICHANGED_MSG => {
-            SetTimer(hwnd, TIMER_BROADCAST_DEBOUNCE, BROADCAST_DEBOUNCE_MS, None);
+            arm_timer(
+                hwnd,
+                TIMER_BROADCAST_DEBOUNCE,
+                BROADCAST_DEBOUNCE_MS,
+                "broadcast debounce",
+            );
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_BROADCAST_DEBOUNCE => {
@@ -11703,7 +11725,12 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         wait_for_tray_geometry_stable(Duration::from_secs(3));
         migrate_legacy_placements_if_needed();
         refresh_provider_order_from_tray(hwnd);
-        SetTimer(hwnd, TIMER_TRAY_ORDER, TRAY_ORDER_SAMPLE_MS, None);
+        arm_timer(
+            hwnd,
+            TIMER_TRAY_ORDER,
+            TRAY_ORDER_SAMPLE_MS,
+            "tray order sample",
+        );
 
         // Position and render first, show last: the widget appears in its
         // final place with real content instead of flashing into view first.
@@ -11748,7 +11775,7 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 let initial_poll_ms = state.poll_interval_ms;
                 arm_poll_timer(state, poll_controller_hwnd(), initial_poll_ms);
             } else {
-                SetTimer(poll_controller_hwnd(), TIMER_POLL, POLL_5_MIN, None);
+                arm_timer(poll_controller_hwnd(), TIMER_POLL, POLL_5_MIN, "poll");
             }
         }
 
@@ -12301,11 +12328,11 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                             s.auth_watch_mode = mode;
                             s.auth_watch_snapshot = snapshot;
                             unsafe {
-                                SetTimer(
+                                arm_timer(
                                     controller_hwnd,
                                     TIMER_AUTH_WATCH,
                                     AUTH_WATCH_INTERVAL_MS,
-                                    None,
+                                    "auth watch",
                                 );
                             }
                         }
@@ -12465,11 +12492,11 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                                 // Watch the credentials on a short cadence so
                                 // signing back in is picked up without waiting
                                 // out the poll interval.
-                                SetTimer(
+                                arm_timer(
                                     controller_hwnd,
                                     TIMER_AUTH_WATCH,
                                     AUTH_WATCH_INTERVAL_MS,
-                                    None,
+                                    "auth watch",
                                 );
                             }
                         }
@@ -12494,11 +12521,11 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                                         s.auth_watch_mode = mode;
                                         s.auth_watch_snapshot = snapshot;
                                         unsafe {
-                                            SetTimer(
+                                            arm_timer(
                                                 controller_hwnd,
                                                 TIMER_AUTH_WATCH,
                                                 AUTH_WATCH_INTERVAL_MS,
-                                                None,
+                                                "auth watch",
                                             );
                                         }
                                     }
@@ -12612,7 +12639,7 @@ fn schedule_countdown_timer() {
     // retry/backoff timer owns that case.
     if healthy_provider_past_reset(data) && s.last_error.is_none() {
         unsafe {
-            SetTimer(controller_hwnd, TIMER_RESET_POLL, 5_000, None);
+            arm_timer(controller_hwnd, TIMER_RESET_POLL, 5_000, "reset poll");
         }
     }
 
@@ -12653,7 +12680,7 @@ fn schedule_countdown_timer() {
         .max(1000) as u32;
 
     unsafe {
-        SetTimer(controller_hwnd, TIMER_COUNTDOWN, ms, None);
+        arm_timer(controller_hwnd, TIMER_COUNTDOWN, ms, "countdown");
     }
 }
 
@@ -13405,7 +13432,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             );
                             arm_poll_timer(s, poll_controller_hwnd(), timer_interval);
                         } else {
-                            SetTimer(poll_controller_hwnd(), TIMER_POLL, new_interval, None);
+                            arm_timer(poll_controller_hwnd(), TIMER_POLL, new_interval, "poll");
                         }
                     }
                     save_state_settings();

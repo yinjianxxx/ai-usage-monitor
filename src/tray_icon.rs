@@ -741,6 +741,10 @@ fn update_provider_tooltip(hwnd: HWND, kind: TrayIconKind, tooltip: &str) {
             provider_tooltip_notify_icon_data_for_mode(hwnd, kind, kind.identity_mode(), tooltip);
         // Countdown-only refresh: modifying the tooltip must not recreate the
         // HICON, re-register the callback, or disturb the user's Shell order.
+        //
+        // Not logged: this fails while the shell is between restarts, which is
+        // already reported by the taskbar watchdog, and the only consequence
+        // is a tooltip that stays stale until the next `sync` rewrites it.
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
@@ -924,6 +928,12 @@ fn ensure_app(hwnd: HWND, tooltip: &str) {
 }
 
 /// Remove the tray icon from the shell.
+///
+/// The failure is deliberately not logged. `sync` calls this for every
+/// provider that is not currently shown, most of which were never registered,
+/// so `NIM_DELETE` failing is the normal path rather than a symptom - logging
+/// it would bury real diagnostics under one line per hidden provider per
+/// refresh.
 pub fn remove(hwnd: HWND, kind: TrayIconKind) {
     unsafe {
         let nid = notify_icon_data(hwnd, kind);
@@ -947,6 +957,8 @@ pub fn restore_app_focus(hwnd: HWND) {
     }
 }
 
+/// Remove the application icon. Fails routinely for the same reason as
+/// [`remove`]: per-provider icon mode calls it whether or not it was added.
 fn remove_app(hwnd: HWND) {
     unsafe {
         let nid = app_notify_icon_data(hwnd);
