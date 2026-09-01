@@ -11013,11 +11013,17 @@ unsafe fn handle_poll_timer() {
     }
 }
 
-unsafe fn arm_poll_timer(state: &mut AppState, hwnd: HWND, interval_ms: u32) -> usize {
-    let timer = SetTimer(hwnd, TIMER_POLL, interval_ms.max(1), None);
+/// Arm the main poll timer and record when the next tick is due.
+///
+/// Goes through `arm_timer` like every other timer: this one drives the whole
+/// monitor, so a `SetTimer` failure here freezes usage indefinitely - nothing
+/// re-arms `TIMER_POLL` on its own. `next_poll_deadline` stays `None` on
+/// failure because there is no tick to count down to.
+unsafe fn arm_poll_timer(state: &mut AppState, hwnd: HWND, interval_ms: u32) {
+    let interval_ms = interval_ms.max(1);
+    let armed = unsafe { arm_timer(hwnd, TIMER_POLL, interval_ms, "poll") };
     state.next_poll_deadline =
-        (timer != 0).then(|| Instant::now() + Duration::from_millis(interval_ms.max(1) as u64));
-    timer
+        armed.then(|| Instant::now() + Duration::from_millis(interval_ms as u64));
 }
 
 /// Re-poll as soon as the credentials on disk change, so re-authenticating is
