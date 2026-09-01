@@ -3790,7 +3790,15 @@ fn credential_watch_mode_for_shown(
         return None;
     }
     if shown_count > 1 {
-        return Some(poller::CredentialWatchMode::AllProviders);
+        // Name the providers rather than saying "all". The callers pass the
+        // shown-and-allowed selection, so a revoked provider is excluded here
+        // exactly as it is from a poll and from a detection sweep.
+        let mut watched = [false; tray_icon::TrayIconKind::COUNT];
+        watched[tray_icon::TrayIconKind::Claude.index()] = show_claude_code;
+        watched[tray_icon::TrayIconKind::Codex.index()] = show_codex;
+        watched[tray_icon::TrayIconKind::Antigravity.index()] = show_antigravity;
+        watched[tray_icon::TrayIconKind::Grok.index()] = show_grok;
+        return Some(poller::CredentialWatchMode::Providers(watched));
     }
     if show_codex {
         return Some(poller::CredentialWatchMode::Codex);
@@ -15287,7 +15295,9 @@ mod reset_notification_tests {
         // can be sampled either side of a poll and the snapshots compared.
         assert_eq!(
             credential_watch_mode_for_shown(true, true, false, false),
-            Some(CredentialWatchMode::AllProviders)
+            Some(CredentialWatchMode::Providers(watched([
+                true, true, false, false
+            ])))
         );
         assert_eq!(
             credential_watch_mode_for_shown(true, false, false, false),
@@ -15489,6 +15499,18 @@ mod reset_notification_tests {
         assert!(applied.codex && applied.antigravity && applied.grok);
     }
 
+    /// Build a watch set from the fixed Claude/Codex/Antigravity/Grok order
+    /// these cases read in, so a test states only which providers are on.
+    fn watched(
+        order: [bool; tray_icon::TrayIconKind::COUNT],
+    ) -> [bool; tray_icon::TrayIconKind::COUNT] {
+        let mut set = [false; tray_icon::TrayIconKind::COUNT];
+        for (slot, kind) in order.into_iter().zip(tray_icon::TrayIconKind::ALL) {
+            set[kind.index()] = slot;
+        }
+        set
+    }
+
     #[test]
     fn credential_watch_mode_tracks_the_only_enabled_provider() {
         assert_eq!(
@@ -15511,10 +15533,20 @@ mod reset_notification_tests {
     }
 
     #[test]
-    fn credential_watch_mode_uses_all_providers_for_combined_auth_failure() {
+    fn credential_watch_mode_names_every_provider_of_a_combined_auth_failure() {
         assert_eq!(
             credential_watch_mode_for_shown(true, true, true, false),
-            Some(poller::CredentialWatchMode::AllProviders)
+            Some(poller::CredentialWatchMode::Providers(watched([
+                true, true, true, false
+            ])))
+        );
+        // A provider the caller excluded is not watched either, so its
+        // credential is never re-read on the watch's schedule.
+        assert_eq!(
+            credential_watch_mode_for_shown(true, true, false, false),
+            Some(poller::CredentialWatchMode::Providers(watched([
+                true, true, false, false
+            ])))
         );
         assert!(poll_error_needs_credential_watch(
             poller::PollError::AuthRequired

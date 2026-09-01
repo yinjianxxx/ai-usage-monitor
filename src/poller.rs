@@ -88,7 +88,13 @@ pub enum CredentialWatchMode {
     Codex,
     Antigravity,
     Grok,
-    AllProviders,
+    /// Several providers at once, naming exactly which.
+    ///
+    /// The set, not "all four": the watch re-reads a credential every poll
+    /// pass and every 15 seconds while polling is parked, so a mode that meant
+    /// "everything" would keep reading a provider the user revoked far more
+    /// often than the detection sweep ever did.
+    Providers([bool; TrayIconKind::COUNT]),
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -1269,11 +1275,20 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
         CredentialWatchMode::Grok => vec![grok_credential_watch_signature()],
-        CredentialWatchMode::AllProviders => {
-            let mut snapshot = claude_credential_watch_snapshot();
-            snapshot.push(codex_credential_watch_signature());
-            snapshot.push(antigravity_credential_watch_signature());
-            snapshot.push(grok_credential_watch_signature());
+        CredentialWatchMode::Providers(watched) => {
+            let mut snapshot = Vec::new();
+            if watched[TrayIconKind::Claude.index()] {
+                snapshot.extend(claude_credential_watch_snapshot());
+            }
+            if watched[TrayIconKind::Codex.index()] {
+                snapshot.push(codex_credential_watch_signature());
+            }
+            if watched[TrayIconKind::Antigravity.index()] {
+                snapshot.push(antigravity_credential_watch_signature());
+            }
+            if watched[TrayIconKind::Grok.index()] {
+                snapshot.push(grok_credential_watch_signature());
+            }
             snapshot
         }
     };
