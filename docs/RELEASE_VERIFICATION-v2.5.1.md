@@ -478,14 +478,66 @@ deferred:
   suspending one must silence exactly that one. Mutation-checked: crossing a
   single field (reading Claude's `pending` for every provider) fails it. Three
   `AppState` accessors left with no callers were removed.
-- The credential watch no longer spends a poll when its watched set narrows.
-  It captured a fresh mode, compared its snapshot against one taken for a
-  different set of sources, reported a change, and requested a poll - then
-  failed its own `auth_watch_mode` guard, so the snapshot was never stored and
-  the next tick repeated it until a poll corrected the mode.
-  `credential_watch_outcome` now separates `Repoll` from `Rebaseline`, and the
-  watch stores mode and snapshot together. Its deactivation path also logs,
-  since the diagnostic log is this project's audit trail for read scope.
+- The credential watch no longer repeats a poll request on every tick after
+  its watched set narrows. It captured a fresh mode, compared its snapshot
+  against one taken for a different set of sources, reported a change, and
+  requested a poll - then failed its own `auth_watch_mode` guard, so the
+  snapshot was never stored and the next tick did it again until a poll
+  corrected the mode. The watch now stores mode and snapshot together, which is
+  the actual repair; the fifth round below corrected the first attempt at it.
+  Its deactivation path also logs, since the diagnostic log is this project's
+  audit trail for read scope.
+
+### Fifth round
+
+A Codex agent (gpt-5.6-sol, xhigh) reviewed the finished branch read-only as
+the last gate before tagging, re-ran the local release gates itself, and
+returned "do not release" with two medium blockers. Both were checked against
+the source here and both are real:
+
+- **Accepted, release blocker.** Allowing a pending provider from **Provider
+  access -> Detect providers again** left the surfaces untouched.
+  `confirm_pending_providers_for_manual` grants and saves, and the detection
+  pass that follows compares the visibility it finds against the visibility the
+  grant already wrote, so `after == before` and `apply_provider_detection`
+  returns early (`src/window.rs:4702`) without `post_usage_updated`, a tray
+  sync, or `request_poll`. The provider stayed off the widget and the tray, on
+  placeholder values, until the next scheduled poll - up to half an hour. The
+  same answer given directly under **Provider access** was always followed by a
+  refresh and a poll, which is why the walk-through above did not catch it: it
+  exercised that entry, not this one. `confirm_pending_providers_for_manual` is
+  now `#[must_use]` and reports whether anything changed, and the menu command
+  refreshes on the same path the Provider access entries use.
+- **Accepted, release blocker, and a regression from the fourth round.** The
+  `Rebaseline` answer introduced above adopted the new snapshot without
+  polling, so a provider that stayed in the watched set could have its
+  credential refreshed in the same interval and have that change swallowed:
+  the new snapshot became the baseline, and the next tick saw nothing to
+  report. Sign-in recovery would then wait for the next scheduled poll instead
+  of the watch's own cadence. Two snapshots taken over different sets are not
+  comparable, so the safe reading is "assume something happened", not "assume
+  nothing did": `credential_watch_outcome` now answers `Repoll` for a changed
+  set as well, and the repeat that the fourth round set out to fix is prevented
+  by storing the mode with the snapshot, which is what was actually broken.
+
+Both fixes were then walked on the machine, on a profile where Antigravity and
+Grok were pending and the poll interval was five minutes. Allowing Antigravity
+and then Grok from **Detect providers again** granted access at 22:59:03 and
+22:59:27, and the usage cache was rewritten at 22:59:29 with Grok data in it -
+so the newly allowed provider was on screen and polled within two seconds of
+the answer, instead of waiting out the interval. Cancelling the Grok review in
+between left it pending and kept it out of the detection scope
+(`scope: ... grok=false`), which is the same run showing that the third answer
+still changes nothing.
+
+Verified as correct by the same review, and re-checked here: the schema-3
+migration and the five read paths; `IDCANCEL` serving as both the third
+custom button and the cancel result, which is documented behaviour and is
+mapped to the same `None` from all three entries, with the `MessageBoxW`
+fallback keeping Yes/No/Cancel in the same roles; the probe-trait split being
+behaviour-preserving, including the single enumeration of running WSL distros
+and the empty-list short circuits; and the release-identity gates in
+`.github/workflows/release.yml`.
 
 ## Owner walk-through on the machine, 2026-09-01
 
@@ -556,10 +608,15 @@ settings and cache it wrote.
   the suite builds one. Closing it properly means giving `AppState` a test
   builder or serializing tests around the global `STATE`, which is not work for
   a patch release. The behaviour is covered by the revocation smoke runs.
-- Everything the release checklist can reach on this machine has been walked.
-  What remains is the release itself: push, merge to `main`, tag, then the
-  draft-release rows (six attachments, `SHA256SUMS`, attestation re-verify) and
-  the WinGet hand-off after it is public.
+- The credential-watch repeat is covered by `credential_watch_outcome` and by
+  reading the call site, not by a live run: reproducing it means narrowing the
+  watched set and watching the 15-second parked cadence for a minute. The
+  earlier fault it replaced was diagnosed the same way.
+- Everything else the release checklist can reach on this machine has been
+  walked.
+- What remains after that is the release itself: push, merge to `main`, tag,
+  then the draft-release rows (six attachments, `SHA256SUMS`, attestation
+  re-verify) and the WinGet hand-off after it is public.
 - Tagging order: merge to `main`, then tag. `git merge-base --is-ancestor
   v2.5.0 HEAD` already passes, so the workflow's ancestry gate is satisfied,
   and `.github/workflows/release.yml` additionally requires the tag to equal

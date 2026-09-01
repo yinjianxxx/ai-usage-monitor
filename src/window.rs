@@ -4391,11 +4391,16 @@ fn review_pending_provider(hwnd: HWND, kind: tray_icon::TrayIconKind) {
     }
 }
 
-fn confirm_pending_providers_for_manual(hwnd: HWND) {
+/// Returns whether any provider's access actually changed, because the caller
+/// owes the surfaces a refresh and a poll in that case. The detection pass
+/// that follows will not do it: granting already wrote `show` and `allow`, so
+/// the pass finds nothing new and returns early.
+#[must_use]
+fn confirm_pending_providers_for_manual(hwnd: HWND) -> bool {
     let (language, pending) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
-            return;
+            return false;
         };
         let pending = tray_icon::TrayIconKind::ALL
             .into_iter()
@@ -4403,13 +4408,14 @@ fn confirm_pending_providers_for_manual(hwnd: HWND) {
             .collect::<Vec<_>>();
         (s.language, pending)
     };
+    let mut decided = false;
     for kind in pending {
-        match confirm_pending_provider_access(hwnd, kind, language) {
-            Some(true) => set_provider_credential_access(kind, true),
-            Some(false) => set_provider_credential_access(kind, false),
-            None => {}
+        if let Some(allowed) = confirm_pending_provider_access(hwnd, kind, language) {
+            set_provider_credential_access(kind, allowed);
+            decided = true;
         }
     }
+    decided
 }
 
 /// Record the answer to the one-time prompt.
@@ -11316,24 +11322,22 @@ unsafe fn arm_poll_timer(state: &mut AppState, hwnd: HWND, interval_ms: u32) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CredentialWatchOutcome {
-    /// The stored snapshot describes the providers that are still watched and
-    /// one of their credentials changed: re-poll.
+    /// Store the new snapshot and poll: either a watched credential changed,
+    /// or the watched set itself did, and two snapshots taken over different
+    /// sets cannot be compared.
     Repoll,
-    /// The watched set changed since the stored snapshot was taken, so the two
-    /// are not comparable. Adopt the new snapshot as the baseline and do not
-    /// read a credential change into a set difference.
-    Rebaseline,
+    /// Same set, same signatures: nothing to do.
     Unchanged,
 }
 
-/// Without the `Rebaseline` answer, narrowing the watched set - revoking a
-/// provider, hiding one - made the next tick compare snapshots of two
-/// different provider sets, report a change, and request a poll that no
-/// credential had earned.
+/// A changed watched set must not be read as "nothing happened". A provider
+/// that stayed in the set can have had its credential refreshed in the same
+/// interval, and swallowing that pushes sign-in recovery out to the next
+/// scheduled poll. Polling once is the cheap answer; what the caller must not
+/// do is leave `auth_watch_mode` stale, which is what made a narrowed watch
+/// repeat this on every tick instead of once.
 fn credential_watch_outcome(baseline_matches: bool, changed: bool) -> CredentialWatchOutcome {
-    if !baseline_matches {
-        CredentialWatchOutcome::Rebaseline
-    } else if changed {
+    if !baseline_matches || changed {
         CredentialWatchOutcome::Repoll
     } else {
         CredentialWatchOutcome::Unchanged
@@ -11382,22 +11386,21 @@ fn spawn_credential_watch_check() {
         if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
             let current_snapshot = poller::credential_watch_snapshot(watch_mode);
             let changed = current_snapshot != previous_snapshot;
-            match credential_watch_outcome(baseline_matches, changed) {
-                CredentialWatchOutcome::Unchanged => {}
-                outcome => {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            if s.auth_watch_active {
-                                s.auth_watch_mode = watch_mode;
-                                s.auth_watch_snapshot = current_snapshot;
-                            }
+            if credential_watch_outcome(baseline_matches, changed) == CredentialWatchOutcome::Repoll
+            {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        if s.auth_watch_active {
+                            // Mode and snapshot together: storing the snapshot
+                            // under a stale mode is what made the next tick
+                            // repeat this pass.
+                            s.auth_watch_mode = watch_mode;
+                            s.auth_watch_snapshot = current_snapshot;
                         }
                     }
-                    if outcome == CredentialWatchOutcome::Repoll {
-                        request_poll();
-                    }
                 }
+                request_poll();
             }
         }
         CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
@@ -13894,7 +13897,19 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 }
                 IDM_REDETECT_PROVIDERS => {
                     if ensure_credential_consent(hwnd) {
-                        confirm_pending_providers_for_manual(hwnd);
+                        if confirm_pending_providers_for_manual(hwnd) {
+                            // A provider answered here is already shown and
+                            // allowed, so the detection pass below finds
+                            // nothing new and returns without touching the
+                            // surfaces. Refresh them here instead, the same
+                            // way the Provider access entries do.
+                            position_at_taskbar();
+                            render_layered();
+                            refresh_floating_monitor();
+                            sync_tray_icons(hwnd);
+                            refresh_provider_order_from_tray(hwnd);
+                            request_poll();
+                        }
                         spawn_provider_detection(DetectionReason::Manual);
                     }
                 }
@@ -15540,7 +15555,7 @@ mod reset_notification_tests {
     }
 
     #[test]
-    fn a_narrowed_credential_watch_rebaselines_instead_of_polling() {
+    fn a_narrowed_credential_watch_polls_once_and_does_not_repeat() {
         // Same watched set, a credential changed: that is what the watch is for.
         assert_eq!(
             credential_watch_outcome(true, true),
@@ -15550,16 +15565,17 @@ mod reset_notification_tests {
             credential_watch_outcome(true, false),
             CredentialWatchOutcome::Unchanged
         );
-        // The watched set itself changed, so the snapshots are not comparable.
-        // Reporting a change here spends a poll no credential earned, and the
-        // stale mode used to make the next tick do it again.
+        // The watched set changed, so the snapshots are not comparable. A
+        // provider that stayed in the set can have been refreshed in the same
+        // interval, so this must not be swallowed; the repeat it used to cause
+        // came from leaving `auth_watch_mode` stale, not from the poll.
         assert_eq!(
             credential_watch_outcome(false, true),
-            CredentialWatchOutcome::Rebaseline
+            CredentialWatchOutcome::Repoll
         );
         assert_eq!(
             credential_watch_outcome(false, false),
-            CredentialWatchOutcome::Rebaseline
+            CredentialWatchOutcome::Repoll
         );
     }
 
