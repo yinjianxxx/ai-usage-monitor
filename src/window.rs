@@ -2228,7 +2228,20 @@ fn tray_icon_data_from_state() -> (Vec<tray_icon::TrayIconData>, bool, String) {
         ));
     }
     let app_tooltip = tray_tooltip_from_lines(app_tooltip_lines.iter().map(String::as_str));
-    (icons, s.detailed_tray_icons, app_tooltip)
+    // With no provider authorized there is nothing to monitor, and a provider
+    // brand mark in the tray would advertise a service the user did not pick
+    // and this app is not reading. Fall back to the application icon, which is
+    // the same surface the "Provider tray icons" toggle already produces. The
+    // stored preference is untouched, so the provider icons come back by
+    // themselves once any provider is granted access again.
+    let any_provider_authorized = tray_icon::TrayIconKind::ALL
+        .into_iter()
+        .any(|kind| provider_has_credential_access(s, kind));
+    (
+        icons,
+        s.detailed_tray_icons && any_provider_authorized,
+        app_tooltip,
+    )
 }
 
 fn tray_surface_provider_order(
