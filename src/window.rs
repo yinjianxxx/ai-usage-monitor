@@ -10976,6 +10976,9 @@ unsafe fn create_broadcast_helper(hinstance: HINSTANCE) -> Option<HWND> {
 
 unsafe fn handle_poll_timer() {
     let action = {
+        // Resolve the controller before locking: `poll_controller_hwnd` falls
+        // back to the state's own HWND, and STATE is not reentrant.
+        let controller_hwnd = poll_controller_hwnd();
         let mut state = lock_state();
         state.as_mut().map(|s| {
             s.next_poll_deadline = None;
@@ -10996,7 +10999,7 @@ unsafe fn handle_poll_timer() {
                     s.auth_recovery_recheck_deadline,
                     now,
                 );
-                arm_poll_timer(s, poll_controller_hwnd(), next_interval);
+                arm_poll_timer(s, controller_hwnd, next_interval);
             }
             action
         })
@@ -11770,12 +11773,13 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         // Provider polling belongs to the process-level helper so it survives
         // taskbar/RDP destruction of the embedded widget HWND.
         {
+            let controller_hwnd = poll_controller_hwnd();
             let mut state = lock_state();
             if let Some(state) = state.as_mut() {
                 let initial_poll_ms = state.poll_interval_ms;
-                arm_poll_timer(state, poll_controller_hwnd(), initial_poll_ms);
+                arm_poll_timer(state, controller_hwnd, initial_poll_ms);
             } else {
-                arm_timer(poll_controller_hwnd(), TIMER_POLL, POLL_5_MIN, "poll");
+                arm_timer(controller_hwnd, TIMER_POLL, POLL_5_MIN, "poll");
             }
         }
 
@@ -12008,6 +12012,11 @@ fn live_broadcast_helper_hwnd() -> Option<HWND> {
     None
 }
 
+/// The window that owns the poll timer: the process-level helper, or the main
+/// window when that helper could not be created.
+///
+/// Takes the state lock on the fallback path, so callers must resolve it
+/// *before* they lock; STATE is a plain `Mutex` and would deadlock.
 fn poll_controller_hwnd() -> HWND {
     if let Some(hwnd) = live_broadcast_helper_hwnd() {
         return hwnd;
@@ -13422,6 +13431,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         _ => POLL_5_MIN,
                     };
                     {
+                        let controller_hwnd = poll_controller_hwnd();
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.poll_interval_ms = new_interval;
@@ -13430,9 +13440,9 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                                 s.auth_recovery_recheck_deadline,
                                 Instant::now(),
                             );
-                            arm_poll_timer(s, poll_controller_hwnd(), timer_interval);
+                            arm_poll_timer(s, controller_hwnd, timer_interval);
                         } else {
-                            arm_timer(poll_controller_hwnd(), TIMER_POLL, new_interval, "poll");
+                            arm_timer(controller_hwnd, TIMER_POLL, new_interval, "poll");
                         }
                     }
                     save_state_settings();
