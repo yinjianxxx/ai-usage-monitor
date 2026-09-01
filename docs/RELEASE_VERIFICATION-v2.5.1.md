@@ -361,13 +361,10 @@ shim-free binary restored `running WSL distros: 1`.
   branch was exercised; the two converge four lines later.
 - A provider whose credentials exist only inside WSL while WSL is stopped. That
   would require moving the owner's real credential file.
-- The revocation scope and the unusable-credential classification are covered
-  by unit tests and by reading the call sites, not by a live end-to-end run on
-  this machine: both would require revoking the owner's own providers and
-  corrupting a real `auth.json`. The release-checklist rows for them are
-  written, and remain to be walked.
-- High Contrast on an actual High Contrast desktop.
-- Any balloon on a light system theme.
+The revocation scope and the unusable-credential classification were listed
+here until the walk-through below covered both against the release build, with
+a disposable profile rather than the owner's own providers and credential
+files. High Contrast and the light-theme balloon moved out for the same reason.
 
 ## Known limitation: the toast attribution icon is inverted
 
@@ -506,7 +503,17 @@ settings and cache it wrote.
 - **Informational balloon.** The owner saw the "Grok detected" balloon on a
   dark system theme, which is the headline fix of this release: the same
   balloon was accepted by Windows and silently dropped from v2.4.1 through
-  v2.5.0.
+  v2.5.0. Repeated on a light system theme after switching Windows over:
+  balloon and its supplied image both render.
+- **High Contrast on a real High Contrast desktop**, both the dark and the
+  light variant, with all four surfaces open at once (taskbar widget, floating
+  window, four detailed tray icons, detail popup) and one provider in
+  **Authentication failed** so the warning pill was on screen. The owner
+  confirmed the widget badges, tray placeholder letters, floating rows,
+  progress tracks, warning-pill characters against the highlight fill, the
+  hover card, and keyboard focus cues through the detail popup's four header
+  buttons. Switching themes with the app running redrew every surface without a
+  restart.
 
 - **Re-walked after the fix.** With **Decide later** in place, all three ways
   of not answering - the button, Esc and the title-bar close button - logged
@@ -516,9 +523,16 @@ settings and cache it wrote.
 
 ## Open
 
-- Still not walked: an informational balloon on a light system theme, and High
-  Contrast on a real High Contrast desktop. See "Not verified" above for the
-  rest.
+- Follow-ups accepted for a later release, none of them a release gate: the two
+  tests that assert on `detection_probe_plan` and `mask_detection` rather than
+  on the behaviour their names claim; `credential_poll_selection` being
+  `#[cfg(test)]`, which leaves the Grok-only poll gate covered by the smoke run
+  and not by a test; and the credential watch spending one extra poll when its
+  scope narrows mid-watch, which self-heals.
+- Everything the release checklist can reach on this machine has been walked.
+  What remains is the release itself: push, merge to `main`, tag, then the
+  draft-release rows (six attachments, `SHA256SUMS`, attestation re-verify) and
+  the WinGet hand-off after it is public.
 - Tagging order: merge to `main`, then tag. `git merge-base --is-ancestor
   v2.5.0 HEAD` already passes, so the workflow's ancestry gate is satisfied,
   and `.github/workflows/release.yml` additionally requires the tag to equal
