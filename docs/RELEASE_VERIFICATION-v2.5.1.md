@@ -19,21 +19,22 @@
 
 ## Automated gates
 
-Run locally on Windows 11 26200 on 2026-09-01, all against the same tree:
-`7bbdd96` with the version bumped to `2.5.1`. An earlier run at `cb0ceac`
-reported 324 tests; the 20 added by `7bbdd96` are the difference, so that run
-is superseded rather than repeated here.
+Run locally on Windows 11 26200 on 2026-09-01, all against the final tree: the
+version bump to `2.5.1` plus the pending-review dialog and copy fix that the
+walk-through below produced. An earlier run at `cb0ceac` reported 324 tests;
+the 20 added by `7bbdd96` and the 3 added with the dialog fix are the
+difference, so the earlier runs are superseded rather than repeated here.
 
 - `cargo fmt --all -- --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - clean
-- `cargo test --locked` - 344 passed, 0 failed
-- `cargo build --release --locked` - clean. Built with `CARGO_TARGET_DIR`
-  pointed at `target\release-gate`, because an earlier branch build (PE version
-  `2.5.0`) was running from `target\release\gengchou.exe` and the linker cannot
-  replace a running image. Nothing in the build depends on the target directory.
-- `tools\check-portable-runtime.ps1 -ExecutablePath
-  target\release-gate\release\gengchou.exe` - passed, no external MSVC/UCRT
-  imports
+- `cargo test --locked` - 347 passed, 0 failed
+- `cargo build --release --locked` - clean, at `target\release\gengchou.exe`.
+  An intermediate run needed `CARGO_TARGET_DIR=target\release-gate` because an
+  older build was still running from that path and the linker cannot replace a
+  running image; the recorded result is the canonical one, taken after the app
+  was closed.
+- `tools\check-portable-runtime.ps1` - passed against
+  `target\release\gengchou.exe`, no external MSVC/UCRT imports
 - PE properties of that build: ProductName `Gengchou`, ProductVersion and
   FileVersion `2.5.1`, OriginalFilename `gengchou.exe`, upstream
   copyright and `Comments` retained
@@ -47,7 +48,9 @@ is superseded rather than repeated here.
   `tools\render-readme-images.ps1`. Only the four `detail-popup-*.png` changed,
   and only in the footer version (`v2.5.0` to `v2.5.1`); the widget, floating
   and tray strips are byte-identical, which is the expected deterministic
-  result.
+  result. Re-rendered again after the dialog and copy fix: no further change,
+  because neither the review dialog nor the access hint appears in the dumped
+  surfaces.
 - `cargo audit` against the committed `Cargo.lock` - 122 dependencies scanned,
   no advisories, exit 0. `.cargo/audit.toml` denies warnings, so that is clean
   too. Run with a locally installed cargo-audit 0.22.1; the newest release
@@ -403,16 +406,119 @@ an informational balloon: top bar `(235, 102, 68)`, middle `(244, 243, 243)`,
 bottom `(57, 137, 248)`, tile `(33, 33, 38)` - the source asset, not inverted.
 The owner's decision to keep the Gengchou mark in that slot therefore stands.
 
+## Fourth round
+
+`7bbdd96` (consent schema 3 and the pending-review strings) landed after the
+third round, so it was reviewed on its own, again by two agents working
+read-only and independently: a Claude agent in this workspace and a Grok agent
+(Grok 4.6, xhigh) in a separate terminal. They disagreed again - "blocked" and
+"ship" - and again their findings barely overlapped.
+
+Both claimed blockers were re-checked against the source and rejected:
+
+- **Rejected.** "Showing a provider under **Providers** no longer grants
+  access, so it is visible but never polled." The state is real and reachable:
+  `7bbdd96` deliberately removed the implicit grant, and `allow=false` with
+  neither pending nor revoked set survives the toggle. It is not a dead end.
+  Ticking the provider under **Provider access** calls
+  `set_provider_credential_access`, which sets `allow`, sets `show`, and clears
+  `revoked`/`pending` in one action (`src/window.rs:4186-4226`), and a shown
+  provider without access carries a detail-popup hint that points there
+  (`src/window.rs:5085-5093`). What was wrong is the wording of that hint,
+  accepted below.
+- **Rejected.** "**Detect providers again** cannot discover a provider that was
+  never allowed, so the checklist row is unsatisfiable." The scopes are as
+  described - Manual is `allow && !revoked && !pending`, narrower than Rescan -
+  but the checklist row and both READMEs already say "when it is already
+  allowed". Discovery of a provider that was never allowed is the periodic
+  sweep's job; the manual action assigns visibility, which is why it is
+  restricted to providers the user has authorized.
+
+Accepted and fixed in this round:
+
+- **Accepted, from the owner's walk-through rather than either review.** The
+  pending review dialog offered only **Allow access** and **Keep closed**, with
+  **Keep closed** as the focused default; the only way to leave a provider
+  pending was Esc or the title-bar close button. The owner intended to cancel,
+  clicked **Keep closed**, and the provider was revoked. The code was correct -
+  a re-run with Esc logged `cancelled` and left it pending - but a dialog whose
+  only neutral answer is invisible collects decisions the user did not make,
+  which is the same guess this release stopped making from settings files. The
+  dialog now offers **Decide later** as a third command link and defaults to
+  it; it shares `IDCANCEL` with Esc and the close button, so the visible and
+  invisible ways out cannot drift apart. The `MessageBoxW` fallback defaults to
+  Cancel for the same reason. `pending_review_defaults_to_deciding_later` is
+  mutation-checked: restoring `IDNO` as the default fails it.
+- **Accepted.** `detail_access_revoked_hint` claimed "Access to {provider} was
+  declined" for a provider that was never granted access - the state an
+  upgraded install lands in. It now states the current fact instead of guessing
+  a past decision, and its outcome line points at **Provider access** rather
+  than the context menu at large; the Chinese, Japanese and Korean variants had
+  drifted further, saying only "the context menu".
+
+Reported by both reviewers and **not fixed**, recorded as follow-ups:
+
+- `a_disabled_provider_has_no_windows_wsl_desktop_or_keyring_probes` asserts on
+  `detection_probe_plan`, which is a field-for-field copy of `DetectionScope`,
+  so it would survive a revert of the probe gate itself.
+  `a_pending_result_cannot_reenable_a_provider` asserts on `mask_detection`,
+  which this release did not change. Neither is worthless, but neither guards
+  what its name claims. The behaviour they aim at is covered at runtime by the
+  scoped smoke runs below and by
+  `pending_and_revoked_providers_are_excluded_from_every_silent_read`, which
+  does feed `pending=true` through all five reasons.
+- `credential_poll_selection` is now `#[cfg(test)]`, so the regression test
+  that commemorates the Grok-only poll gate guards a test-only helper. The
+  production path is covered by the Grok-only smoke run below, not by a test.
+
+## Owner walk-through on the machine, 2026-09-01
+
+Scripted cases ran the release build against a disposable `APPDATA` /
+`LOCALAPPDATA` profile with `GENGCHOU_TEST_MUTEX_SUFFIX`, so settings, cache
+and `diagnose.log` were isolated while credentials still resolved from the real
+user profile. Evidence is the scope lines in each run's own log plus the
+settings and cache it wrote.
+
+- **Upgraded `allow=false`.** Codex became `pending=true`, the other three
+  stayed `pending=false`, `revoked` stayed false everywhere, and the schema
+  moved to 3. Nothing else changed.
+- **Explicit `revoked=true` for Codex, with Grok unannounced.** Startup sweep
+  scope was `claude=false codex=false antigravity=false grok=true`: the revoked
+  provider was excluded even though it was neither shown nor announced, which
+  is the state that would otherwise have put it in scope. Grok was detected and
+  announced once, `show_grok` stayed false, and Codex kept `revoked=true`
+  without being re-classified. No Codex read appears anywhere in the log.
+- **Grok-only profile.** Polled successfully and wrote a cache containing only
+  `grok`. This is the live regression check for the v2.5.0 defect where a
+  profile whose only authorized provider was Grok never polled at all.
+- **Codex `auth.json` malformed, WSL available.** Fell through to the WSL
+  credential, as designed: a usable source outranks an unusable one.
+- **Same, with WSL made unavailable** (a `wsl.exe` that exits non-zero placed
+  beside a copy of the executable). Logged `the Codex credentials on this
+  machine are unusable`, i.e. `CredentialUnusable` / **Authentication failed**
+  rather than **Not detected**. This is the end-to-end evidence for the
+  classification fix; the release-checklist row for it is now walked.
+- **Pending review dialog, all three answers**, on a profile with Codex,
+  Antigravity and Grok pending: `cancelled` left the provider pending and
+  unread, `allow` granted and showed Grok and started polling it, `keep closed`
+  revoked Codex while leaving it visible. The dialog defect above was found
+  here.
+- **Informational balloon.** The owner saw the "Grok detected" balloon on a
+  dark system theme, which is the headline fix of this release: the same
+  balloon was accepted by Windows and silently dropped from v2.4.1 through
+  v2.5.0.
+
+- **Re-walked after the fix.** With **Decide later** in place, all three ways
+  of not answering - the button, Esc and the title-bar close button - logged
+  `cancelled` and left the provider pending and unread, while **Keep closed**
+  and **Allow access** behaved as before. The reworded hint was confirmed on a
+  provider that had never been granted access.
+
 ## Open
 
-- `7bbdd96` - consent schema 3 and the pending-review strings in all eleven
-  languages - landed after the third review round and has had no independent
-  review. Every earlier round returned at least one accepted blocker.
-- The manual smoke rows this release added or changed have not been walked on
-  the machine: revocation scope, the pending/needs-review choices, the
-  `CredentialUnusable` classification, an informational balloon on a light
-  system theme, and High Contrast on a real High Contrast desktop. See
-  "Not verified" above for the rest.
+- Still not walked: an informational balloon on a light system theme, and High
+  Contrast on a real High Contrast desktop. See "Not verified" above for the
+  rest.
 - Tagging order: merge to `main`, then tag. `git merge-base --is-ancestor
   v2.5.0 HEAD` already passes, so the workflow's ancestry gate is satisfied,
   and `.github/workflows/release.yml` additionally requires the tag to equal

@@ -310,12 +310,22 @@ pub struct Strings {
     /// "{provider}" is replaced with the localized provider name. Rendered as
     /// the hint's single-line action, so it stays short; the route back is in
     /// `detail_access_revoked_outcome`.
+    ///
+    /// Covers a provider that was never granted access as well as one the user
+    /// revoked: the surfaces cannot tell those apart on an upgraded install,
+    /// so the wording states the current fact rather than guessing a past
+    /// decision.
     pub detail_access_revoked_hint: &'static str,
     pub detail_access_revoked_outcome: &'static str,
     /// "{provider}" is replaced with the localized provider name.
     pub access_needs_review: &'static str,
     pub access_allow: &'static str,
     pub access_keep_closed: &'static str,
+    /// Third choice in the pending review dialog, and its default: leaves the
+    /// provider pending and reads nothing. Without it the only way to answer
+    /// "not now" is the title-bar close button, and users pick "keep closed"
+    /// instead - recording a revocation they did not intend.
+    pub access_decide_later: &'static str,
     /// "{provider}" is replaced with the localized provider name.
     pub pending_access_title: &'static str,
     /// "{provider}" is replaced with the localized provider name.
@@ -441,6 +451,7 @@ mod tests {
                 strings.access_needs_review,
                 strings.access_allow,
                 strings.access_keep_closed,
+                strings.access_decide_later,
                 strings.pending_access_title,
                 strings.pending_access_body,
                 strings.detail_access_pending_hint,

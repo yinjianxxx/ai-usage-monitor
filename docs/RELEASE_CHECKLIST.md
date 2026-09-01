@@ -73,8 +73,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   prompt appears and previously allowed providers stay allowed. Providers whose
   older file only has `allow=false` appear under Provider access as **needs
   review** and are not read until **Allow access** or **Keep closed** is
-  chosen. Repeat from settings that had declined every provider: they stay
-  declined and pending, not silently re-enabled.
+  chosen. Confirm the review dialog offers a third choice, **Decide later**,
+  that it is the focused default, and that it, Esc and the title-bar close
+  button all leave the provider pending with nothing read - a stray Enter must
+  never record a revocation. Repeat from settings that had declined every
+  provider: they stay declined and pending, not silently re-enabled.
 - Sign in to a provider that was not previously detected and confirm
   **Provider access → Detect providers again** picks it up immediately when it
   is already allowed. Pending providers must be confirmed first; the prompt

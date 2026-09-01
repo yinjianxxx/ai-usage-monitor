@@ -278,9 +278,12 @@ Upgrading from an earlier version does not show the prompt again and keeps the
 existing provider selection. A provider that was allowed stays allowed. A
 provider whose older file only has `allow=false`, with no record of whether
 you revoked it, is marked **needs review** and is not read until you choose
-**Allow access** or **Keep closed** under Provider access. **Detect providers
-again** asks the same choice for each pending provider and states that it will
-read that provider's local credentials for ongoing monitoring. A provider added
+**Allow access** or **Keep closed** under Provider access. The review also
+offers **Decide later**, which is its default: it changes nothing and leaves
+the provider pending, so closing the dialog or pressing Enter never records a
+decision for you. **Detect providers again** asks the same choice for each
+pending provider and states that it will read that provider's local
+credentials for ongoing monitoring. A provider added
 by an upgrade that was never pending or revoked can still be discovered
 automatically. To pick up a newly installed provider that is already allowed,
 use **Provider access → Detect providers again**. Gengchou also checks once

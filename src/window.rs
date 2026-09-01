@@ -4316,6 +4316,25 @@ fn show_credential_consent_prompt(hwnd: HWND, language: LanguageId) -> bool {
 
 /// Ask whether a LegacyNeedsReview provider may be read. `Some(true)` allows
 /// access, `Some(false)` keeps it closed, `None` leaves the pending state.
+/// "Decide later", and the default answer of the pending review dialog.
+///
+/// Deliberately `IDCANCEL`: the title-bar close button and Esc already produce
+/// it, so the visible third choice and the two invisible ways out cannot drift
+/// apart. Defaulting to "keep closed" instead would let one stray Enter record
+/// a revocation the user never chose - the exact guess this release stopped
+/// making on their behalf.
+const PENDING_ACCESS_DEFAULT_BUTTON: i32 = IDCANCEL.0;
+
+/// Which answer a pending review dialog button stands for. `None` leaves the
+/// provider pending, so an unrecognized id is safe.
+fn pending_access_answer(selected_button: i32) -> Option<bool> {
+    match selected_button {
+        id if id == IDYES.0 => Some(true),
+        id if id == IDNO.0 => Some(false),
+        _ => None,
+    }
+}
+
 fn confirm_pending_provider_access(
     hwnd: HWND,
     kind: tray_icon::TrayIconKind,
@@ -4334,6 +4353,7 @@ fn confirm_pending_provider_access(
         let message_wide = native_interop::wide_str(&message);
         let allow_wide = native_interop::wide_str(strings.access_allow);
         let keep_wide = native_interop::wide_str(strings.access_keep_closed);
+        let later_wide = native_interop::wide_str(strings.access_decide_later);
         let buttons = [
             TASKDIALOG_BUTTON {
                 nButtonID: IDYES.0,
@@ -4342,6 +4362,10 @@ fn confirm_pending_provider_access(
             TASKDIALOG_BUTTON {
                 nButtonID: IDNO.0,
                 pszButtonText: PCWSTR::from_raw(keep_wide.as_ptr()),
+            },
+            TASKDIALOG_BUTTON {
+                nButtonID: PENDING_ACCESS_DEFAULT_BUTTON,
+                pszButtonText: PCWSTR::from_raw(later_wide.as_ptr()),
             },
         ];
         let config = TASKDIALOGCONFIG {
@@ -4353,17 +4377,13 @@ fn confirm_pending_provider_access(
             pszContent: PCWSTR::from_raw(message_wide.as_ptr()),
             cButtons: buttons.len() as u32,
             pButtons: buttons.as_ptr(),
-            nDefaultButton: IDNO.0,
+            nDefaultButton: PENDING_ACCESS_DEFAULT_BUTTON,
             pfCallback: Some(credential_consent_task_dialog_callback),
             ..Default::default()
         };
-        let mut selected_button = IDNO.0;
+        let mut selected_button = PENDING_ACCESS_DEFAULT_BUTTON;
         match call_task_dialog_indirect_if_available(&config, &mut selected_button) {
-            Some(result) if result.is_ok() => match selected_button {
-                id if id == IDYES.0 => Some(true),
-                id if id == IDNO.0 => Some(false),
-                _ => None,
-            },
+            Some(result) if result.is_ok() => pending_access_answer(selected_button),
             result => {
                 diagnose::log(format!(
                     "pending access task dialog unavailable ({}); using message box fallback",
@@ -4371,16 +4391,18 @@ fn confirm_pending_provider_access(
                         .map(|error| windows::core::Error::from(error).to_string())
                         .unwrap_or_else(|| "TaskDialogIndirect entry point missing".to_string())
                 ));
-                match MessageBoxW(
-                    hwnd,
-                    PCWSTR::from_raw(message_wide.as_ptr()),
-                    PCWSTR::from_raw(title_wide.as_ptr()),
-                    MB_YESNOCANCEL | MB_DEFBUTTON2 | MB_ICONQUESTION,
-                ) {
-                    IDYES => Some(true),
-                    IDNO => Some(false),
-                    _ => None,
-                }
+                // Cancel is the fallback's "decide later": same third answer,
+                // and the same default, so neither dialog can revoke a
+                // provider on a stray Enter.
+                pending_access_answer(
+                    MessageBoxW(
+                        hwnd,
+                        PCWSTR::from_raw(message_wide.as_ptr()),
+                        PCWSTR::from_raw(title_wide.as_ptr()),
+                        MB_YESNOCANCEL | MB_DEFBUTTON3 | MB_ICONQUESTION,
+                    )
+                    .0,
+                )
             }
         }
     };
@@ -15473,6 +15495,49 @@ mod reset_notification_tests {
         assert_eq!(credential_consent_default_button(), IDNO.0);
         assert_ne!(fallback_style.0 & MB_DEFBUTTON2.0, 0);
         assert_ne!(fallback_style.0 & MB_SETFOREGROUND.0, 0);
+    }
+
+    #[test]
+    fn pending_review_buttons_map_to_their_answers() {
+        assert_eq!(pending_access_answer(IDYES.0), Some(true));
+        assert_eq!(pending_access_answer(IDNO.0), Some(false));
+        assert_eq!(pending_access_answer(IDCANCEL.0), None);
+        // Esc, the title-bar close button and an id we never registered all
+        // land here; none of them may answer for the user.
+        assert_eq!(pending_access_answer(0), None);
+    }
+
+    #[test]
+    fn pending_review_defaults_to_deciding_later() {
+        // The regression this guards: with "keep closed" as the default, one
+        // Enter recorded a revocation the user never chose, and the only way
+        // to stay pending was the title-bar close button.
+        assert_eq!(
+            pending_access_answer(PENDING_ACCESS_DEFAULT_BUTTON),
+            None,
+            "the default button must change nothing"
+        );
+        assert_eq!(PENDING_ACCESS_DEFAULT_BUTTON, IDCANCEL.0);
+    }
+
+    #[test]
+    fn every_language_offers_the_three_pending_review_answers() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            for (label, name) in [
+                (strings.access_allow, "access_allow"),
+                (strings.access_keep_closed, "access_keep_closed"),
+                (strings.access_decide_later, "access_decide_later"),
+            ] {
+                assert!(
+                    !label.trim().is_empty(),
+                    "missing {name} for {}",
+                    language.code()
+                );
+            }
+            assert_ne!(strings.access_decide_later, strings.access_keep_closed);
+            assert_ne!(strings.access_decide_later, strings.access_allow);
+        }
     }
 
     #[test]

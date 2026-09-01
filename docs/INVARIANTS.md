@@ -24,7 +24,9 @@ identity, or release automation.
   in scope even when it is not currently enabled: detection is the only way a
   newly installed provider is ever noticed. An upgraded `allow=false` whose
   reason cannot be recovered is pending until the user allows access or keeps
-  it closed; it is not guessed to be a revocation. Send a credential only to
+  it closed; it is not guessed to be a revocation. The review dialog must keep
+  a visible third answer that changes nothing, and default to it: dismissing a
+  prompt is not a decision either way. Send a credential only to
   the provider that issued it.
 - A missing credential is **Not detected**. A Windows-local credential source
   that is unreadable or malformed, and any credential the provider expires or
