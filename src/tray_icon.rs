@@ -568,8 +568,6 @@ pub enum BalloonTone {
     ActionRequired,
 }
 
-/// Balloon icon and sound for a tone. `has_custom_icon` reports whether an app
-/// icon was actually loaded for `hBalloonIcon`.
 /// Balloon image, cached per DPI and kept alive for the process.
 ///
 /// `hBalloonIcon` is not like the tray icon's `hIcon`. The shell copies `hIcon`
@@ -604,6 +602,8 @@ fn cached_balloon_icon(hwnd: HWND) -> HICON {
     icon
 }
 
+/// Balloon icon and sound for a tone. `has_custom_icon` reports whether an app
+/// icon was actually loaded for `hBalloonIcon`.
 fn balloon_info_flags(tone: BalloonTone, has_custom_icon: bool) -> NOTIFY_ICON_INFOTIP_FLAGS {
     match tone {
         BalloonTone::Info if has_custom_icon => NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND,
@@ -615,7 +615,6 @@ fn balloon_info_flags(tone: BalloonTone, has_custom_icon: bool) -> NOTIFY_ICON_I
     }
 }
 
-/// Show a Windows balloon notification from the tray icon.
 /// Attach the balloon to one specific tray icon. Fails when that icon is not
 /// currently registered, which is how the caller walks to the next candidate.
 unsafe fn deliver_balloon(
@@ -633,6 +632,7 @@ unsafe fn deliver_balloon(
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
 }
 
+/// Show a Windows balloon notification from the tray icon.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
