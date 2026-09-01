@@ -31,8 +31,10 @@ const SUPPORTED_POLL_INTERVALS: [u32; 6] = [
 
 pub(crate) const PLACEMENT_SCHEMA_VERSION: u8 = 2;
 /// Version 1 introduced the one-time, all-provider access prompt that
-/// replaced the per-provider prompts.
-pub(crate) const CONSENT_SCHEMA_VERSION: u8 = 2;
+/// replaced the per-provider prompts. Version 2 carried the global answer
+/// onto Grok. Version 3 records per-provider LegacyNeedsReview so an older
+/// `allow=false` is not guessed to be a revocation or an implicit grant.
+pub(crate) const CONSENT_SCHEMA_VERSION: u8 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MonitorKey {
@@ -139,7 +141,202 @@ pub(crate) enum LastUpdateOutcome {
     Available { version: String },
 }
 
+/// Load-only presence for the schema-3 access fields.
+///
+/// `Canonical` is an in-memory value (Default, tests, a just-saved snapshot).
+/// `Wire` is a file, and `None` means that JSON key was absent. Compared
+/// equal so round-trips that go through JSON do not fail `PartialEq` on
+/// metadata the file does not keep.
+#[derive(Clone, Debug)]
+pub(crate) enum IncomingAccess {
+    Canonical,
+    Wire {
+        pending: [Option<bool>; TrayIconKind::COUNT],
+        revoked: [Option<bool>; TrayIconKind::COUNT],
+    },
+}
+
+impl Default for IncomingAccess {
+    fn default() -> Self {
+        Self::Canonical
+    }
+}
+
+impl PartialEq for IncomingAccess {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Deserialization DTO. Pending and revoked are `Option` so a missing key is
+/// distinct from an explicit `false`.
+#[derive(Deserialize)]
+struct SettingsFileWire {
+    #[serde(default)]
+    placement_schema_version: u8,
+    #[serde(default)]
+    widget_placement: Option<WidgetPlacement>,
+    #[serde(default)]
+    floating_placement: Option<FloatingPlacement>,
+    #[serde(default)]
+    tray_offset: i32,
+    #[serde(default)]
+    taskbar_index: usize,
+    #[serde(default)]
+    widget_default_position: WidgetDefaultPosition,
+    #[serde(default = "default_poll_interval")]
+    poll_interval_ms: u32,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    last_update_check_unix: Option<u64>,
+    #[serde(default)]
+    last_update_outcome: Option<LastUpdateOutcome>,
+    #[serde(default = "default_widget_visible")]
+    widget_visible: bool,
+    #[serde(default)]
+    floating_visible: bool,
+    #[serde(default = "default_detailed_tray_icons")]
+    detailed_tray_icons: bool,
+    #[serde(default)]
+    detail_pinned: bool,
+    #[serde(default)]
+    floating_x: Option<i32>,
+    #[serde(default)]
+    floating_y: Option<i32>,
+    #[serde(default)]
+    floating_default_position: FloatingDefaultPosition,
+    #[serde(default = "legacy_show_claude_code")]
+    show_claude_code: bool,
+    #[serde(default = "legacy_show_codex")]
+    show_codex: bool,
+    #[serde(default = "default_show_antigravity")]
+    show_antigravity: bool,
+    #[serde(default = "default_show_grok")]
+    show_grok: bool,
+    #[serde(default)]
+    allow_claude_credentials: bool,
+    #[serde(default)]
+    allow_codex_credentials: bool,
+    #[serde(default)]
+    allow_antigravity_credentials: bool,
+    #[serde(default)]
+    allow_grok_credentials: bool,
+    #[serde(default)]
+    credential_consent_granted: bool,
+    #[serde(default)]
+    credential_consent_decided: bool,
+    #[serde(default)]
+    consent_schema_version: u8,
+    #[serde(default)]
+    claude_credential_access_decided: bool,
+    #[serde(default)]
+    codex_credential_access_decided: bool,
+    #[serde(default)]
+    antigravity_credential_access_decided: bool,
+    #[serde(default)]
+    grok_credential_access_decided: bool,
+    #[serde(default)]
+    claude_credential_access_revoked: Option<bool>,
+    #[serde(default)]
+    codex_credential_access_revoked: Option<bool>,
+    #[serde(default)]
+    antigravity_credential_access_revoked: Option<bool>,
+    #[serde(default)]
+    grok_credential_access_revoked: Option<bool>,
+    #[serde(default)]
+    claude_credential_access_pending: Option<bool>,
+    #[serde(default)]
+    codex_credential_access_pending: Option<bool>,
+    #[serde(default)]
+    antigravity_credential_access_pending: Option<bool>,
+    #[serde(default)]
+    grok_credential_access_pending: Option<bool>,
+    #[serde(
+        default = "legacy_provider_order",
+        deserialize_with = "deserialize_provider_order"
+    )]
+    provider_order: Vec<TrayIconKind>,
+    #[serde(default)]
+    notify_session_reset: bool,
+    #[serde(default)]
+    notify_weekly_reset: bool,
+}
+
+impl From<SettingsFileWire> for SettingsFile {
+    fn from(wire: SettingsFileWire) -> Self {
+        Self {
+            placement_schema_version: wire.placement_schema_version,
+            widget_placement: wire.widget_placement,
+            floating_placement: wire.floating_placement,
+            tray_offset: wire.tray_offset,
+            taskbar_index: wire.taskbar_index,
+            widget_default_position: wire.widget_default_position,
+            poll_interval_ms: wire.poll_interval_ms,
+            language: wire.language,
+            last_update_check_unix: wire.last_update_check_unix,
+            last_update_outcome: wire.last_update_outcome,
+            widget_visible: wire.widget_visible,
+            floating_visible: wire.floating_visible,
+            detailed_tray_icons: wire.detailed_tray_icons,
+            detail_pinned: wire.detail_pinned,
+            floating_x: wire.floating_x,
+            floating_y: wire.floating_y,
+            floating_default_position: wire.floating_default_position,
+            show_claude_code: wire.show_claude_code,
+            show_codex: wire.show_codex,
+            show_antigravity: wire.show_antigravity,
+            show_grok: wire.show_grok,
+            allow_claude_credentials: wire.allow_claude_credentials,
+            allow_codex_credentials: wire.allow_codex_credentials,
+            allow_antigravity_credentials: wire.allow_antigravity_credentials,
+            allow_grok_credentials: wire.allow_grok_credentials,
+            credential_consent_granted: wire.credential_consent_granted,
+            credential_consent_decided: wire.credential_consent_decided,
+            consent_schema_version: wire.consent_schema_version,
+            claude_credential_access_decided: wire.claude_credential_access_decided,
+            codex_credential_access_decided: wire.codex_credential_access_decided,
+            antigravity_credential_access_decided: wire.antigravity_credential_access_decided,
+            grok_credential_access_decided: wire.grok_credential_access_decided,
+            claude_credential_access_revoked: wire
+                .claude_credential_access_revoked
+                .unwrap_or(false),
+            codex_credential_access_revoked: wire.codex_credential_access_revoked.unwrap_or(false),
+            antigravity_credential_access_revoked: wire
+                .antigravity_credential_access_revoked
+                .unwrap_or(false),
+            grok_credential_access_revoked: wire.grok_credential_access_revoked.unwrap_or(false),
+            claude_credential_access_pending: wire
+                .claude_credential_access_pending
+                .unwrap_or(false),
+            codex_credential_access_pending: wire.codex_credential_access_pending.unwrap_or(false),
+            antigravity_credential_access_pending: wire
+                .antigravity_credential_access_pending
+                .unwrap_or(false),
+            grok_credential_access_pending: wire.grok_credential_access_pending.unwrap_or(false),
+            provider_order: wire.provider_order,
+            notify_session_reset: wire.notify_session_reset,
+            notify_weekly_reset: wire.notify_weekly_reset,
+            incoming: IncomingAccess::Wire {
+                pending: [
+                    wire.claude_credential_access_pending,
+                    wire.codex_credential_access_pending,
+                    wire.antigravity_credential_access_pending,
+                    wire.grok_credential_access_pending,
+                ],
+                revoked: [
+                    wire.claude_credential_access_revoked,
+                    wire.codex_credential_access_revoked,
+                    wire.antigravity_credential_access_revoked,
+                    wire.grok_credential_access_revoked,
+                ],
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SettingsFileWire")]
 pub(crate) struct SettingsFile {
     #[serde(default)]
     pub placement_schema_version: u8,
@@ -216,6 +413,24 @@ pub(crate) struct SettingsFile {
     pub antigravity_credential_access_decided: bool,
     #[serde(default)]
     pub grok_credential_access_decided: bool,
+    /// Whether the user turned this provider's access off themselves.
+    ///
+    /// Distinct from `!allow_*_credentials`: older files cannot tell a
+    /// revocation from "never asked". Schema 3 records that uncertainty as
+    /// `*_credential_access_pending` instead of guessing `revoked=true`.
+    pub claude_credential_access_revoked: bool,
+    pub codex_credential_access_revoked: bool,
+    pub antigravity_credential_access_revoked: bool,
+    pub grok_credential_access_revoked: bool,
+    /// LegacyNeedsReview: an upgraded `allow=false` whose reason is unknown.
+    /// Silent credential reads stay off until the user allows access or
+    /// keeps the provider closed.
+    pub claude_credential_access_pending: bool,
+    pub codex_credential_access_pending: bool,
+    pub antigravity_credential_access_pending: bool,
+    pub grok_credential_access_pending: bool,
+    #[serde(skip)]
+    pub(crate) incoming: IncomingAccess,
     #[serde(
         default = "legacy_provider_order",
         deserialize_with = "deserialize_provider_order"
@@ -262,6 +477,15 @@ impl Default for SettingsFile {
             codex_credential_access_decided: false,
             antigravity_credential_access_decided: false,
             grok_credential_access_decided: false,
+            claude_credential_access_revoked: false,
+            codex_credential_access_revoked: false,
+            antigravity_credential_access_revoked: false,
+            grok_credential_access_revoked: false,
+            claude_credential_access_pending: false,
+            codex_credential_access_pending: false,
+            antigravity_credential_access_pending: false,
+            grok_credential_access_pending: false,
+            incoming: IncomingAccess::Canonical,
             provider_order: default_provider_order(),
             notify_session_reset: false,
             notify_weekly_reset: false,
@@ -362,6 +586,61 @@ pub(crate) struct ProviderVisibility {
     pub codex_announced: bool,
     pub antigravity_announced: bool,
     pub grok_announced: bool,
+    pub claude_credential_access_revoked: bool,
+    pub codex_credential_access_revoked: bool,
+    pub antigravity_credential_access_revoked: bool,
+    pub grok_credential_access_revoked: bool,
+    pub claude_credential_access_pending: bool,
+    pub codex_credential_access_pending: bool,
+    pub antigravity_credential_access_pending: bool,
+    pub grok_credential_access_pending: bool,
+}
+
+impl ProviderVisibility {
+    pub(crate) fn shown(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.show_claude_code,
+            TrayIconKind::Codex => self.show_codex,
+            TrayIconKind::Antigravity => self.show_antigravity,
+            TrayIconKind::Grok => self.show_grok,
+        }
+    }
+
+    pub(crate) fn allow(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.allow_claude_credentials,
+            TrayIconKind::Codex => self.allow_codex_credentials,
+            TrayIconKind::Antigravity => self.allow_antigravity_credentials,
+            TrayIconKind::Grok => self.allow_grok_credentials,
+        }
+    }
+
+    pub(crate) fn announced(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_announced,
+            TrayIconKind::Codex => self.codex_announced,
+            TrayIconKind::Antigravity => self.antigravity_announced,
+            TrayIconKind::Grok => self.grok_announced,
+        }
+    }
+
+    pub(crate) fn revoked(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_revoked,
+            TrayIconKind::Codex => self.codex_credential_access_revoked,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_revoked,
+            TrayIconKind::Grok => self.grok_credential_access_revoked,
+        }
+    }
+
+    pub(crate) fn pending(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_pending,
+            TrayIconKind::Codex => self.codex_credential_access_pending,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_pending,
+            TrayIconKind::Grok => self.grok_credential_access_pending,
+        }
+    }
 }
 
 /// Turn on exactly the providers detected right after the user granted
@@ -415,10 +694,6 @@ pub(crate) fn apply_manual_detection(
     visibility.show_codex |= detected.codex;
     visibility.show_antigravity |= detected.antigravity;
     visibility.show_grok |= detected.grok;
-    visibility.allow_claude_credentials |= detected.claude;
-    visibility.allow_codex_credentials |= detected.codex;
-    visibility.allow_antigravity_credentials |= detected.antigravity;
-    visibility.allow_grok_credentials |= detected.grok;
     visibility.claude_announced |= detected.claude;
     visibility.codex_announced |= detected.codex;
     visibility.antigravity_announced |= detected.antigravity;
@@ -467,6 +742,133 @@ pub(crate) fn take_detection_announcements(
         }
     }
     announcements
+}
+
+impl SettingsFile {
+    pub(crate) fn allow(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.allow_claude_credentials,
+            TrayIconKind::Codex => self.allow_codex_credentials,
+            TrayIconKind::Antigravity => self.allow_antigravity_credentials,
+            TrayIconKind::Grok => self.allow_grok_credentials,
+        }
+    }
+
+    pub(crate) fn set_allow(&mut self, kind: TrayIconKind, value: bool) {
+        match kind {
+            TrayIconKind::Claude => self.allow_claude_credentials = value,
+            TrayIconKind::Codex => self.allow_codex_credentials = value,
+            TrayIconKind::Antigravity => self.allow_antigravity_credentials = value,
+            TrayIconKind::Grok => self.allow_grok_credentials = value,
+        }
+    }
+
+    pub(crate) fn pending(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_pending,
+            TrayIconKind::Codex => self.codex_credential_access_pending,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_pending,
+            TrayIconKind::Grok => self.grok_credential_access_pending,
+        }
+    }
+
+    pub(crate) fn set_pending(&mut self, kind: TrayIconKind, value: bool) {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_pending = value,
+            TrayIconKind::Codex => self.codex_credential_access_pending = value,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_pending = value,
+            TrayIconKind::Grok => self.grok_credential_access_pending = value,
+        }
+    }
+
+    pub(crate) fn revoked(&self, kind: TrayIconKind) -> bool {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_revoked,
+            TrayIconKind::Codex => self.codex_credential_access_revoked,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_revoked,
+            TrayIconKind::Grok => self.grok_credential_access_revoked,
+        }
+    }
+
+    pub(crate) fn set_revoked(&mut self, kind: TrayIconKind, value: bool) {
+        match kind {
+            TrayIconKind::Claude => self.claude_credential_access_revoked = value,
+            TrayIconKind::Codex => self.codex_credential_access_revoked = value,
+            TrayIconKind::Antigravity => self.antigravity_credential_access_revoked = value,
+            TrayIconKind::Grok => self.grok_credential_access_revoked = value,
+        }
+    }
+}
+
+fn incoming_pending(settings: &SettingsFile, kind: TrayIconKind) -> Option<bool> {
+    match &settings.incoming {
+        IncomingAccess::Canonical => Some(settings.pending(kind)),
+        IncomingAccess::Wire { pending, .. } => pending[kind.index()],
+    }
+}
+
+fn incoming_revoked(settings: &SettingsFile, kind: TrayIconKind) -> Option<bool> {
+    match &settings.incoming {
+        IncomingAccess::Canonical => Some(settings.revoked(kind)),
+        IncomingAccess::Wire { revoked, .. } => revoked[kind.index()],
+    }
+}
+
+/// Classify LegacyNeedsReview after schema-1 and schema-2 have already run.
+///
+/// `allow=true` and an unanswered global consent win over a missing pending
+/// field. `decided && !allow` is never treated as a revocation.
+fn classify_one_access_state(
+    schema: u8,
+    consent_decided: bool,
+    allow: bool,
+    incoming_pending: Option<bool>,
+    incoming_revoked: Option<bool>,
+) -> (bool, bool) {
+    let needs_classify = schema < 3 || incoming_pending.is_none();
+    if !needs_classify {
+        return (
+            incoming_pending.unwrap_or(false),
+            incoming_revoked.unwrap_or(false),
+        );
+    }
+    if !consent_decided {
+        return (false, incoming_revoked.unwrap_or(false));
+    }
+    if allow {
+        return (false, false);
+    }
+    if incoming_revoked == Some(true) {
+        return (false, true);
+    }
+    (true, false)
+}
+
+fn classify_legacy_access_state(settings: &mut SettingsFile, schema_before: u8) -> bool {
+    let mut changed = false;
+    let consent_decided = settings.credential_consent_decided;
+    for kind in TrayIconKind::ALL {
+        let allow = settings.allow(kind);
+        let incoming_pending = incoming_pending(settings, kind);
+        let incoming_revoked = incoming_revoked(settings, kind);
+        let (pending, revoked) = classify_one_access_state(
+            schema_before,
+            consent_decided,
+            allow,
+            incoming_pending,
+            incoming_revoked,
+        );
+        if pending != settings.pending(kind) || revoked != settings.revoked(kind) {
+            changed = true;
+        }
+        if revoked && allow {
+            settings.set_allow(kind, false);
+            changed = true;
+        }
+        settings.set_pending(kind, pending);
+        settings.set_revoked(kind, revoked);
+    }
+    changed
 }
 
 fn normalize_provider_order(configured: &[TrayIconKind]) -> Vec<TrayIconKind> {
@@ -544,10 +946,15 @@ pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
     if settings.consent_schema_version < 2 {
         settings.allow_grok_credentials = settings.credential_consent_granted;
     }
-    if settings.consent_schema_version < CONSENT_SCHEMA_VERSION {
+    let schema_before_access = settings.consent_schema_version;
+    let classified = classify_legacy_access_state(settings, schema_before_access);
+    if schema_before_access < CONSENT_SCHEMA_VERSION || classified {
         settings.consent_schema_version = CONSENT_SCHEMA_VERSION;
-        repaired.push("credential_consent");
+        if !repaired.iter().any(|item| *item == "credential_consent") {
+            repaired.push("credential_consent");
+        }
     }
+    settings.incoming = IncomingAccess::Canonical;
     let provider_order = normalize_provider_order(&settings.provider_order);
     if provider_order != settings.provider_order {
         settings.provider_order = provider_order;
@@ -670,7 +1077,7 @@ pub(crate) fn load() -> SettingsFile {
     let Some(content) = read_settings_content() else {
         return SettingsFile::default();
     };
-    let mut settings: SettingsFile = match serde_json::from_str(&content) {
+    let settings: SettingsFile = match serde_json::from_str(&content) {
         Ok(settings) => settings,
         Err(error) => {
             diagnose::log(format!(
@@ -679,12 +1086,22 @@ pub(crate) fn load() -> SettingsFile {
             return SettingsFile::default();
         }
     };
+    apply_normalized_load(settings, save)
+}
+
+/// Normalize a just-parsed settings file and try to persist repairs.
+///
+/// A persist failure must not roll the in-memory value back: callers keep the
+/// conservative normalized state (including pending/deny) and surface the
+/// existing persistence warning.
+fn apply_normalized_load(
+    mut settings: SettingsFile,
+    persist: impl FnOnce(&SettingsFile) -> io::Result<()>,
+) -> SettingsFile {
     let repaired = normalize(&mut settings);
     if !repaired.is_empty() {
         diagnose::log(format!("settings normalized fields={}", repaired.join(",")));
-    }
-    if !repaired.is_empty() {
-        if let Err(error) = save(&settings) {
+        if let Err(error) = persist(&settings) {
             record_persistence_warning("Unable to save normalized settings", &error);
             diagnose::log_error("settings normalization save failed", &error);
         }
@@ -762,6 +1179,37 @@ pub(crate) fn save(settings: &SettingsFile) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The schema-1 migration marks every pre-existing provider as decided
+    /// while carrying an old `allow_* = false` forward, so `!allow` there does
+    /// not mean the user said no. Those providers become LegacyNeedsReview
+    /// (`pending`) instead of `revoked`.
+    #[test]
+    fn migrating_an_old_install_revokes_nothing() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "allow_claude_credentials": true,
+                "allow_codex_credentials": false,
+                "allow_antigravity_credentials": false
+            }"#,
+        )
+        .expect("settings parse");
+        assert_eq!(settings.consent_schema_version, 0);
+
+        normalize(&mut settings);
+
+        assert!(settings.codex_credential_access_decided);
+        assert!(settings.antigravity_credential_access_decided);
+        assert!(!settings.allow_codex_credentials);
+        assert!(!settings.codex_credential_access_revoked);
+        assert!(!settings.antigravity_credential_access_revoked);
+        assert!(!settings.claude_credential_access_revoked);
+        assert!(!settings.grok_credential_access_revoked);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(settings.codex_credential_access_pending);
+        assert!(settings.antigravity_credential_access_pending);
+        assert_eq!(settings.consent_schema_version, CONSENT_SCHEMA_VERSION);
+    }
+
     use super::*;
 
     /// A provider name from a newer build must not take the whole settings file
@@ -881,6 +1329,10 @@ mod tests {
         assert!(!settings.claude_credential_access_decided);
         assert!(!settings.codex_credential_access_decided);
         assert!(!settings.antigravity_credential_access_decided);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.codex_credential_access_pending);
+        assert!(!settings.antigravity_credential_access_pending);
+        assert!(!settings.grok_credential_access_pending);
     }
 
     #[test]
@@ -976,6 +1428,12 @@ mod tests {
         assert!(settings.claude_credential_access_decided);
         assert!(settings.codex_credential_access_decided);
         assert!(settings.antigravity_credential_access_decided);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(settings.codex_credential_access_pending);
+        assert!(settings.antigravity_credential_access_pending);
+        assert!(settings.allow_grok_credentials);
+        assert!(!settings.grok_credential_access_pending);
+        assert!(!settings.grok_credential_access_decided);
     }
 
     /// An install whose owner declined every provider must not be re-prompted
@@ -989,6 +1447,12 @@ mod tests {
 
         assert!(settings.credential_consent_decided);
         assert!(!settings.credential_consent_granted);
+        assert!(settings.claude_credential_access_pending);
+        assert!(settings.codex_credential_access_pending);
+        assert!(settings.antigravity_credential_access_pending);
+        assert!(settings.grok_credential_access_pending);
+        assert!(!settings.allow_claude_credentials);
+        assert!(!settings.allow_grok_credentials);
     }
 
     /// `load` runs `normalize` unconditionally and rewrites the file whenever
@@ -1018,6 +1482,10 @@ mod tests {
 
         assert!(!repaired.contains(&"credential_consent"));
         assert!(!settings.credential_consent_decided);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.codex_credential_access_pending);
+        assert!(!settings.antigravity_credential_access_pending);
+        assert!(!settings.grok_credential_access_pending);
     }
 
     #[test]
@@ -1109,6 +1577,83 @@ mod tests {
         assert!(take_detection_announcements(&mut visibility, detected).is_empty());
     }
 
+    /// The startup sweep exists for exactly this install: it upgraded into a
+    /// version that added a provider, so migration granted access but left the
+    /// announcement unpaid. Providers it had already decided on stay quiet
+    /// even when they are detected too.
+    #[test]
+    fn a_migrated_install_still_owes_a_balloon_for_a_provider_an_update_added() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{
+                "consent_schema_version": 1,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "claude_credential_access_decided": true,
+                "codex_credential_access_decided": true,
+                "antigravity_credential_access_decided": true,
+                "show_codex": true,
+                "allow_codex_credentials": true
+            }"#,
+        )
+        .expect("settings from before Grok shipped should remain readable");
+
+        normalize(&mut settings);
+
+        assert!(settings.allow_grok_credentials);
+        assert!(!settings.show_grok);
+        assert!(!settings.grok_credential_access_decided);
+
+        let mut visibility = ProviderVisibility {
+            show_claude_code: settings.show_claude_code,
+            show_codex: settings.show_codex,
+            show_antigravity: settings.show_antigravity,
+            show_grok: settings.show_grok,
+            allow_claude_credentials: settings.allow_claude_credentials,
+            allow_codex_credentials: settings.allow_codex_credentials,
+            allow_antigravity_credentials: settings.allow_antigravity_credentials,
+            allow_grok_credentials: settings.allow_grok_credentials,
+            claude_announced: settings.claude_credential_access_decided,
+            codex_announced: settings.codex_credential_access_decided,
+            antigravity_announced: settings.antigravity_credential_access_decided,
+            grok_announced: settings.grok_credential_access_decided,
+            ..Default::default()
+        };
+
+        let announced = take_detection_announcements(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: true,
+                antigravity: false,
+                grok: true,
+            },
+        );
+
+        assert_eq!(announced, vec![TrayIconKind::Grok]);
+        assert!(!visibility.show_grok);
+        assert!(!settings.grok_credential_access_pending);
+        assert!(!settings.grok_credential_access_revoked);
+    }
+
+    /// Why the startup sweep must not run on a fresh install: it is only
+    /// silent once first-run detection has finished claiming the providers it
+    /// enables, so running the two concurrently would announce providers that
+    /// pass is in the middle of turning on.
+    #[test]
+    fn first_run_detection_leaves_a_following_sweep_nothing_to_announce() {
+        let mut visibility = ProviderVisibility::default();
+        let detected = DetectedProviders {
+            claude: true,
+            codex: false,
+            antigravity: false,
+            grok: true,
+        };
+
+        apply_first_run_detection(&mut visibility, detected);
+
+        assert!(take_detection_announcements(&mut visibility, detected).is_empty());
+    }
+
     /// A provider the user hid by hand counts as announced, so the sweep
     /// leaves it alone instead of nagging.
     #[test]
@@ -1153,10 +1698,34 @@ mod tests {
             },
         );
 
-        assert!(visibility.show_claude_code && visibility.allow_claude_credentials);
+        assert!(visibility.show_claude_code);
+        assert!(!visibility.allow_claude_credentials);
         assert!(!visibility.show_codex);
         // Kept, even though this pass could not read its credential.
         assert!(visibility.show_antigravity && visibility.allow_antigravity_credentials);
+    }
+
+    #[test]
+    fn manual_detection_does_not_grant_access() {
+        let mut visibility = ProviderVisibility {
+            allow_codex_credentials: true,
+            show_codex: true,
+            ..Default::default()
+        };
+
+        apply_manual_detection(
+            &mut visibility,
+            DetectedProviders {
+                claude: true,
+                codex: true,
+                antigravity: false,
+                grok: false,
+            },
+        );
+
+        assert!(visibility.show_claude_code);
+        assert!(!visibility.allow_claude_credentials);
+        assert!(visibility.allow_codex_credentials);
     }
 
     #[test]
@@ -1357,6 +1926,222 @@ mod tests {
         assert_eq!(legacy.placement_schema_version, 0);
         assert!(legacy.widget_placement.is_none());
         assert!(legacy.floating_placement.is_none());
+    }
+
+    fn parse_settings(json: &str) -> SettingsFile {
+        serde_json::from_str(json).expect("settings parse")
+    }
+
+    #[test]
+    fn old_explicit_allow_stays_allowed_and_not_pending() {
+        let mut settings = parse_settings(
+            r#"{
+                "allow_claude_credentials": true,
+                "show_claude_code": true
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(settings.allow_claude_credentials);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.claude_credential_access_revoked);
+    }
+
+    #[test]
+    fn old_revocation_shape_becomes_pending_not_revoked() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 2,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "show_claude_code": true,
+                "allow_claude_credentials": false,
+                "claude_credential_access_decided": true
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.allow_claude_credentials);
+        assert!(settings.claude_credential_access_pending);
+        assert!(!settings.claude_credential_access_revoked);
+    }
+
+    #[test]
+    fn old_shown_never_authorized_becomes_pending() {
+        let mut settings = parse_settings(
+            r#"{
+                "show_codex": true,
+                "allow_codex_credentials": false
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(settings.show_codex);
+        assert!(!settings.allow_codex_credentials);
+        assert!(settings.codex_credential_access_pending);
+        assert!(!settings.codex_credential_access_revoked);
+    }
+
+    #[test]
+    fn old_hidden_never_authorized_becomes_pending() {
+        let mut settings = parse_settings(
+            r#"{
+                "show_claude_code": false,
+                "allow_claude_credentials": false,
+                "allow_codex_credentials": true
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.show_claude_code);
+        assert!(settings.claude_credential_access_pending);
+        assert!(!settings.claude_credential_access_revoked);
+    }
+
+    #[test]
+    fn revoked_then_hidden_on_unpublished_branch_stays_revoked() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 2,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "show_claude_code": false,
+                "allow_claude_credentials": false,
+                "claude_credential_access_decided": true,
+                "claude_credential_access_revoked": true
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.allow_claude_credentials);
+        assert!(settings.claude_credential_access_revoked);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.show_claude_code);
+    }
+
+    #[test]
+    fn explicit_revoked_false_is_not_treated_as_a_revocation() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 2,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "allow_codex_credentials": false,
+                "codex_credential_access_revoked": false
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(settings.codex_credential_access_pending);
+        assert!(!settings.codex_credential_access_revoked);
+    }
+
+    #[test]
+    fn schema3_missing_pending_is_conservative_only_for_remaining_allow_false() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 3,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "allow_claude_credentials": true,
+                "allow_codex_credentials": false,
+                "claude_credential_access_revoked": false,
+                "codex_credential_access_revoked": false
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.claude_credential_access_revoked);
+        assert!(settings.allow_claude_credentials);
+        assert!(settings.codex_credential_access_pending);
+        assert!(!settings.codex_credential_access_revoked);
+    }
+
+    #[test]
+    fn schema3_present_pending_false_is_not_reclassified() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 3,
+                "credential_consent_granted": true,
+                "credential_consent_decided": true,
+                "allow_claude_credentials": true,
+                "allow_codex_credentials": false,
+                "allow_antigravity_credentials": true,
+                "allow_grok_credentials": true,
+                "claude_credential_access_pending": false,
+                "codex_credential_access_pending": false,
+                "antigravity_credential_access_pending": false,
+                "grok_credential_access_pending": false,
+                "codex_credential_access_revoked": true
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.codex_credential_access_pending);
+        assert!(settings.codex_credential_access_revoked);
+        assert!(!settings.allow_codex_credentials);
+    }
+
+    #[test]
+    fn unanswered_consent_is_not_marked_pending() {
+        let mut settings = parse_settings(
+            r#"{
+                "consent_schema_version": 2,
+                "credential_consent_decided": false,
+                "allow_claude_credentials": false
+            }"#,
+        );
+        normalize(&mut settings);
+        assert!(!settings.credential_consent_decided);
+        assert!(!settings.claude_credential_access_pending);
+        assert!(!settings.allow_claude_credentials);
+    }
+
+    #[test]
+    fn pending_survives_save_and_reload() {
+        let mut settings = parse_settings(
+            r#"{
+                "allow_claude_credentials": true,
+                "allow_codex_credentials": false
+            }"#,
+        );
+        normalize(&mut settings);
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"codex_credential_access_pending\":true"));
+        let mut reloaded: SettingsFile = serde_json::from_str(&json).expect("reload");
+        normalize(&mut reloaded);
+        assert_eq!(reloaded, settings);
+        assert!(reloaded.codex_credential_access_pending);
+        assert!(!reloaded.allow_codex_credentials);
+    }
+
+    #[test]
+    fn failed_save_does_not_roll_back_in_memory_pending() {
+        let parsed = parse_settings(
+            r#"{
+                "allow_codex_credentials": false,
+                "allow_claude_credentials": true
+            }"#,
+        );
+        assert!(!parsed.codex_credential_access_pending);
+
+        let mut persist_calls = 0;
+        let settings = apply_normalized_load(parsed, |normalized| {
+            persist_calls += 1;
+            assert!(normalized.codex_credential_access_pending);
+            assert!(!normalized.allow_codex_credentials);
+            assert!(!normalized.codex_credential_access_revoked);
+            Err(io::Error::other("injected settings save failure"))
+        });
+
+        assert_eq!(persist_calls, 1);
+        assert!(settings.codex_credential_access_pending);
+        assert!(!settings.allow_codex_credentials);
+        assert!(!settings.codex_credential_access_revoked);
+        let _ = take_persistence_warning();
+    }
+
+    #[test]
+    fn classify_one_never_promotes_allow() {
+        let (pending, revoked) = classify_one_access_state(2, true, false, None, Some(false));
+        assert!(pending);
+        assert!(!revoked);
+        let (pending, revoked) = classify_one_access_state(2, true, true, None, None);
+        assert!(!pending);
+        assert!(!revoked);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -562,9 +563,43 @@ pub enum BalloonTone {
     /// elapsed quota window, a newly detected provider. Carries the app icon
     /// and no sound.
     Info,
-    /// Monitoring is stopped until the user acts, currently only a credential
-    /// that the provider rejected.
+    /// Monitoring is stopped until the user acts: a credential the provider
+    /// rejected, or one on this machine that cannot be used.
     ActionRequired,
+}
+
+/// Balloon image, cached per DPI and kept alive for the process.
+///
+/// `hBalloonIcon` is not like the tray icon's `hIcon`. The shell copies `hIcon`
+/// while `Shell_NotifyIconW` runs, but Windows 10/11 renders a tray balloon as
+/// a toast *after* the call returns, so destroying the balloon handle on the
+/// way out leaves nothing to draw: the call still reports success and the
+/// balloon is silently dropped. Blanket-leaking is not the answer either -
+/// `load_embedded_app_icon_of_size` can fall back to `ExtractIconExW`, whose
+/// handles we own. Keep one handle per DPI instead.
+///
+/// Nothing is ever evicted. Evicting on a DPI change would destroy a handle
+/// the shell may still be about to draw - the same premature destruction this
+/// cache exists to avoid - and a caller reads its handle after releasing the
+/// lock, so a concurrent notification at another DPI could pull it out from
+/// under that caller. The set is bounded by the number of distinct DPIs the
+/// window ever reports, which is a handful.
+static BALLOON_ICONS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
+
+fn cached_balloon_icon(hwnd: HWND) -> HICON {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let mut cached = BALLOON_ICONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((_, handle)) = cached.iter().find(|(cached_dpi, _)| *cached_dpi == dpi) {
+        return HICON(*handle as *mut std::ffi::c_void);
+    }
+    let icon = load_embedded_app_icon_of_size(hwnd, true);
+    if !icon.is_invalid() {
+        cached.push((dpi, icon.0 as isize));
+    }
+    icon
 }
 
 /// Balloon icon and sound for a tone. `has_custom_icon` reports whether an app
@@ -580,6 +615,23 @@ fn balloon_info_flags(tone: BalloonTone, has_custom_icon: bool) -> NOTIFY_ICON_I
     }
 }
 
+/// Attach the balloon to one specific tray icon. Fails when that icon is not
+/// currently registered, which is how the caller walks to the next candidate.
+unsafe fn deliver_balloon(
+    mut nid: NOTIFYICONDATAW,
+    info_flags: NOTIFY_ICON_INFOTIP_FLAGS,
+    balloon_icon: HICON,
+    title: &str,
+    message: &str,
+) -> bool {
+    nid.uFlags |= NIF_INFO;
+    nid.dwInfoFlags = info_flags;
+    nid.hBalloonIcon = balloon_icon;
+    copy_wide(title, &mut nid.szInfoTitle);
+    copy_wide_256(message, &mut nid.szInfo);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
+}
+
 /// Show a Windows balloon notification from the tray icon.
 pub fn notify_balloon(
     hwnd: HWND,
@@ -590,29 +642,43 @@ pub fn notify_balloon(
 ) {
     unsafe {
         let balloon_icon = match tone {
-            BalloonTone::Info => load_embedded_app_icon_of_size(hwnd, true),
+            BalloonTone::Info => cached_balloon_icon(hwnd),
             BalloonTone::ActionRequired => HICON::default(),
         };
         let info_flags = balloon_info_flags(tone, !balloon_icon.is_invalid());
-        let mut nid = notify_icon_data(hwnd, kind);
-        nid.uFlags |= NIF_INFO;
-        nid.dwInfoFlags = info_flags;
-        nid.hBalloonIcon = balloon_icon;
-        copy_wide(title, &mut nid.szInfoTitle);
-        copy_wide_256(message, &mut nid.szInfo);
-        if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
-            let mut app_nid = app_notify_icon_data(hwnd);
-            app_nid.uFlags |= NIF_INFO;
-            app_nid.dwInfoFlags = info_flags;
-            app_nid.hBalloonIcon = balloon_icon;
-            copy_wide(title, &mut app_nid.szInfoTitle);
-            copy_wide_256(message, &mut app_nid.szInfo);
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &app_nid);
-        }
-        // The shell takes its own copy while Shell_NotifyIconW runs, as it
-        // does for the tray icon handle in `ensure`.
-        if !balloon_icon.is_invalid() {
-            let _ = DestroyIcon(balloon_icon);
+        // A balloon can only be shown on an icon the tray currently has. The
+        // provider's own icon is the right anchor when it exists, but the
+        // detection announcement is defined by the provider *not* being shown,
+        // so its icon has been removed - and detailed mode removes the app icon
+        // too, leaving both of the obvious anchors gone. Fall through to any
+        // icon that is actually registered rather than dropping the balloon.
+        let delivered = deliver_balloon(
+            notify_icon_data(hwnd, kind),
+            info_flags,
+            balloon_icon,
+            title,
+            message,
+        ) || deliver_balloon(
+            app_notify_icon_data(hwnd),
+            info_flags,
+            balloon_icon,
+            title,
+            message,
+        ) || TrayIconKind::ALL.into_iter().any(|other| {
+            other.id() != kind.id()
+                && deliver_balloon(
+                    notify_icon_data(hwnd, other),
+                    info_flags,
+                    balloon_icon,
+                    title,
+                    message,
+                )
+        });
+        if !delivered {
+            diagnose::log(format!(
+                "balloon not delivered; no registered tray icon kind={}",
+                kind.diagnostic_label()
+            ));
         }
     }
 }
@@ -675,6 +741,10 @@ fn update_provider_tooltip(hwnd: HWND, kind: TrayIconKind, tooltip: &str) {
             provider_tooltip_notify_icon_data_for_mode(hwnd, kind, kind.identity_mode(), tooltip);
         // Countdown-only refresh: modifying the tooltip must not recreate the
         // HICON, re-register the callback, or disturb the user's Shell order.
+        //
+        // Not logged: this fails while the shell is between restarts, which is
+        // already reported by the taskbar watchdog, and the only consequence
+        // is a tooltip that stays stale until the next `sync` rewrites it.
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
@@ -858,6 +928,12 @@ fn ensure_app(hwnd: HWND, tooltip: &str) {
 }
 
 /// Remove the tray icon from the shell.
+///
+/// The failure is deliberately not logged. `sync` calls this for every
+/// provider that is not currently shown, most of which were never registered,
+/// so `NIM_DELETE` failing is the normal path rather than a symptom - logging
+/// it would bury real diagnostics under one line per hidden provider per
+/// refresh.
 pub fn remove(hwnd: HWND, kind: TrayIconKind) {
     unsafe {
         let nid = notify_icon_data(hwnd, kind);
@@ -881,6 +957,8 @@ pub fn restore_app_focus(hwnd: HWND) {
     }
 }
 
+/// Remove the application icon. Fails routinely for the same reason as
+/// [`remove`]: per-provider icon mode calls it whether or not it was added.
 fn remove_app(hwnd: HWND) {
     unsafe {
         let nid = app_notify_icon_data(hwnd);
@@ -1134,18 +1212,17 @@ mod tests {
 
     #[test]
     fn icon_guids_are_stable_and_unique() {
-        let guids = [
-            app_icon_guid(),
-            TrayIconKind::Claude.guid(),
-            TrayIconKind::Codex.guid(),
-            TrayIconKind::Antigravity.guid(),
-        ];
-        assert_ne!(guids[0], guids[1]);
-        assert_ne!(guids[1], guids[2]);
-        assert_ne!(guids[0], guids[2]);
-        assert_ne!(guids[0], guids[3]);
-        assert_ne!(guids[1], guids[3]);
-        assert_ne!(guids[2], guids[3]);
+        // Built from `ALL` rather than spelled out: the hand-written list
+        // silently stopped covering every provider the moment a fourth one
+        // was added, which is exactly what this test exists to prevent.
+        let mut guids = vec![app_icon_guid()];
+        guids.extend(TrayIconKind::ALL.into_iter().map(TrayIconKind::guid));
+        assert_eq!(guids.len(), TrayIconKind::COUNT + 1);
+        for (index, guid) in guids.iter().enumerate() {
+            for other in &guids[index + 1..] {
+                assert_ne!(guid, other, "duplicate tray icon GUID");
+            }
+        }
     }
 
     #[test]

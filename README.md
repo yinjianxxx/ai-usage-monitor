@@ -65,7 +65,10 @@ show the exact pixels the shipped code draws. Regenerate them any time with
 - **Tray icons.** One live icon per enabled provider — the number and adaptive
   bars follow whatever quota windows that provider reports; with no data the
   number gives way to the provider's initial. Disable **Provider tray icons**
-  to keep a single neutral app icon instead.
+  to keep a single neutral app icon instead. The app icon also stands in
+  whenever no provider has been granted credential access, since there is no
+  provider whose mark would be honest to show; your preference is untouched
+  and the provider icons return as soon as one is authorized.
 - **Detail popup.** Opens from a left-click on any surface: per-provider
   status badges, exact reset clock times, and a live refresh countdown. Its
   separate pin and position-lock controls can keep it open or stop it moving.
@@ -263,24 +266,51 @@ machine and shows those providers. If none are detected, it keeps a locally
 polled Codex placeholder visible so the first sign-in can be recognized without
 changing the user's provider selection. Permission is granted once for every
 provider, but revoking stays per provider: use **Provider access** in the
-context menu to turn any single one off at any time. Gengchou re-reads the
-original file or Windows Credential Manager entry as needed, so provider-side
-token refresh continues to work without copying the token into Gengchou.
+context menu to turn any single one off at any time. Turning a provider off
+also stops it being read at all: neither the check at start, the periodic
+check, nor **Detect providers again** touches its credentials until you turn
+it back on. Showing or hiding a provider under **Providers** only changes
+visibility; it does not grant credential access. Gengchou re-reads the original
+file or Windows Credential Manager entry as needed, so provider-side token
+refresh continues to work without copying the token into Gengchou.
 
 Upgrading from an earlier version does not show the prompt again and keeps the
-existing provider selection and permissions as they are. To pick up a newly
-installed provider, use **Provider access → Detect providers again**. Gengchou
-also checks periodically and shows a single notification when it finds a newly
-signed-in provider; it never changes what is displayed on its own.
+existing provider selection. A provider that was allowed stays allowed. A
+provider whose older file only has `allow=false`, with no record of whether
+you revoked it, is marked **needs review** and is not read until you choose
+**Allow access** or **Keep closed** under Provider access. The review also
+offers **Decide later**, which is its default: it changes nothing and leaves
+the provider pending, so closing the dialog or pressing Enter never records a
+decision for you. **Detect providers again** asks the same choice for each
+pending provider and states that it will read that provider's local
+credentials for ongoing monitoring. A provider added
+by an upgrade that was never pending or revoked can still be discovered
+automatically. To pick up a newly installed provider that is already allowed,
+use **Provider access → Detect providers again**. Gengchou also checks once
+shortly after each start and periodically thereafter, and shows a single
+notification when it finds a newly signed-in provider; it never changes what
+is displayed on its own. The check at startup is what tells you about a
+provider added by an upgrade, rather than making you wait out the first
+interval.
+
+`gengchou.exe --claude-auth-diagnostics` is a separate, user-triggered
+exception: it reads local Claude credentials only to print a redacted
+diagnostic report.
 
 A provider with no credential on this machine shows **Not detected** in the
 detail popup along with a note that it is recognized automatically after
 sign-in, and raises no notification — a provider that was never signed in has
-nothing to sign in to *again*. **Authentication failed** means a concrete
-credential source exists but is unreadable, malformed, expired, rejected, or
-otherwise unusable; these cases share the same simple recovery: sign in again.
-If a WSL probe itself cannot start or finish, Gengchou treats that as a
-temporary refresh failure instead and never raises an authentication warning.
+nothing to sign in to *again*. **Authentication failed** means a credential
+really is there and cannot be used: a Windows file or Credential Manager entry
+that is unreadable or malformed, or a credential the provider expires or
+rejects. These cases share the same simple recovery: sign in again. A WSL probe that
+cannot start or finish is treated as a temporary refresh failure instead, never
+as an authentication problem. Inside WSL, Claude's probe still separates an
+absent credential from an unreadable one; the Codex, Antigravity and Grok
+probes cannot tell a distribution that has no credential from one that failed
+to answer, so they move on to the next source and a credential that lives only
+inside an unreachable distribution reads as **Not detected** rather than
+raising a false sign-in warning.
 
 ## Data & privacy
 

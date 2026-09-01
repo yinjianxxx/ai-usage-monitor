@@ -25,8 +25,10 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - `tools\check-portable-runtime.ps1` rejects external MSVC/UCRT runtime DLLs
   so the portable executable starts without a separate redistributable.
 - Confirm tests cover settings that predate provider permissions, the
-  default-deny permission state, and the hard poll gate that requires both
-  visibility and explicit provider permission.
+  default-deny permission state, the hard poll gate that requires both
+  visibility and explicit provider permission, schema-3 LegacyNeedsReview
+  pending classification, and zero credential reads for pending/revoked
+  providers on FirstRun, Rescan, Manual, poll, and the credential watch.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
 - When a release adds a provider, state the downgrade consequence in the
@@ -68,12 +70,30 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   notices the first sign-in. After declining, confirm nothing is read or
   polled.
 - On an upgrade from settings that predate the one-time prompt, confirm no
-  prompt appears and the existing provider selection and permissions are
-  preserved exactly. Repeat from settings that had declined every provider.
+  prompt appears and previously allowed providers stay allowed. Providers whose
+  older file only has `allow=false` appear under Provider access as **needs
+  review** and are not read until **Allow access** or **Keep closed** is
+  chosen. Confirm the review dialog offers a third choice, **Decide later**,
+  that it is the focused default, and that it, Esc and the title-bar close
+  button all leave the provider pending with nothing read - a stray Enter must
+  never record a revocation. Repeat from settings that had declined every
+  provider: they stay declined and pending, not silently re-enabled.
 - Sign in to a provider that was not previously detected and confirm
-  **Provider access → Detect providers again** picks it up immediately. Confirm
+  **Provider access → Detect providers again** picks it up immediately when it
+  is already allowed. Pending providers must be confirmed first; the prompt
+  says local credentials will be read for ongoing monitoring. Confirm
   the periodic sweep notifies once per provider and never changes what is
-  displayed on its own, and stays quiet about providers the user turned off.
+  displayed on its own, and stays quiet about providers the user turned off
+  or left pending. Confirm the sweep also runs shortly after start on an
+  install that has already answered the access prompt, so a provider added by
+  an upgrade that is not pending or revoked does not wait out a full interval.
+  Revoke one provider, then confirm neither the startup sweep, the periodic
+  sweep, nor **Detect providers again** reads its credentials at all - the
+  diagnostic log records the scope of every pass. Showing a provider under
+  **Providers** must not grant access. Confirm an upgraded `allow=false` is
+  pending rather than a guessed revocation, and that startup Rescan, poll, and
+  Detect providers again stay out of scope until **Allow access** or **Keep
+  closed**.
 - With Codex, Antigravity, and Grok credentials only inside WSL, confirm they
   are read from a **running** distribution (`$CODEX_HOME/auth.json`,
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, and
@@ -86,8 +106,13 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - Force a WSL credential probe spawn failure, timeout, and unexpected exit;
   each must follow the transient request-failure path and must not show an
   authentication warning. A concrete credential file that is present but
-  unreadable (including the WSL exit-45 path), malformed, expired, or rejected
-  must still use **Authentication failed** and the sign-in recovery.
+  unreadable, malformed, expired, or rejected must still use **Authentication
+  failed** and the sign-in recovery. Inside WSL that distinction is Claude's
+  only: its probe reports exit 45 for a present-but-unreadable file, while the
+  Codex, Antigravity and Grok probes report only success or nothing and must
+  fall through quietly to the next source. Check the Windows-side paths for
+  those three instead - a malformed `auth.json` or an unparsable Credential
+  Manager entry must show **Authentication failed**, not **Not detected**.
 - Confirm a provider with no credential shows **Not detected** with the
   automatic-recognition note and raises no notification, while a concrete but
   unusable credential shows **Authentication failed**. Both credential states
@@ -178,7 +203,9 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   gives a localized connection action plus an automatic-retry outcome.
 - Disable Provider tray icons and confirm the provider icons are replaced
   by one app icon matching the executable; re-enable it and confirm all enabled
-  provider icons return without duplicates. At each tested DPI, confirm the app
+  provider icons return without duplicates. Confirm the same app icon stands in
+  while no provider has access at all, without rewriting the user's Provider
+  tray icons preference. At each tested DPI, confirm the app
   icon fills the Shell slot without clipping. Exercise this notification
   matrix in both tray-icon modes:
   - provider detection, quota reset, and Claude Code update: Gengchou app icon,

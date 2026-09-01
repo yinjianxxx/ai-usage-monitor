@@ -62,6 +62,15 @@ pub enum PollError {
     AuthRequired,
     AuthForbidden,
     NoCredentials,
+    /// A local credential source exists but could not be turned into a usable
+    /// token: unreadable, malformed, or truncated.
+    ///
+    /// Displays as `AuthenticationFailed` like the rejection errors - the
+    /// recovery is the same, sign in again - but is deliberately not one of
+    /// them: nothing was rejected remotely, so this must not arm the bounded
+    /// service recheck. The credential watch is the right recovery, and it
+    /// fires exactly when the CLI rewrites the file.
+    CredentialUnusable,
     RateLimited(Option<u32>),
     NetworkUnavailable,
     RequestFailed,
@@ -79,7 +88,13 @@ pub enum CredentialWatchMode {
     Codex,
     Antigravity,
     Grok,
-    AllProviders,
+    /// Several providers at once, naming exactly which.
+    ///
+    /// The set, not "all four": the watch re-reads a credential every poll
+    /// pass and every 15 seconds while polling is parked, so a mode that meant
+    /// "everything" would keep reading a provider the user revoked far more
+    /// often than the detection sweep ever did.
+    Providers([bool; TrayIconKind::COUNT]),
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -321,6 +336,15 @@ struct CredentialW {
     user_name: *mut u16,
 }
 
+/// `CredReadW` reports a target that does not exist with this code; anything
+/// else it fails with means an entry is there and could not be read.
+const ERROR_NOT_FOUND: u32 = 1168;
+
+#[link(name = "Kernel32")]
+extern "system" {
+    fn GetLastError() -> u32;
+}
+
 #[link(name = "Advapi32")]
 extern "system" {
     fn CredReadW(
@@ -450,7 +474,10 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
     let all_require_user_action = errors.iter().all(|error| {
         matches!(
             error,
-            PollError::AuthRequired | PollError::AuthForbidden | PollError::NoCredentials
+            PollError::AuthRequired
+                | PollError::AuthForbidden
+                | PollError::NoCredentials
+                | PollError::CredentialUnusable
         )
     });
     if all_require_user_action {
@@ -484,7 +511,9 @@ fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
 pub fn provider_status(error: PollError) -> ProviderStatus {
     match error {
         PollError::NoCredentials => ProviderStatus::NotSignedIn,
-        PollError::AuthRequired | PollError::AuthForbidden => ProviderStatus::AuthenticationFailed,
+        PollError::AuthRequired | PollError::AuthForbidden | PollError::CredentialUnusable => {
+            ProviderStatus::AuthenticationFailed
+        }
         PollError::RateLimited(_) => ProviderStatus::RateLimited,
         PollError::NetworkUnavailable => ProviderStatus::NetworkUnavailable,
         PollError::RequestFailed => ProviderStatus::RequestFailed,
@@ -956,10 +985,16 @@ struct ClaudeRecoveryFailure {
 
 fn poll_codex() -> Result<UsageData, PollError> {
     let creds = match read_codex_credentials() {
-        Some(creds) => creds,
-        None => {
+        LocalCredential::Usable(creds) => creds,
+        LocalCredential::Missing => {
             diagnose::log("Codex usage poll failed: no Codex credentials found");
             return Err(PollError::NoCredentials);
+        }
+        LocalCredential::Unusable => {
+            diagnose::log(
+                "Codex usage poll failed: the Codex credentials on this machine are unusable",
+            );
+            return Err(PollError::CredentialUnusable);
         }
     };
 
@@ -986,10 +1021,14 @@ fn poll_codex() -> Result<UsageData, PollError> {
 }
 fn poll_antigravity() -> Result<UsageData, PollError> {
     let creds = match read_antigravity_credentials() {
-        Some(creds) => creds,
-        None => {
+        LocalCredential::Usable(creds) => creds,
+        LocalCredential::Missing => {
             diagnose::log("Antigravity usage poll failed: no Antigravity credentials found");
             return Err(PollError::NoCredentials);
+        }
+        LocalCredential::Unusable => {
+            diagnose::log("Antigravity usage poll failed: the Antigravity credentials on this machine are unusable");
+            return Err(PollError::CredentialUnusable);
         }
     };
 
@@ -1014,10 +1053,16 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
 
 fn poll_grok() -> Result<UsageData, PollError> {
     let creds = match read_grok_credentials() {
-        Some(creds) => creds,
-        None => {
+        LocalCredential::Usable(creds) => creds,
+        LocalCredential::Missing => {
             diagnose::log("Grok usage poll failed: no Grok credentials found");
             return Err(PollError::NoCredentials);
+        }
+        LocalCredential::Unusable => {
+            diagnose::log(
+                "Grok usage poll failed: the Grok credentials on this machine are unusable",
+            );
+            return Err(PollError::CredentialUnusable);
         }
     };
 
@@ -1239,11 +1284,20 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
         CredentialWatchMode::Grok => vec![grok_credential_watch_signature()],
-        CredentialWatchMode::AllProviders => {
-            let mut snapshot = claude_credential_watch_snapshot();
-            snapshot.push(codex_credential_watch_signature());
-            snapshot.push(antigravity_credential_watch_signature());
-            snapshot.push(grok_credential_watch_signature());
+        CredentialWatchMode::Providers(watched) => {
+            let mut snapshot = Vec::new();
+            if watched[TrayIconKind::Claude.index()] {
+                snapshot.extend(claude_credential_watch_snapshot());
+            }
+            if watched[TrayIconKind::Codex.index()] {
+                snapshot.push(codex_credential_watch_signature());
+            }
+            if watched[TrayIconKind::Antigravity.index()] {
+                snapshot.push(antigravity_credential_watch_signature());
+            }
+            if watched[TrayIconKind::Grok.index()] {
+                snapshot.push(grok_credential_watch_signature());
+            }
             snapshot
         }
     };
@@ -1264,6 +1318,124 @@ pub struct DetectedProviders {
 impl DetectedProviders {
     pub fn any(self) -> bool {
         self.claude || self.codex || self.antigravity || self.grok
+    }
+}
+
+/// What a local credential source turned out to be.
+///
+/// Only the Windows-local reads are classified this way. A WSL probe stays an
+/// `Option`: `wsl.exe` failing to start, a broken distro and a distro that
+/// simply has no credential are indistinguishable from the outside, so
+/// calling any of them "unusable" would raise a sign-in warning for a probe
+/// that was merely slow. Those keep moving on to the next source.
+enum LocalCredential<T> {
+    /// Nothing to read: no file, no keyring entry, no home directory.
+    Missing,
+    /// A source is there but did not yield a token.
+    Unusable,
+    Usable(T),
+}
+
+impl<T> LocalCredential<T> {
+    fn is_usable(&self) -> bool {
+        matches!(self, Self::Usable(_))
+    }
+
+    fn usable(self) -> Option<T> {
+        match self {
+            Self::Usable(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Fall back to another source, keeping the more specific verdict.
+    ///
+    /// A usable credential anywhere wins. Otherwise `Unusable` outranks
+    /// `Missing`: one source being broken is what the user needs to hear,
+    /// even if the others simply are not there.
+    fn or_else(self, next: impl FnOnce() -> LocalCredential<T>) -> LocalCredential<T> {
+        match self {
+            Self::Usable(value) => Self::Usable(value),
+            first => match next() {
+                Self::Usable(value) => Self::Usable(value),
+                Self::Unusable => Self::Unusable,
+                Self::Missing => first,
+            },
+        }
+    }
+
+    fn or_else_wsl(self, next: impl FnOnce() -> Option<T>) -> LocalCredential<T> {
+        self.or_else(|| match next() {
+            Some(value) => Self::Usable(value),
+            None => Self::Missing,
+        })
+    }
+}
+
+/// Which providers a detection pass may read credentials for.
+///
+/// Access is granted once for every provider but revoked one at a time, so a
+/// pass that ignored this would read a source the user turned off - at every
+/// start and then every half hour, for as long as the app runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectionScope {
+    pub claude: bool,
+    pub codex: bool,
+    pub antigravity: bool,
+    pub grok: bool,
+}
+
+impl DetectionScope {
+    pub fn any(self) -> bool {
+        self.claude || self.codex || self.antigravity || self.grok
+    }
+
+    pub fn from_flags(flags: [bool; TrayIconKind::COUNT]) -> Self {
+        Self {
+            claude: flags[TrayIconKind::Claude.index()],
+            codex: flags[TrayIconKind::Codex.index()],
+            antigravity: flags[TrayIconKind::Antigravity.index()],
+            grok: flags[TrayIconKind::Grok.index()],
+        }
+    }
+
+    pub fn flags(self) -> [bool; TrayIconKind::COUNT] {
+        let mut flags = [false; TrayIconKind::COUNT];
+        flags[TrayIconKind::Claude.index()] = self.claude;
+        flags[TrayIconKind::Codex.index()] = self.codex;
+        flags[TrayIconKind::Antigravity.index()] = self.antigravity;
+        flags[TrayIconKind::Grok.index()] = self.grok;
+        flags
+    }
+}
+
+/// Which source probes a detection pass may touch. Every flag is false when
+/// that provider is outside `scope`, so a disabled provider's Windows file,
+/// Credential Manager entry, Desktop cache, and WSL distros are not read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DetectionProbePlan {
+    pub claude_windows: bool,
+    pub claude_desktop: bool,
+    pub claude_wsl: bool,
+    pub codex_windows: bool,
+    pub codex_wsl: bool,
+    pub antigravity_windows: bool,
+    pub antigravity_wsl: bool,
+    pub grok_windows: bool,
+    pub grok_wsl: bool,
+}
+
+pub fn detection_probe_plan(scope: DetectionScope) -> DetectionProbePlan {
+    DetectionProbePlan {
+        claude_windows: scope.claude,
+        claude_desktop: scope.claude,
+        claude_wsl: scope.claude,
+        codex_windows: scope.codex,
+        codex_wsl: scope.codex,
+        antigravity_windows: scope.antigravity,
+        antigravity_wsl: scope.antigravity,
+        grok_windows: scope.grok,
+        grok_wsl: scope.grok,
     }
 }
 
@@ -1294,7 +1466,8 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
     }
 }
 
-/// Probe every credential source that is cheap to reach.
+/// Probe the credential sources that are cheap to reach, for every provider
+/// the caller's scope still allows.
 ///
 /// "Cheap" excludes stopped WSL distros: reading inside one starts its virtual
 /// machine, and this runs on a timer. Providers that only live in a stopped
@@ -1302,35 +1475,116 @@ pub fn detect_from(inputs: DetectionInputs) -> DetectedProviders {
 /// the full credential resolution including every distro.
 ///
 /// Runs on a worker thread - never call it from the UI thread.
-pub fn detect_signed_in_providers() -> DetectedProviders {
-    let running = list_running_wsl_distros();
-    let claude_wsl = running.iter().any(|distro| {
-        read_credentials_from_source(&CredentialSource::Wsl {
-            distro: distro.clone(),
+///
+/// `scope` is honoured before any source is touched: every probe below is
+/// guarded by it, and `&&` short-circuits, so a provider outside the scope has
+/// none of its files, keyring entries or WSL distros read at all.
+/// The credential sources a detection pass can probe.
+///
+/// A trait only so a test can count the calls: the invariant that a provider
+/// outside the scope is never probed lives in the wiring below, not in the
+/// probes, and reading the wiring is how it was checked until now.
+trait DetectionProbes {
+    fn claude_windows(&self) -> bool;
+    fn claude_desktop(&self) -> bool;
+    fn claude_wsl(&self, running: &[String]) -> bool;
+    fn codex_windows(&self) -> bool;
+    fn codex_wsl(&self, running: &[String]) -> bool;
+    fn antigravity_windows(&self) -> bool;
+    fn antigravity_wsl(&self, running: &[String]) -> bool;
+    fn grok_windows(&self) -> bool;
+    fn grok_wsl(&self, running: &[String]) -> bool;
+}
+
+/// The real sources: a Windows file or Credential Manager entry, the Claude
+/// Desktop cache, and the running WSL distributions.
+struct LocalDetectionProbes;
+
+impl DetectionProbes for LocalDetectionProbes {
+    fn claude_windows(&self) -> bool {
+        windows_credential_source()
+            .is_some_and(|source| read_credentials_from_source(&source).is_ok())
+    }
+
+    fn claude_desktop(&self) -> bool {
+        claude_desktop::enabled() && claude_desktop::read_candidates(now_unix_millis()).is_ok()
+    }
+
+    fn claude_wsl(&self, running: &[String]) -> bool {
+        running.iter().any(|distro| {
+            read_credentials_from_source(&CredentialSource::Wsl {
+                distro: distro.clone(),
+            })
+            .is_ok()
         })
-        .is_ok()
-    });
-    let inputs = DetectionInputs {
-        claude_windows: windows_credential_source()
-            .is_some_and(|source| read_credentials_from_source(&source).is_ok()),
-        claude_desktop: claude_desktop::enabled()
-            && claude_desktop::read_candidates(now_unix_millis()).is_ok(),
-        claude_wsl,
-        codex_windows: read_windows_codex_credentials().is_some(),
-        codex_wsl: !running.is_empty() && read_codex_credentials_from_wsl(&running).is_some(),
-        antigravity_windows: read_windows_antigravity_credentials().is_some(),
-        antigravity_wsl: !running.is_empty()
-            && read_antigravity_credentials_from_wsl(&running).is_some(),
-        grok_windows: read_windows_grok_credentials().is_some(),
-        grok_wsl: !running.is_empty() && read_grok_credentials_from_wsl(&running).is_some(),
-    };
-    let detected = detect_from(inputs);
+    }
+
+    fn codex_windows(&self) -> bool {
+        read_windows_codex_credentials().is_usable()
+    }
+
+    fn codex_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_codex_credentials_from_wsl(running).is_some()
+    }
+
+    fn antigravity_windows(&self) -> bool {
+        read_windows_antigravity_credentials().is_usable()
+    }
+
+    fn antigravity_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_antigravity_credentials_from_wsl(running).is_some()
+    }
+
+    fn grok_windows(&self) -> bool {
+        read_windows_grok_credentials().is_usable()
+    }
+
+    fn grok_wsl(&self, running: &[String]) -> bool {
+        !running.is_empty() && read_grok_credentials_from_wsl(running).is_some()
+    }
+}
+
+/// Probe exactly the sources the scope allows.
+///
+/// `&&` short-circuits, so a `false` in the plan means the probe on its right
+/// is never called - that is the whole privacy guarantee, and
+/// `a_provider_outside_the_scope_is_never_probed` asserts it by counting.
+fn detect_with_probes(
+    scope: DetectionScope,
+    running: &[String],
+    probes: &dyn DetectionProbes,
+) -> DetectedProviders {
+    let plan = detection_probe_plan(scope);
+    detect_from(DetectionInputs {
+        claude_windows: plan.claude_windows && probes.claude_windows(),
+        claude_desktop: plan.claude_desktop && probes.claude_desktop(),
+        claude_wsl: plan.claude_wsl && probes.claude_wsl(running),
+        codex_windows: plan.codex_windows && probes.codex_windows(),
+        codex_wsl: plan.codex_wsl && probes.codex_wsl(running),
+        antigravity_windows: plan.antigravity_windows && probes.antigravity_windows(),
+        antigravity_wsl: plan.antigravity_wsl && probes.antigravity_wsl(running),
+        grok_windows: plan.grok_windows && probes.grok_windows(),
+        grok_wsl: plan.grok_wsl && probes.grok_wsl(running),
+    })
+}
+
+pub fn detect_signed_in_providers(scope: DetectionScope) -> DetectedProviders {
+    if !scope.any() {
+        diagnose::log("provider detection skipped: no provider is in scope");
+        return DetectedProviders::default();
+    }
+    let running = list_running_wsl_distros();
+    let detected = detect_with_probes(scope, &running, &LocalDetectionProbes);
     diagnose::log(format!(
-        "provider detection: claude={} codex={} antigravity={} grok={} (running WSL distros: {})",
+        "provider detection: claude={} codex={} antigravity={} grok={} (scope: claude={} codex={} antigravity={} grok={}, running WSL distros: {})",
         detected.claude,
         detected.codex,
         detected.antigravity,
         detected.grok,
+        scope.claude,
+        scope.codex,
+        scope.antigravity,
+        scope.grok,
         running.len()
     ));
     detected
@@ -2845,21 +3099,65 @@ fn codex_direct_keyring_target(codex_home: &Path) -> Option<String> {
     codex_direct_keyring_target_from_path(&canonical.to_string_lossy())
 }
 
-fn read_windows_codex_credentials() -> Option<CodexTokenData> {
-    let codex_home = codex_home()?;
+/// Classify a file that is supposed to hold a credential.
+///
+/// `NotFound` is the only error that counts as missing: any other read failure
+/// is a file that exists and cannot be used, which the user has to act on.
+fn local_credential_from_file<T>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> LocalCredential<T> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match parse(&content) {
+            Some(value) => LocalCredential::Usable(value),
+            None => {
+                diagnose::log(format!(
+                    "credential file {} could not be parsed",
+                    path.display()
+                ));
+                LocalCredential::Unusable
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocalCredential::Missing,
+        Err(error) => {
+            diagnose::log(format!(
+                "credential file {} exists but could not be read: {error}",
+                path.display()
+            ));
+            LocalCredential::Unusable
+        }
+    }
+}
+
+fn read_windows_codex_credentials() -> LocalCredential<CodexTokenData> {
+    let Some(codex_home) = codex_home() else {
+        return LocalCredential::Missing;
+    };
     let auth_path = codex_home.join("auth.json");
-    let tokens = std::fs::read_to_string(&auth_path)
-        .ok()
-        .and_then(|content| codex_tokens_from_auth_json(&content))
-        .or_else(|| {
-            let target = codex_direct_keyring_target(&codex_home)?;
-            let content = read_windows_generic_credential_quiet(&target)?;
-            let tokens = codex_tokens_from_auth_json(&content)?;
-            diagnose::log("loaded Codex credentials from Windows Credential Manager");
-            Some(tokens)
+    let tokens =
+        local_credential_from_file(&auth_path, codex_tokens_from_auth_json).or_else(|| {
+            let Some(target) = codex_direct_keyring_target(&codex_home) else {
+                return LocalCredential::Missing;
+            };
+            match read_windows_generic_credential_classified(&target) {
+                LocalCredential::Usable(content) => match codex_tokens_from_auth_json(&content) {
+                    Some(tokens) => {
+                        diagnose::log("loaded Codex credentials from Windows Credential Manager");
+                        LocalCredential::Usable(tokens)
+                    }
+                    None => {
+                        diagnose::log(
+                            "Codex credentials in the Windows keyring could not be parsed",
+                        );
+                        LocalCredential::Unusable
+                    }
+                },
+                LocalCredential::Unusable => LocalCredential::Unusable,
+                LocalCredential::Missing => LocalCredential::Missing,
+            }
         });
 
-    if tokens.is_none() {
+    if matches!(tokens, LocalCredential::Missing) {
         diagnose::log(format!(
             "no readable Codex Desktop/CLI credentials found at {} or in the direct Windows keyring",
             auth_path.display()
@@ -2875,20 +3173,34 @@ fn read_windows_codex_credentials() -> Option<CodexTokenData> {
 /// on "not signed in" and gets re-checked on a timer, so reading every distro
 /// here would start their virtual machines on a schedule for users who simply
 /// do not have Codex. A distro the user actually works in is already running.
-fn read_codex_credentials() -> Option<CodexTokenData> {
+fn read_codex_credentials() -> LocalCredential<CodexTokenData> {
     read_windows_codex_credentials()
-        .or_else(|| read_codex_credentials_from_wsl(&list_running_wsl_distros()))
+        .or_else_wsl(|| read_codex_credentials_from_wsl(&list_running_wsl_distros()))
 }
 
-fn read_windows_antigravity_credentials() -> Option<AntigravityTokenData> {
-    let content = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET)?;
-    antigravity_token_from_auth_json(&content)
+fn read_windows_antigravity_credentials() -> LocalCredential<AntigravityTokenData> {
+    match read_windows_generic_credential_classified(ANTIGRAVITY_CREDENTIAL_TARGET) {
+        LocalCredential::Usable(content) => match antigravity_token_from_auth_json(&content) {
+            Some(tokens) => LocalCredential::Usable(tokens),
+            None => {
+                diagnose::log("Antigravity credentials in the Windows keyring could not be parsed");
+                LocalCredential::Unusable
+            }
+        },
+        LocalCredential::Unusable => LocalCredential::Unusable,
+        LocalCredential::Missing => {
+            diagnose::log(format!(
+                "no Windows credential entry {ANTIGRAVITY_CREDENTIAL_TARGET}"
+            ));
+            LocalCredential::Missing
+        }
+    }
 }
 
 /// See `read_codex_credentials` for why this stops at running distros.
-fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
+fn read_antigravity_credentials() -> LocalCredential<AntigravityTokenData> {
     read_windows_antigravity_credentials()
-        .or_else(|| read_antigravity_credentials_from_wsl(&list_running_wsl_distros()))
+        .or_else_wsl(|| read_antigravity_credentials_from_wsl(&list_running_wsl_distros()))
 }
 
 fn grok_home() -> Option<PathBuf> {
@@ -2908,12 +3220,12 @@ fn grok_auth_path() -> Option<PathBuf> {
     grok_home().map(|home| home.join("auth.json"))
 }
 
-fn read_windows_grok_credentials() -> Option<GrokTokenData> {
-    let auth_path = grok_auth_path()?;
-    let tokens = std::fs::read_to_string(&auth_path)
-        .ok()
-        .and_then(|content| grok_token_from_auth_json(&content));
-    if tokens.is_none() {
+fn read_windows_grok_credentials() -> LocalCredential<GrokTokenData> {
+    let Some(auth_path) = grok_auth_path() else {
+        return LocalCredential::Missing;
+    };
+    let tokens = local_credential_from_file(&auth_path, grok_token_from_auth_json);
+    if matches!(tokens, LocalCredential::Missing) {
         diagnose::log(format!(
             "no readable Grok CLI credentials found at {}",
             auth_path.display()
@@ -2938,9 +3250,9 @@ fn read_grok_credentials_from_wsl(distros: &[String]) -> Option<GrokTokenData> {
     None
 }
 
-fn read_grok_credentials() -> Option<GrokTokenData> {
+fn read_grok_credentials() -> LocalCredential<GrokTokenData> {
     read_windows_grok_credentials()
-        .or_else(|| read_grok_credentials_from_wsl(&list_running_wsl_distros()))
+        .or_else_wsl(|| read_grok_credentials_from_wsl(&list_running_wsl_distros()))
 }
 
 fn grok_credential_watch_signature() -> String {
@@ -3009,7 +3321,19 @@ fn read_windows_generic_credential(target: &str) -> Option<String> {
     result
 }
 
+/// Any failure at all, for callers that only need the bytes.
 fn read_windows_generic_credential_quiet(target: &str) -> Option<String> {
+    read_windows_generic_credential_classified(target).usable()
+}
+
+/// Read a Credential Manager entry, separating "no such entry" from an entry
+/// that is there and cannot be used.
+///
+/// Only `ERROR_NOT_FOUND` is missing. A read that fails for any other reason,
+/// an empty blob, and a blob that is not UTF-8 all mean something is stored
+/// that cannot be turned into a credential - which the user has to act on, and
+/// which used to be reported as if they had never signed in.
+fn read_windows_generic_credential_classified(target: &str) -> LocalCredential<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
     let mut target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
@@ -3024,24 +3348,43 @@ fn read_windows_generic_credential_quiet(target: &str) -> Option<String> {
         )
     };
 
-    if ok == 0 || credential.is_null() {
-        return None;
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_NOT_FOUND {
+            return LocalCredential::Missing;
+        }
+        diagnose::log(format!(
+            "Windows credential target {target} exists but could not be read (error {error})"
+        ));
+        return LocalCredential::Unusable;
+    }
+    if credential.is_null() {
+        return LocalCredential::Missing;
     }
 
-    let result = unsafe {
+    unsafe {
         let cred = &*credential;
         if cred.credential_blob_size == 0 || cred.credential_blob.is_null() {
             CredFree(credential as *mut c_void);
-            return None;
+            diagnose::log(format!(
+                "Windows credential target {target} holds an empty blob"
+            ));
+            return LocalCredential::Unusable;
         }
         let bytes =
             std::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize);
-        let text = String::from_utf8(bytes.to_vec()).ok();
+        let text = String::from_utf8(bytes.to_vec());
         CredFree(credential as *mut c_void);
-        text
-    };
-
-    result
+        match text {
+            Ok(text) => LocalCredential::Usable(text),
+            Err(_) => {
+                diagnose::log(format!(
+                    "Windows credential target {target} is not valid UTF-8"
+                ));
+                LocalCredential::Unusable
+            }
+        }
+    }
 }
 
 fn read_wsl_credentials(distro: &str) -> Result<Credentials, ClaudeCredentialProblem> {
@@ -3905,6 +4248,221 @@ mod tests {
         assert_eq!(
             codex_direct_keyring_target_from_path("abc").as_deref(),
             Some("cli|ba7816bf8f01cfea.Codex Auth")
+        );
+    }
+
+    #[test]
+    fn a_pass_with_nothing_in_scope_reads_no_credential_source() {
+        assert_eq!(
+            detect_signed_in_providers(DetectionScope::default()),
+            DetectedProviders::default()
+        );
+    }
+
+    #[test]
+    fn a_disabled_provider_has_no_windows_wsl_desktop_or_keyring_probes() {
+        let three_on_one_off = DetectionScope {
+            claude: true,
+            codex: true,
+            antigravity: true,
+            grok: false,
+        };
+        let plan = detection_probe_plan(three_on_one_off);
+        assert!(plan.claude_windows && plan.claude_desktop && plan.claude_wsl);
+        assert!(plan.codex_windows && plan.codex_wsl);
+        assert!(plan.antigravity_windows && plan.antigravity_wsl);
+        assert!(!plan.grok_windows && !plan.grok_wsl);
+
+        let only_grok = DetectionScope {
+            claude: false,
+            codex: false,
+            antigravity: false,
+            grok: true,
+        };
+        let plan = detection_probe_plan(only_grok);
+        assert!(!plan.claude_windows && !plan.claude_desktop && !plan.claude_wsl);
+        assert!(!plan.codex_windows && !plan.codex_wsl);
+        assert!(!plan.antigravity_windows && !plan.antigravity_wsl);
+        assert!(plan.grok_windows && plan.grok_wsl);
+    }
+
+    /// Records every probe it is asked for and claims a credential exists, so
+    /// a case can assert both what was read and what was not.
+    #[derive(Default)]
+    struct RecordingProbes {
+        calls: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordingProbes {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, name: &'static str) -> bool {
+            self.calls.borrow_mut().push(name);
+            true
+        }
+    }
+
+    impl DetectionProbes for RecordingProbes {
+        fn claude_windows(&self) -> bool {
+            self.record("claude_windows")
+        }
+        fn claude_desktop(&self) -> bool {
+            self.record("claude_desktop")
+        }
+        fn claude_wsl(&self, _running: &[String]) -> bool {
+            self.record("claude_wsl")
+        }
+        fn codex_windows(&self) -> bool {
+            self.record("codex_windows")
+        }
+        fn codex_wsl(&self, _running: &[String]) -> bool {
+            self.record("codex_wsl")
+        }
+        fn antigravity_windows(&self) -> bool {
+            self.record("antigravity_windows")
+        }
+        fn antigravity_wsl(&self, _running: &[String]) -> bool {
+            self.record("antigravity_wsl")
+        }
+        fn grok_windows(&self) -> bool {
+            self.record("grok_windows")
+        }
+        fn grok_wsl(&self, _running: &[String]) -> bool {
+            self.record("grok_wsl")
+        }
+    }
+
+    /// The invariant itself, asserted by counting rather than by reading the
+    /// wiring: a provider outside the scope has no source touched at all - no
+    /// Windows file, no Credential Manager entry, no Desktop cache, no WSL
+    /// probe. The previous version of this case asserted on
+    /// `detection_probe_plan`, which is a copy of the scope and would have
+    /// stayed green if a probe had been wired up without its gate.
+    #[test]
+    fn a_provider_outside_the_scope_is_never_probed() {
+        let running = vec!["Ubuntu".to_string()];
+        for kind in TrayIconKind::ALL {
+            let mut flags = [false; TrayIconKind::COUNT];
+            flags[kind.index()] = true;
+            let probes = RecordingProbes::default();
+            let detected = detect_with_probes(DetectionScope::from_flags(flags), &running, &probes);
+
+            let expected: Vec<&'static str> = match kind {
+                TrayIconKind::Claude => vec!["claude_windows", "claude_desktop", "claude_wsl"],
+                TrayIconKind::Codex => vec!["codex_windows", "codex_wsl"],
+                TrayIconKind::Antigravity => vec!["antigravity_windows", "antigravity_wsl"],
+                TrayIconKind::Grok => vec!["grok_windows", "grok_wsl"],
+            };
+            assert_eq!(
+                probes.calls(),
+                expected,
+                "{kind:?} probed the wrong sources"
+            );
+            let mut expected_detected = DetectedProviders::default();
+            match kind {
+                TrayIconKind::Claude => expected_detected.claude = true,
+                TrayIconKind::Codex => expected_detected.codex = true,
+                TrayIconKind::Antigravity => expected_detected.antigravity = true,
+                TrayIconKind::Grok => expected_detected.grok = true,
+            }
+            assert_eq!(
+                detected, expected_detected,
+                "{kind:?} did not report itself as detected"
+            );
+        }
+
+        // Nothing in scope: no probe at all, even with a running distro and
+        // credentials that would answer yes.
+        let probes = RecordingProbes::default();
+        let detected = detect_with_probes(DetectionScope::default(), &running, &probes);
+        assert!(probes.calls().is_empty());
+        assert_eq!(detected, DetectedProviders::default());
+    }
+
+    #[test]
+    fn a_broken_source_outranks_a_missing_one_when_falling_back() {
+        let broken = || LocalCredential::<u8>::Unusable;
+        let absent = || LocalCredential::<u8>::Missing;
+
+        assert!(matches!(
+            LocalCredential::Missing.or_else(broken),
+            LocalCredential::Unusable
+        ));
+        assert!(matches!(
+            LocalCredential::Unusable.or_else(absent),
+            LocalCredential::Unusable
+        ));
+        assert!(matches!(
+            LocalCredential::Unusable.or_else(|| LocalCredential::Usable(1u8)),
+            LocalCredential::Usable(1)
+        ));
+        assert!(matches!(
+            LocalCredential::Missing.or_else(absent),
+            LocalCredential::Missing
+        ));
+    }
+
+    #[test]
+    fn a_working_wsl_distro_still_rescues_a_broken_windows_credential() {
+        assert!(matches!(
+            LocalCredential::<u8>::Unusable.or_else_wsl(|| Some(7)),
+            LocalCredential::Usable(7)
+        ));
+        assert!(matches!(
+            LocalCredential::<u8>::Unusable.or_else_wsl(|| None),
+            LocalCredential::Unusable
+        ));
+    }
+
+    #[test]
+    fn a_credential_file_is_missing_only_when_it_is_not_there() {
+        let root = std::env::temp_dir().join(format!(
+            "gengchou-local-credential-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_default();
+        let parse = |content: &str| (content == "good").then_some(1u8);
+
+        assert!(matches!(
+            local_credential_from_file(&root.join("absent.json"), parse),
+            LocalCredential::Missing
+        ));
+
+        let malformed = root.join("malformed.json");
+        std::fs::write(&malformed, "bad").unwrap_or_default();
+        assert!(matches!(
+            local_credential_from_file(&malformed, parse),
+            LocalCredential::Unusable
+        ));
+
+        let usable = root.join("usable.json");
+        std::fs::write(&usable, "good").unwrap_or_default();
+        assert!(matches!(
+            local_credential_from_file(&usable, parse),
+            LocalCredential::Usable(1)
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap_or_default();
+    }
+
+    #[test]
+    fn an_unusable_local_credential_reads_as_authentication_failed_without_a_remote_rejection() {
+        assert_eq!(
+            provider_status(PollError::CredentialUnusable),
+            ProviderStatus::AuthenticationFailed
+        );
+
+        let mut data = AppUsageData::default();
+        record_poll_error(&mut data, PollError::CredentialUnusable);
+        assert!(
+            !data.remote_auth_rejection,
+            "a local credential nobody rejected must not arm the bounded service recheck"
         );
     }
 
