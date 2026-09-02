@@ -1966,6 +1966,25 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
                 return Ok(None);
             }
         };
+    if let Some(usage) = claude_usage_from_response(response) {
+        Ok(Some(usage))
+    } else {
+        diagnose::log("Claude usage response did not contain a usable quota window");
+        Ok(None)
+    }
+}
+
+/// Build usage from the Claude usage endpoint payload, or `None` when it
+/// carries no usable window.
+///
+/// A 200 with neither bucket is not a successful reading of "nothing". Every
+/// surface filters an empty `UsageData` out and draws it exactly like no data,
+/// so calling it a success wiped the numbers on screen while the status line
+/// claimed a fresh update, and `merge_missing_provider_data` dropped the
+/// previous values because the slot was `Some`. `None` reaches the caller as a
+/// failed refresh, which keeps the last good numbers and marks them stale.
+/// Antigravity and Grok already refuse an empty window this way.
+fn claude_usage_from_response(response: UsageResponse) -> Option<UsageData> {
     let mut windows = Vec::new();
 
     if let Some(bucket) = &response.five_hour {
@@ -1984,7 +2003,11 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         ));
     }
 
-    Ok(Some(UsageData::from_windows(windows)))
+    // Checked on the built value, not on `windows`: `from_windows` also drops
+    // a window whose percentage is not finite, so a payload that carries only
+    // those is just as empty.
+    let usage = UsageData::from_windows(windows);
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn classify_http_status(code: u16, retry_after_ms: Option<u32>) -> PollError {
@@ -2180,7 +2203,14 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
         windows.extend(codex_usage_window(&window, "Secondary"));
     }
 
-    Some(UsageData::from_windows(windows))
+    // A `rate_limit` object whose windows are both empty is not usable data.
+    // The `?` above only covers a missing `rate_limit`, so this shape reached
+    // the caller as a successful pass carrying nothing: every surface draws an
+    // empty `UsageData` exactly like no data, and the merge dropped the
+    // previous values because the slot was `Some`. Checked on the built value
+    // so a window whose percentage is not finite counts as empty too.
+    let usage = UsageData::from_windows(windows);
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn codex_usage_window(window: &CodexRateLimitWindow, fallback_label: &str) -> Option<UsageWindow> {
@@ -5121,6 +5151,48 @@ mod tests {
         assert_eq!(
             data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
             42.0
+        );
+    }
+
+    /// A 200 that carries no usable window must read as a failed refresh, not
+    /// as a successful pass with nothing in it.
+    ///
+    /// "Success with nothing to show" is unrepresentable: every surface
+    /// filters an empty `UsageData` out and draws it exactly like no data,
+    /// while the status line reports a fresh successful update - and
+    /// `merge_missing_provider_data` only carries the previous numbers forward
+    /// when the slot is `None`, so an empty `Some` wiped them. Antigravity and
+    /// Grok already refuse this shape; Claude never did, and Codex only
+    /// refused a missing `rate_limit`, not a `rate_limit` whose windows are
+    /// both absent.
+    #[test]
+    fn an_empty_quota_payload_is_not_a_successful_refresh() {
+        let codex: CodexUsageResponse = serde_json::from_str(
+            r#"{"rate_limit": {"primary_window": null, "secondary_window": null}}"#,
+        )
+        .expect("Codex response should deserialize");
+        assert!(
+            codex_usage_from_response(codex).is_none(),
+            "a rate limit with no window is not usable data"
+        );
+
+        let claude: UsageResponse = serde_json::from_str(r#"{"five_hour": null}"#)
+            .expect("Claude response should deserialize");
+        assert!(
+            claude_usage_from_response(claude).is_none(),
+            "a usage payload with neither bucket is not usable data"
+        );
+
+        // The guard must not swallow a payload that does carry a window.
+        let usable: UsageResponse =
+            serde_json::from_str(r#"{"five_hour": {"utilization": 12.0, "resets_at": null}}"#)
+                .expect("Claude response should deserialize");
+        assert_eq!(
+            claude_usage_from_response(usable)
+                .expect("one bucket is usable")
+                .windows
+                .len(),
+            1
         );
     }
 
