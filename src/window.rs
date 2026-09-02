@@ -1176,6 +1176,48 @@ fn request_process_quit() {
 /// from under us). The taskbar widget is never shown as a desktop popup: when
 /// the shell is unavailable it stays hidden until a later shell event or the
 /// watchdog can verify a successful re-attachment.
+/// Every fixed-interval timer a revived widget has to arm, with the window it
+/// is armed on being the widget itself.
+///
+/// One list rather than a run of `arm_timer` calls, because this set has
+/// already drifted once: a recreated widget was left without its tray-order
+/// sample and the fallback ordering check stopped at the first Explorer
+/// restart.
+///
+/// `widget_is_poll_controller` is the degraded path. `poll_controller_hwnd`
+/// answers with the process-level broadcast helper when it exists and with the
+/// widget otherwise, and `WM_TIMER` only ever reaches the window a timer was
+/// armed on - so when `create_broadcast_helper` failed at startup, polling,
+/// the credential watch and the periodic provider sweep are all armed on the
+/// widget and die with it. The helper, when it exists, outlives the widget and
+/// keeps them, which is why the normal path re-arms nothing but its own.
+///
+/// Only a recreated widget lost anything: re-arming a survivor's poll timer
+/// would push the next poll out by a whole interval every time Explorer
+/// restarts. `TIMER_COUNTDOWN`, `TIMER_RESET_POLL` and `TIMER_UPDATE_CHECK`
+/// are deliberately absent - each is scheduled from current state by its own
+/// function, which the revival path calls.
+fn revive_timer_plan(
+    widget_was_recreated: bool,
+    widget_is_poll_controller: bool,
+    poll_interval_ms: u32,
+    auth_watch_active: bool,
+) -> Vec<(usize, u32, &'static str)> {
+    let mut plan = vec![(TIMER_TRAY_ORDER, TRAY_ORDER_SAMPLE_MS, "tray order sample")];
+    if widget_was_recreated && widget_is_poll_controller {
+        plan.push((TIMER_POLL, poll_interval_ms, "poll"));
+        plan.push((
+            TIMER_PROVIDER_DETECT,
+            PROVIDER_DETECT_INTERVAL_MS,
+            "provider detection",
+        ));
+        if auth_watch_active {
+            plan.push((TIMER_AUTH_WATCH, AUTH_WATCH_INTERVAL_MS, "auth watch"));
+        }
+    }
+    plan
+}
+
 unsafe fn revive_execute() {
     if QUIT_REQUESTED.load(Ordering::SeqCst) {
         clear_reviving();
@@ -1205,7 +1247,8 @@ unsafe fn revive_execute() {
         }
     };
 
-    let hwnd = if IsWindow(existing_hwnd).as_bool() {
+    let widget_was_recreated = !IsWindow(existing_hwnd).as_bool();
+    let hwnd = if !widget_was_recreated {
         diagnose::log("revival: window still alive; re-attaching only");
         existing_hwnd
     } else {
@@ -1290,13 +1333,41 @@ unsafe fn revive_execute() {
     // starts with none. The WinEvent hook that `attach_to_taskbar` reinstalls
     // catches a drag, but the periodic sample is what notices an order change
     // the hook missed - without this it stopped for good at the first Explorer
-    // restart.
-    arm_timer(
-        hwnd,
-        TIMER_TRAY_ORDER,
-        TRAY_ORDER_SAMPLE_MS,
-        "tray order sample",
-    );
+    // restart. When the broadcast helper could not be created at startup this
+    // widget is also the poll controller, so polling, the credential watch and
+    // the provider sweep died with the old window too; `revive_timer_plan`
+    // owns that whole set.
+    let widget_is_poll_controller = live_broadcast_helper_hwnd().is_none();
+    if widget_was_recreated && widget_is_poll_controller {
+        // Session notifications were registered on the window Explorer just
+        // destroyed, and they are what tells this process the session locked
+        // or disconnected.
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() {
+            diagnose::log("revival: session notifications could not be re-registered");
+        }
+    }
+    {
+        let mut state = lock_state();
+        let (poll_interval_ms, auth_watch_active) = state
+            .as_ref()
+            .map(|s| (s.poll_interval_ms, s.auth_watch_active))
+            .unwrap_or((POLL_5_MIN, false));
+        for (timer, interval_ms, label) in revive_timer_plan(
+            widget_was_recreated,
+            widget_is_poll_controller,
+            poll_interval_ms,
+            auth_watch_active,
+        ) {
+            match (timer, state.as_mut()) {
+                // Goes through `arm_poll_timer` so `next_poll_deadline` stays
+                // in step with the timer that was actually set.
+                (TIMER_POLL, Some(s)) => arm_poll_timer(s, hwnd, interval_ms),
+                _ => {
+                    arm_timer(hwnd, timer, interval_ms, label);
+                }
+            }
+        }
+    }
 
     REVIVE_ATTEMPTS.store(0, Ordering::SeqCst);
     clear_reviving();
@@ -14974,6 +15045,63 @@ mod reset_notification_tests {
         assert!(usage_cache
             .write_if_latest(current_cache_revision, || Ok::<(), ()>(()))
             .expect("current cache write"));
+    }
+
+    /// A recreated widget must get back everything that died with the old one.
+    ///
+    /// `WM_TIMER` only reaches the window a timer was armed on, and
+    /// `recreate_widget_window` hands back a different `HWND`. When the
+    /// broadcast helper could not be created at startup the widget is also the
+    /// poll controller, so polling, the credential watch and the periodic
+    /// provider sweep were armed on the window Explorer just destroyed: with
+    /// nothing to re-arm them the monitor stopped for good at the first
+    /// Explorer restart, silently, while the app kept running. The tray-order
+    /// sample was the same bug found one round earlier, which is why this set
+    /// is data now instead of a run of `arm_timer` calls.
+    #[test]
+    fn a_recreated_widget_gets_back_every_timer_that_died_with_the_old_one() {
+        let ids = |plan: Vec<(usize, u32, &'static str)>| {
+            plan.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>()
+        };
+
+        // Degraded path: the widget is the poll controller.
+        let degraded = revive_timer_plan(true, true, POLL_1_MIN, true);
+        assert_eq!(
+            degraded
+                .iter()
+                .find(|(id, _, _)| *id == TIMER_POLL)
+                .map(|(_, interval, _)| *interval),
+            Some(POLL_1_MIN),
+            "the poll timer must come back on the user's own interval"
+        );
+        let degraded = ids(degraded);
+        for timer in [
+            TIMER_TRAY_ORDER,
+            TIMER_POLL,
+            TIMER_PROVIDER_DETECT,
+            TIMER_AUTH_WATCH,
+        ] {
+            assert!(degraded.contains(&timer), "missing timer {timer}");
+        }
+
+        // The watch is only re-armed when it was actually running.
+        assert!(!ids(revive_timer_plan(true, true, POLL_5_MIN, false)).contains(&TIMER_AUTH_WATCH));
+
+        // Normal path: the helper owns those and outlived the widget, so
+        // re-arming them here would move them onto a window that is not the
+        // controller.
+        assert_eq!(
+            ids(revive_timer_plan(true, false, POLL_1_MIN, true)),
+            vec![TIMER_TRAY_ORDER]
+        );
+
+        // A widget that was never destroyed kept its timers. Re-arming the
+        // poll timer would push the next poll out by a full interval on every
+        // Explorer restart.
+        assert_eq!(
+            ids(revive_timer_plan(false, true, POLL_1_MIN, true)),
+            vec![TIMER_TRAY_ORDER]
+        );
     }
 
     /// Serializes the tests that install a panic hook. The hook is
