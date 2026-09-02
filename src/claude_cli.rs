@@ -53,7 +53,7 @@ fn updates_disabled() -> bool {
     std::env::var_os("DISABLE_UPDATES").is_some_and(|value| !value.is_empty())
 }
 
-fn find_executable() -> Option<PathBuf> {
+pub(crate) fn find_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CLAUDE_CLI_PATH")
         .map(PathBuf::from)
         .filter(|path| path.is_file())

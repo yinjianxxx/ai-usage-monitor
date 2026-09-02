@@ -167,13 +167,17 @@ pub fn begin_winget_update(expected_version: &str) -> Result<(), String> {
         expected_version,
     );
 
-    Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-Command")
-        .arg(&command)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
+    // Absolute, so a `powershell.exe` sitting next to a portable build cannot
+    // be handed the command that replaces the installed app.
+    Command::new(crate::native_interop::system_program(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .arg("-NoLogo")
+    .arg("-Command")
+    .arg(&command)
+    .creation_flags(CREATE_NEW_CONSOLE)
+    .spawn()
+    .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
 
     Ok(())
 }

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
@@ -9,9 +12,44 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Absolute path to a program that ships in the Windows system directory.
+///
+/// `Command::new("wsl.exe")` does not mean "the Windows one". Rust resolves a
+/// bare program name by searching the directory of the current executable
+/// before the system directory, so a file dropped next to a portable
+/// `gengchou.exe` is what runs - and a downloads folder, where a portable
+/// build normally lives, is exactly where a stray executable ends up.
+/// Confirmed on the pinned toolchain rather than assumed: with a decoy
+/// `wsl.exe` beside a test binary the decoy ran, and the real one only ran
+/// once the decoy was removed.
+///
+/// `GetSystemDirectoryW` rather than `%SystemRoot%`, because an environment
+/// variable can be pointed elsewhere. If it ever fails there is nothing better
+/// to fall back to than the bare name, which is what every call site did
+/// before; that fallback is logged rather than passed over.
+pub fn system_program(name: &str) -> PathBuf {
+    static SYSTEM_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let directory = SYSTEM_DIRECTORY.get_or_init(|| {
+        let mut buffer = [0u16; 260];
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 || length > buffer.len() {
+            crate::diagnose::log(
+                "unable to resolve the Windows system directory; system programs fall back to a bare name",
+            );
+            return None;
+        }
+        Some(PathBuf::from(OsString::from_wide(&buffer[..length])))
+    });
+    match directory {
+        Some(directory) => directory.join(name),
+        None => PathBuf::from(name),
+    }
+}
 
 // Window style constants
 pub const WS_POPUP_STYLE: u32 = 0x80000000;
@@ -450,6 +488,49 @@ impl Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Windows program Gengchou starts must be named by absolute path.
+    ///
+    /// A bare name is resolved against this executable's own directory before
+    /// the system directory, so a portable build sitting in a downloads folder
+    /// would run whatever `wsl.exe` happens to have landed beside it - and the
+    /// credential probes are what run `wsl.exe`. Asserted on `system_program`
+    /// because that is what every call site now passes to `Command::new`.
+    #[test]
+    fn a_system_program_is_named_by_absolute_path() {
+        let wsl = system_program("wsl.exe");
+        assert!(wsl.is_absolute(), "got {}", wsl.display());
+        assert_eq!(
+            wsl.file_name().and_then(|name| name.to_str()),
+            Some("wsl.exe")
+        );
+
+        let directory = wsl.parent().expect("an absolute path has a parent");
+        assert!(
+            directory.is_dir(),
+            "the resolved system directory must exist: {}",
+            directory.display()
+        );
+        // Windows reports this directory in mixed case, so compare folded.
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let expected = PathBuf::from(system_root).join("System32");
+            assert_eq!(
+                directory.to_string_lossy().to_lowercase(),
+                expected.to_string_lossy().to_lowercase()
+            );
+        }
+
+        // A nested name stays under the same root.
+        let powershell = system_program(r"WindowsPowerShell\v1.0\powershell.exe");
+        assert!(powershell
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with(&directory.to_string_lossy().to_lowercase()));
+        assert_eq!(
+            powershell.file_name().and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+    }
 
     #[test]
     fn embedding_validation_requires_expected_parent_and_child_style() {

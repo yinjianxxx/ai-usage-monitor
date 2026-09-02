@@ -45,6 +45,11 @@ identity, or release automation.
 - Routine notifications use the Gengchou icon and are silent. Only a current
   credential problem requiring user action uses the Windows warning glyph and
   notification sound.
+- Windows programs this app starts are named by absolute path. A bare name is
+  resolved against this executable's own directory before the system
+  directory, so a portable build would run a same-named file dropped beside
+  it - including the `wsl.exe` that reads credentials and the `powershell.exe`
+  that drives a WinGet update.
 
 ## Persistence and diagnostics
 

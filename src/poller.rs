@@ -1694,7 +1694,7 @@ printf '%s\n' "$config_dir/.credentials.json"
 
 fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialProblem> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -1762,7 +1762,7 @@ cat -- "$credential_path"
 /// distro, timeout): move on to the next source.
 fn read_wsl_script_output(distro: &str, script: &'static str) -> Option<Vec<u8>> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -1835,7 +1835,7 @@ fn read_antigravity_credentials_from_wsl(distros: &[String]) -> Option<Antigravi
 
 fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -2973,7 +2973,10 @@ fn diagnostic_first_line(bytes: &[u8]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-fn run_diagnostic_command(program: &str, args: &[&str]) -> Option<std::process::Output> {
+fn run_diagnostic_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<std::process::Output> {
     run_with_timeout(
         Command::new(program)
             .args(args)
@@ -3050,15 +3053,25 @@ pub fn claude_auth_diagnostics_report() -> String {
         }
     }
 
-    let cli_path = run_diagnostic_command("where.exe", &["claude"])
-        .filter(|output| output.status.success())
-        .and_then(|output| diagnostic_first_line(&output.stdout));
+    let cli_path = run_diagnostic_command(
+        crate::native_interop::system_program("where.exe"),
+        &["claude"],
+    )
+    .filter(|output| output.status.success())
+    .and_then(|output| diagnostic_first_line(&output.stdout));
     lines.push(format!(
         "ClaudeCliPath: {}",
         cli_path.as_deref().unwrap_or("not_found")
     ));
 
-    let cli_version = run_diagnostic_command("claude", &["--version"])
+    // Resolved the same way the update path resolves it, rather than by bare
+    // name: a bare name is looked up in this executable's own directory first,
+    // and a portable build's directory is not a trusted place to find a CLI.
+    let cli = crate::claude_cli::find_executable();
+
+    let cli_version = cli
+        .as_ref()
+        .and_then(|cli| run_diagnostic_command(cli, &["--version"]))
         .filter(|output| output.status.success())
         .and_then(|output| diagnostic_first_line(&output.stdout));
     lines.push(format!(
@@ -3066,7 +3079,10 @@ pub fn claude_auth_diagnostics_report() -> String {
         cli_version.as_deref().unwrap_or("unavailable")
     ));
 
-    match run_diagnostic_command("claude", &["auth", "status"]) {
+    match cli
+        .as_ref()
+        .and_then(|cli| run_diagnostic_command(cli, &["auth", "status"]))
+    {
         Some(output) if output.status.success() => {
             let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
             let logged_in = status
@@ -3505,7 +3521,7 @@ fn list_wsl_distros() -> Vec<String> {
 
 fn enumerate_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .args(["-l", "-q"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
@@ -3537,7 +3553,7 @@ fn enumerate_wsl_distros() -> Vec<String> {
 /// stops a distro, and a stale answer here means probing a stopped distro.
 fn list_running_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .args(["-l", "-q", "--running"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
