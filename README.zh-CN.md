@@ -143,8 +143,11 @@ Codex、Antigravity 与 Grok 的 WSL 凭据只在发行版**已经在运行**时
 | 设置——包括各服务商授权标志，绝不含令牌 | `%APPDATA%\Gengchou\settings.json` |
 | 用量缓存——仅百分比、配额窗口元数据和重置时间，绝不含令牌 | `%APPDATA%\Gengchou\usage-cache.json` |
 | 诊断日志（每代只追加；运行中自动轮换；仅保留当前文件和一份 `.old`） | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
+| 读不出来的设置文件，保留而非丢弃；只留一代 | `%APPDATA%\Gengchou\settings.json.corrupt` |
 
 如果 `%APPDATA%` 不可用，设置和用量缓存会依次回退到 Windows 配置目录和 `%LOCALAPPDATA%`。如果仍找不到可持久写入的位置，应用会继续本次运行并显示一次存储警告，不会静默声称设置已经保存。
+
+设置文件读不出来时，更筹会先把原件保留为 `settings.json.corrupt` 再以默认值启动，并弹出一次点明该路径的警告。以默认值启动不是"只读"：紧接着的第一次保存本会把你的布局、语言、服务商选择和授权决定一并覆盖，且无从恢复。
 
 更筹自身的直接写入仅限上表路径。Claude Desktop 会话读取是只读的：更筹读取加密缓存和 Chromium `Local State`，只在内存中解密缓存，只提取符合条件的访问令牌，从不提取或保存刷新令牌；释放前会覆盖解密后的 JSON 和保留的令牌缓冲区，也不会修改 Desktop 文件。除非设置 `DISABLE_UPDATES`，另行安装的 Claude CLI 仍可能按照 `claude update` 的行为更新其自身安装和凭据文件。仍低于 v2.2.4 的安装必须先保留并运行 v2.2.4 桥接版两次，完成迁移验证后，才能升级到 v2.3.0 或后续版本。
 

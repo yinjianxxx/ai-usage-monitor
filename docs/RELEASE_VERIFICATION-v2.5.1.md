@@ -657,6 +657,9 @@ code.
   the suite builds one. Closing it properly means giving `AppState` a test
   builder or serializing tests around the global `STATE`, which is not work for
   a patch release. The behaviour is covered by the revocation smoke runs.
+  **Closed after the release** - see the section below; the decision function
+  was split out instead of building an `AppState`, which still has no test
+  constructor.
 - The credential-watch behaviour is covered by `credential_watch_outcome`, by
   reading the call site and by the fifth-round re-check, not by a live run:
   reproducing it means narrowing the watched set and watching the 15-second
@@ -672,3 +675,37 @@ code.
   v2.5.0 HEAD` already passes, so the workflow's ancestry gate is satisfied,
   and `.github/workflows/release.yml` additionally requires the tag to equal
   the `Cargo.toml` version, which the bump above now satisfies.
+
+## Follow-ups closed after the release, 2026-09-02
+
+The three **Not acted on** entries above and the first **Open** follow-up were
+all cleared on `claude/v2.5.2-followups`. They are recorded here rather than
+edited into the rounds above: those rounds are what was decided at the time,
+and rewriting them would lose the fact that these shipped unfixed in v2.5.1.
+
+- `TIMER_TRAY_ORDER` is re-armed after the widget is recreated. Reviewing that
+  fix turned up a second, larger instance of the same shape: when
+  `create_broadcast_helper` fails at startup the widget *is* the poll
+  controller, so `TIMER_POLL`, the credential watch and the periodic provider
+  sweep were armed on it and died with it too, and the session-notification
+  registration went with them. The set is now data (`revive_timer_plan`) rather
+  than a run of `arm_timer` calls, because a list of calls is exactly what
+  drifted the first time.
+- `updater.rs` no longer calls `std::env::remove_var`; the watchdog relaunch
+  clears the readiness marker on its own command instead.
+- The diagnostic log mutex is derived from the log path. The stated reason at
+  the time was that an ordinary interactive account cannot create objects in
+  the `Global\` namespace without `SeCreateGlobalPrivilege`. That premise is
+  wrong and was checked directly: on a non-elevated token whose privilege list
+  does not contain `SeCreateGlobalPrivilege`, a raw `CreateMutexW` on a
+  `Global\` name returns a valid handle with `GetLastError() == 0`. The change
+  is still right for the reason that survives - the log file is per user, so
+  its lock must be too, and unrelated accounts should not wait on each other -
+  and the `Local\` fallback still covers a name another account has taken with
+  a restrictive DACL.
+- `a_pending_result_cannot_reenable_a_provider` was replaced. The decision the
+  running app makes is now the pure `resolve_detection`, asserted directly by
+  three tests, so removing the scope mask from the decision fails all three.
+  `AppState` still has no test constructor; what the split buys is that the
+  assertion is on the production decision rather than on an intersection helper
+  that the revert would not have touched.

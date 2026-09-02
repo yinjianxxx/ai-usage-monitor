@@ -20,12 +20,17 @@ const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
 /// Base name of the mutex that serializes writes to one log file.
 ///
 /// The file lives under `%LOCALAPPDATA%`, so it is per user, while a `Global\`
-/// name is machine wide. Two consequences, both fixed by deriving the name
-/// from the path: unrelated users no longer wait on each other, and a user who
-/// cannot create objects in the global namespace - that needs
-/// `SeCreateGlobalPrivilege`, which an ordinary interactive account does not
-/// have - falls back to the session namespace instead of losing diagnostics
-/// altogether.
+/// name is machine wide: accounts writing different files were serializing on
+/// one lock. Deriving the name from the path fixes that.
+///
+/// An earlier version of this comment also claimed an ordinary interactive
+/// account cannot create a `Global\` object without `SeCreateGlobalPrivilege`.
+/// That is not what Windows does here, and it was checked directly: on a
+/// non-elevated token whose privilege list does not contain that privilege, a
+/// raw `CreateMutexW` on a `Global\` name returns a valid handle with
+/// `GetLastError() == 0`. The fallback below is kept for the case that is
+/// real - a name another account already holds with a DACL that denies this
+/// one - not for that one.
 const DIAGNOSTIC_LOG_MUTEX_BASE: &str = "Gengchou-DiagnosticLog-v2";
 
 struct DiagnoseState {
@@ -91,12 +96,13 @@ fn log_path() -> Result<PathBuf, String> {
     Ok(base.join("Gengchou").join("diagnose.log"))
 }
 
-/// The mutex names to try, most to least privileged.
+/// The mutex names to try, in order.
 ///
 /// `Global\` first so two sessions of the same account still serialize on one
-/// file; `Local\` as the fallback, which covers a session that may not create
-/// global objects. The suffix is the log path, lowercased before hashing
-/// because Windows paths compare case-insensitively.
+/// file; `Local\` as the fallback for a `Global\` name that cannot be opened,
+/// which keeps diagnostics working within this session rather than losing them
+/// altogether. The suffix is the log path, lowercased before hashing because
+/// Windows paths compare case-insensitively.
 fn log_mutex_names(path: &Path) -> [String; 2] {
     let key = path.to_string_lossy().to_lowercase();
     let digest = crate::updater::sha256_hex(key.as_bytes()).unwrap_or_default();
@@ -295,10 +301,9 @@ pub fn log_error(context: &str, error: impl std::fmt::Display) {
 #[cfg(test)]
 mod tests {
     /// The log file is per user, so the lock that serializes writes to it must
-    /// be too. A single machine-wide name made unrelated accounts wait on each
-    /// other and, worse, gave a session that may not create global objects no
-    /// lock at all - diagnostics were then lost, silently, which is the failure
-    /// mode this log exists to expose.
+    /// be too. A single machine-wide name made accounts that write entirely
+    /// different files wait on each other, and left the `Local\` fallback
+    /// pointing at a lock that guarded nothing in particular.
     #[test]
     fn the_log_mutex_is_scoped_to_the_log_file() {
         let mine = log_mutex_names(Path::new(

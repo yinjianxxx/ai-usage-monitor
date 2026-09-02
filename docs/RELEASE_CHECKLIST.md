@@ -38,6 +38,16 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   file**, fall back to defaults, and overwrite the user's layout, language, and
   provider selection on the next save. Downgrading across that boundary is a
   settings reset, not a rollback.
+- The same applies to any new `#[serde(tag = ...)]` variant, not just provider
+  names. `widget_placement`, `floating_placement` and `last_update_outcome`
+  became tolerant of an unknown variant in v2.5.2 - an older build there loses
+  that one field and keeps the file - but **v2.5.1 and earlier reject the whole
+  settings file** the same way. Adding a variant is therefore a downgrade
+  consequence to state in the release notes, exactly like adding a provider.
+- An unreadable settings file is kept as `settings.json.corrupt` and reported
+  once; only one generation is kept. Returning defaults is not a read-only
+  outcome, so any change that makes the parse stricter has to keep that rescue
+  ahead of the first save.
 - Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
   and principal dependencies and record whether an upgrade is justified.
   Between minor releases, review them immediately only for a security advisory,
@@ -138,6 +148,14 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   plus `diagnose.log.old` remain. Rename the current file externally, create a
   replacement, and confirm the next line follows the replacement rather than
   the renamed file.
+- Corrupt `settings.json` - a UTF-8 BOM is enough, and PowerShell 5.1's
+  `Set-Content -Encoding utf8` writes one - then start. Confirm the original
+  bytes are kept at `settings.json.corrupt`, that one warning names that path,
+  and that the run then behaves like a fresh profile. Repeat once more and
+  confirm only the newer original is kept. Do this while an update is being
+  applied too: the readiness confirmation must complete before that warning,
+  otherwise the helper's 30-second budget expires behind the dialog and rolls
+  the update back.
 - Confirm Refresh is one submenu whose first item is Refresh now, followed by a
   separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
   minutes); exercise Refresh now and each interval once. While a slow manual

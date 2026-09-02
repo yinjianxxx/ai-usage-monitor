@@ -55,7 +55,14 @@ identity, or release automation.
   it, then replaces the destination in the same directory.
 - Diagnostic logging rejects reparse-point paths, reopens the current pathname
   for every write, serializes cooperating processes, and keeps exactly the
-  current log plus one `diagnose.log.old` generation.
+  current log plus one `diagnose.log.old` generation. Its cross-process lock is
+  derived from the log path, so accounts that write different files do not wait
+  on each other.
+- A settings file that cannot be parsed is preserved as `settings.json.corrupt`
+  and reported to the user before defaults are loaded. Loading defaults is not
+  a read-only outcome: the first save that follows replaces the user's layout,
+  language, provider selection and access decisions. A value a newer build
+  wrote costs at most the one field that cannot be represented, never the file.
 
 ## Network and updates
 
@@ -63,6 +70,9 @@ identity, or release automation.
 - Update payloads remain hash-verified, staged, atomically replaced, and rolled
   back unless the new process reports ready. Never replace a still-running
   executable or restart an unverified path.
+- The new process confirms readiness before any startup step that can wait on
+  the user. The helper's timeout is fixed, so a dialog placed ahead of that
+  confirmation rolls a healthy update back while the user is still reading it.
 
 ## Release history
 
