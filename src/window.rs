@@ -12248,6 +12248,32 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
             "taskbar widget hidden pending shell recovery"
         });
 
+        // Confirm the update transaction here: this is exactly the milestone
+        // `confirm_update_ready` documents - the single-instance mutex is
+        // held, the window and tray icons exist, and the first render is
+        // done - and it is the last point before startup can block on the
+        // user. The helper gives a new build 30 seconds to report ready and
+        // otherwise rolls back to the previous binary, while everything below
+        // can put a modal on screen and wait forever: the first-run consent
+        // prompt, and the persistence warning that fires whenever the last
+        // save failed. An update that landed on either of those was killed and
+        // rolled back while the user was still reading the dialog.
+        if let Err(error) = updater::confirm_update_ready() {
+            diagnose::log(format!(
+                "unable to confirm successful update startup; startup stopped: {error}"
+            ));
+            let strings = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| s.language.strings())
+                    .unwrap_or(LanguageId::English.strings())
+            };
+            let message = format!("{}\n\n{error}", strings.update_failed);
+            show_error_message(strings.updates, &message);
+            return;
+        }
+
         // Show the one-time access prompt only after the compact surface and
         // tray icons exist, so an owner with WS_EX_NOACTIVATE cannot strand
         // the modal before any app UI is visible. This remains before
@@ -12297,21 +12323,6 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         // Initial theme check
         check_theme_change();
 
-        if let Err(error) = updater::confirm_update_ready() {
-            diagnose::log(format!(
-                "unable to confirm successful update startup; startup stopped: {error}"
-            ));
-            let strings = {
-                let state = lock_state();
-                state
-                    .as_ref()
-                    .map(|s| s.language.strings())
-                    .unwrap_or(LanguageId::English.strings())
-            };
-            let message = format!("{}\n\n{error}", strings.update_failed);
-            show_error_message(strings.updates, &message);
-            return;
-        }
         if let Some(error) = startup_notice {
             let strings = {
                 let state = lock_state();
