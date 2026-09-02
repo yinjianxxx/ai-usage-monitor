@@ -610,6 +610,19 @@ impl PollCoordinator {
         self.force_claude_refresh.store(false, Ordering::Release);
     }
 
+    /// Release ownership after a pass unwound.
+    ///
+    /// The coalesced follow-up is dropped on purpose: re-running the pass that
+    /// just panicked would panic again. Clearing `in_flight` last means a
+    /// request racing this call can lose its refresh, which the periodic poll
+    /// timer makes good on the next tick - the alternative, leaving
+    /// `in_flight` set, loses every refresh for the life of the process.
+    fn abandon_pass(&self) {
+        self.pending.store(false, Ordering::Release);
+        self.force_claude_refresh.store(false, Ordering::Release);
+        self.in_flight.store(false, Ordering::Release);
+    }
+
     /// Return true when this worker should immediately perform the one
     /// coalesced follow-up pass. The second check closes the race where a
     /// request arrives between the first pending check and releasing ownership.
@@ -630,6 +643,42 @@ impl PollCoordinator {
 }
 
 static POLL_COORDINATOR: PollCoordinator = PollCoordinator::new();
+
+/// Releases the poll coordinator if the pass it covers unwinds.
+///
+/// `in_flight` is what keeps a second worker from starting, so a pass that
+/// unwound past `finish_pass` left it set for the life of the process: every
+/// later request was collapsed into a pending pass that nobody ran, and usage
+/// froze while the app itself kept running. `Cargo.toml` deliberately keeps
+/// panics unwinding rather than aborting, so the thread really does come apart
+/// here.
+struct PollPassGuard<'a> {
+    coordinator: Option<&'a PollCoordinator>,
+}
+
+impl<'a> PollPassGuard<'a> {
+    fn arm(coordinator: &'a PollCoordinator) -> Self {
+        Self {
+            coordinator: Some(coordinator),
+        }
+    }
+
+    /// The pass returned normally; leave ownership to `finish_pass`.
+    fn finished(mut self) {
+        self.coordinator = None;
+    }
+}
+
+impl Drop for PollPassGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(coordinator) = self.coordinator {
+            diagnose::log(
+                "poll pass panicked; releasing the coordinator so a later request can start a new worker",
+            );
+            coordinator.abandon_pass();
+        }
+    }
+}
 
 fn watchdog_needs_taskbar_recovery(
     widget_exists: bool,
@@ -11418,56 +11467,81 @@ fn spawn_credential_watch_check() {
     if CREDENTIAL_WATCH_BUSY.swap(true, Ordering::AcqRel) {
         return;
     }
-    std::thread::spawn(|| {
-        let watch = {
-            let mut state = lock_state();
-            state.as_mut().and_then(|s| {
-                if !s.auth_watch_active {
-                    return None;
-                }
-                let scope = credential_read_scope(s, CredentialReadReason::CredentialWatch);
-                let Some(mode) = credential_watch_mode_for_shown(
-                    scope.claude,
-                    scope.codex,
-                    scope.antigravity,
-                    scope.grok,
-                ) else {
-                    diagnose::log(
-                        "credential watch stopped: no provider is in scope for a credential read",
-                    );
-                    s.auth_watch_active = false;
-                    s.auth_watch_snapshot.clear();
-                    return None;
-                };
-                Some((
-                    mode,
-                    s.auth_watch_mode == mode,
-                    s.auth_watch_snapshot.clone(),
-                ))
-            })
-        };
-        if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
-            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-            let changed = current_snapshot != previous_snapshot;
-            if credential_watch_outcome(baseline_matches, changed) == CredentialWatchOutcome::Repoll
+    std::thread::spawn(|| hold_credential_watch_busy(run_credential_watch_check));
+}
+
+/// Clears `CREDENTIAL_WATCH_BUSY` when the guard goes out of scope.
+///
+/// That flag is what stops the 15-second timer from stacking checks on top of
+/// a slow probe, so a panic that unwound past a plain store at the end of the
+/// check left it set for the life of the process: the credential watch never
+/// ran again, silently, while polling carried on as if nothing had happened.
+struct CredentialWatchBusyGuard;
+
+impl Drop for CredentialWatchBusyGuard {
+    fn drop(&mut self) {
+        CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Run `check` and release the busy flag however it ends.
+///
+/// Taking the check as an argument so the release contract can be asserted
+/// with a check that panics, on the function the spawned thread calls rather
+/// than on the guard alone: dropping the guard from this call site would leave
+/// a guard-only test green.
+fn hold_credential_watch_busy(check: impl FnOnce()) {
+    let _busy = CredentialWatchBusyGuard;
+    check();
+}
+
+fn run_credential_watch_check() {
+    let watch = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| {
+            if !s.auth_watch_active {
+                return None;
+            }
+            let scope = credential_read_scope(s, CredentialReadReason::CredentialWatch);
+            let Some(mode) = credential_watch_mode_for_shown(
+                scope.claude,
+                scope.codex,
+                scope.antigravity,
+                scope.grok,
+            ) else {
+                diagnose::log(
+                    "credential watch stopped: no provider is in scope for a credential read",
+                );
+                s.auth_watch_active = false;
+                s.auth_watch_snapshot.clear();
+                return None;
+            };
+            Some((
+                mode,
+                s.auth_watch_mode == mode,
+                s.auth_watch_snapshot.clone(),
+            ))
+        })
+    };
+    if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
+        let current_snapshot = poller::credential_watch_snapshot(watch_mode);
+        let changed = current_snapshot != previous_snapshot;
+        if credential_watch_outcome(baseline_matches, changed) == CredentialWatchOutcome::Repoll {
             {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        if s.auth_watch_active {
-                            // Mode and snapshot together: storing the snapshot
-                            // under a stale mode is what made the next tick
-                            // repeat this pass.
-                            s.auth_watch_mode = watch_mode;
-                            s.auth_watch_snapshot = current_snapshot;
-                        }
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    if s.auth_watch_active {
+                        // Mode and snapshot together: storing the snapshot
+                        // under a stale mode is what made the next tick
+                        // repeat this pass.
+                        s.auth_watch_mode = watch_mode;
+                        s.auth_watch_snapshot = current_snapshot;
                     }
                 }
-                request_poll();
             }
+            request_poll();
         }
-        CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
-    });
+    }
 }
 
 unsafe fn handle_auth_watch_timer(hwnd: HWND) {
@@ -12534,10 +12608,21 @@ fn request_poll_with(force_claude_refresh: bool) {
 }
 
 fn poll_worker() {
+    run_poll_passes(&POLL_COORDINATOR, do_poll);
+}
+
+/// Run coalesced passes until no follow-up is owed.
+///
+/// Separate from `poll_worker`, and taking the coordinator and the pass as
+/// arguments, so the panic contract in `PollPassGuard` can be asserted on the
+/// loop the running app enters rather than on a copy of it.
+fn run_poll_passes(coordinator: &PollCoordinator, mut pass: impl FnMut(u64, bool)) {
     loop {
-        let (generation, force_claude_refresh) = POLL_COORDINATOR.begin_pass();
-        do_poll(generation, force_claude_refresh);
-        if !POLL_COORDINATOR.finish_pass() {
+        let (generation, force_claude_refresh) = coordinator.begin_pass();
+        let guard = PollPassGuard::arm(coordinator);
+        pass(generation, force_claude_refresh);
+        guard.finished();
+        if !coordinator.finish_pass() {
             break;
         }
         diagnose::log("poll request coalesced; starting pending refresh");
@@ -12640,6 +12725,14 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             );
 
             let mut auth_transition_kind = None;
+            // Collected under the lock, sent after it. `Shell_NotifyIconW`
+            // reaches Explorer synchronously, and Explorer can call straight
+            // back into this app's window procedure, which takes `STATE`.
+            // Sending from inside this section - on the poll worker, holding
+            // that lock - put the UI thread and this worker on opposite sides
+            // of the same wait. The other three balloon sites in this file
+            // already release first; this was the one that did not.
+            let mut reset_notifications = Vec::new();
             let mut state = lock_state();
             if !POLL_COORDINATOR.is_current(generation) {
                 diagnose::log(format!(
@@ -12672,7 +12765,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 // reset that elapsed while the app was closed is old news,
                 // not an event worth a balloon (pre-cache behavior: the
                 // first poll of a run never notified).
-                let reset_notifications = if s.data_is_cached {
+                reset_notifications = if s.data_is_cached {
                     Vec::new()
                 } else {
                     collect_reset_notifications(
@@ -12702,17 +12795,6 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 s.last_poll_ok = true;
                 s.last_success_unix = Some(updated_unix);
                 refresh_usage_texts(s);
-
-                for notification in reset_notifications {
-                    diagnose::log(format!("reset notification shown: {}", notification.body));
-                    tray_icon::notify_balloon(
-                        main_hwnd,
-                        notification.kind,
-                        tray_icon::BalloonTone::Info,
-                        &notification.title,
-                        &notification.body,
-                    );
-                }
 
                 s.retry_count = 0;
                 // Re-arm from completion instead of keeping the old periodic
@@ -12773,6 +12855,16 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // show these numbers immediately.
             let cache_snapshot = state.as_ref().and_then(capture_usage_cache_snapshot);
             drop(state);
+            for notification in reset_notifications {
+                diagnose::log(format!("reset notification shown: {}", notification.body));
+                tray_icon::notify_balloon(
+                    main_hwnd,
+                    notification.kind,
+                    tray_icon::BalloonTone::Info,
+                    &notification.title,
+                    &notification.body,
+                );
+            }
             if let Some(snapshot) = cache_snapshot.as_ref() {
                 save_usage_cache(snapshot);
             }
@@ -14871,6 +14963,76 @@ mod reset_notification_tests {
         assert!(usage_cache
             .write_if_latest(current_cache_revision, || Ok::<(), ()>(()))
             .expect("current cache write"));
+    }
+
+    /// Serializes the tests that install a panic hook. The hook is
+    /// process-global, so two of them running at once would leave the wrong
+    /// one installed for the rest of the run.
+    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `body`, which is expected to panic, without the default hook
+    /// printing that panic into the test output.
+    fn catch_expected_panic(body: impl FnOnce()) -> bool {
+        let _serialized = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::panic::set_hook(previous);
+        outcome.is_err()
+    }
+
+    /// A poll pass that panics must still hand the coordinator back.
+    ///
+    /// `in_flight` is what keeps a second worker from starting, so a pass that
+    /// unwound past `finish_pass` left it set for the life of the process:
+    /// every later request was collapsed into a pending pass that nobody ran,
+    /// and usage froze while the app itself kept running - silently, because
+    /// the panic hook wrote to a log nobody was reading. Asserted on
+    /// `run_poll_passes`, the loop the running app enters, rather than on
+    /// `PollPassGuard`: a revert that dropped the guard from the loop would
+    /// leave a guard-only test green.
+    #[test]
+    fn a_panicking_poll_pass_releases_the_coordinator() {
+        let coordinator = PollCoordinator::new();
+        assert!(
+            coordinator.request(false),
+            "the first request owns the single worker"
+        );
+
+        let unwound = catch_expected_panic(|| {
+            run_poll_passes(&coordinator, |_, _| panic!("a poll pass panicked"));
+        });
+
+        assert!(
+            unwound,
+            "the panic must still reach the thread boundary so the hook records it"
+        );
+        assert!(
+            coordinator.request(false),
+            "a later request must be able to start a new worker"
+        );
+    }
+
+    /// Same contract for the credential watch, where the damage would be that
+    /// a re-login is never picked up: the busy flag stops the 15-second timer
+    /// from stacking checks on a slow probe, so a panic that unwound past a
+    /// store at the end of the check disabled the watch for good. Asserted on
+    /// `hold_credential_watch_busy`, which is what the spawned thread calls.
+    #[test]
+    fn a_panicking_credential_watch_check_releases_the_busy_flag() {
+        CREDENTIAL_WATCH_BUSY.store(true, Ordering::Release);
+
+        let unwound = catch_expected_panic(|| {
+            hold_credential_watch_busy(|| panic!("a credential watch check panicked"));
+        });
+
+        assert!(unwound, "the panic must still reach the thread boundary");
+        assert!(
+            !CREDENTIAL_WATCH_BUSY.load(Ordering::Acquire),
+            "the busy flag must be released so the next tick can check again"
+        );
     }
 
     #[test]
