@@ -115,7 +115,7 @@ stamped `2.5.1` so the published `v2.5.2` would read as newer, copied to
 `%LOCALAPPDATA%\Programs\Gengchou-dogfood\` and started in place of the
 WinGet-installed instance, which was left untouched. Settings were backed up
 first. The startup entry, which had been pointing at the repository's
-`targetelease` build, was repointed at the dogfood copy.
+`target\release` build, was repointed at the dogfood copy.
 
 The owner then produced the evidence this document had listed as missing:
 
