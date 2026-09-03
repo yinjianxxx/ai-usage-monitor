@@ -9826,6 +9826,25 @@ fn show_pending_persistence_warning_once() {
     show_error_message(strings.settings, &message);
 }
 
+/// Say once that this run has no diagnostic log.
+///
+/// `take_init_error` is destructive, so this is one-shot by construction: the
+/// detail popup and the floating window must not each raise it again.
+fn show_diagnostics_unavailable_once() {
+    let Some(error) = diagnose::take_init_error() else {
+        return;
+    };
+    let strings = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language.strings())
+            .unwrap_or(LanguageId::English.strings())
+    };
+    let message = format!("{}\n\n{error}", strings.diagnostics_unavailable);
+    show_error_message(strings.window_title, &message);
+}
+
 fn show_update_prompt(strings: Strings, release: &ReleaseDescriptor) -> bool {
     let message = strings
         .update_prompt_now
@@ -12516,6 +12535,9 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
 
         schedule_countdown_timer();
         show_pending_persistence_warning_once();
+        // After confirm_update_ready above, like every other modal: this one
+        // can appear at every launch while a profile stays broken.
+        show_diagnostics_unavailable_once();
 
         // Provider polling belongs to the process-level helper so it survives
         // taskbar/RDP destruction of the embedded widget HWND.

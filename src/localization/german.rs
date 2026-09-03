@@ -9,6 +9,8 @@ pub(super) const STRINGS: Strings = Strings {
         "Gengchou läuft bereits in einer anderen Windows-Sitzung dieses PCs. Nur ein Gengchou kann Ihre Einstellungen gleichzeitig verwenden.",
     instance_lock_failed:
         "Gengchou konnte nicht gestartet werden: Die Sperre für die Einzelinstanz konnte nicht erstellt werden.",
+    diagnostics_unavailable:
+        "Die Diagnoseprotokollierung ist nicht verfuegbar, daher hinterlassen Probleme - auch Abstuerze - keine Spur auf diesem PC.",
     refresh: "Aktualisieren",
     refresh_now: "Jetzt aktualisieren",
     one_minute: "1 Minute",

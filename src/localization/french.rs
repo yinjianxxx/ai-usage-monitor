@@ -9,6 +9,8 @@ pub(super) const STRINGS: Strings = Strings {
         "Gengchou est déjà en cours d'exécution dans une autre session Windows de ce PC. Un seul Gengchou à la fois peut utiliser vos paramètres.",
     instance_lock_failed:
         "Gengchou n'a pas pu démarrer : son verrou d'instance unique n'a pas pu être créé.",
+    diagnostics_unavailable:
+        "La journalisation de diagnostic est indisponible : les problemes, pannes comprises, ne laisseront aucune trace sur ce PC.",
     refresh: "Actualiser",
     refresh_now: "Actualiser maintenant",
     one_minute: "1 minute",

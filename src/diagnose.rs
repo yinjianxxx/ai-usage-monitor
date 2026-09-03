@@ -75,6 +75,31 @@ impl Drop for LogMutexGuard {
 }
 
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
+static INIT_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Keep the reason diagnostics are unavailable so the first window can say so.
+///
+/// Every later `log` call is a no-op once `init` has failed, and so is the
+/// panic hook that writes through it: this string is the only trace that the
+/// app has no black box. Discarding it left a user with neither a log nor an
+/// explanation for why there is none.
+pub fn record_init_error(error: String) {
+    let slot = INIT_ERROR.get_or_init(|| Mutex::new(None));
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+/// Take the reason, if any, exactly once: a later window must not raise it
+/// again.
+pub fn take_init_error() -> Option<String> {
+    INIT_ERROR.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    })
+}
 
 fn log_path() -> Result<PathBuf, String> {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -432,5 +457,29 @@ mod tests {
             std::fs::read_to_string(&path).expect("latest current log"),
             "second\n"
         );
+    }
+
+    /// The reason logging is unavailable survives long enough to be shown, and
+    /// exactly once.
+    ///
+    /// Nothing else records it: once `init` fails, `log` and the panic hook
+    /// that writes through it are both no-ops, so dropping this string leaves
+    /// the user with no log and no reason for there being none. It has to be
+    /// taken rather than read, or every surface that opens later would raise
+    /// the same dialog again.
+    #[test]
+    fn the_reason_logging_is_unavailable_is_kept_and_reported_once() {
+        assert_eq!(take_init_error(), None, "nothing was recorded yet");
+
+        record_init_error("LOCALAPPDATA is unavailable".to_string());
+        // A second failure must not overwrite the first: the first one is what
+        // explains why everything after it went quiet.
+        record_init_error("a later, less interesting failure".to_string());
+
+        assert_eq!(
+            take_init_error(),
+            Some("LOCALAPPDATA is unavailable".to_string())
+        );
+        assert_eq!(take_init_error(), None, "one report, not one per window");
     }
 }

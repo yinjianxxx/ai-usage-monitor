@@ -223,6 +223,10 @@ pub struct Strings {
     /// Shown when the single-instance guard itself could not be created. The
     /// Win32 error is appended untranslated.
     pub instance_lock_failed: &'static str,
+    /// Shown once when diagnostic logging could not be started. The reason is
+    /// appended untranslated. Without it the app runs with no black box at
+    /// all: the panic hook writes to that same log.
+    pub diagnostics_unavailable: &'static str,
     pub refresh: &'static str,
     pub refresh_now: &'static str,
     pub one_minute: &'static str,

@@ -8,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     instance_already_running:
         "この PC の別の Windows セッションで Gengchou がすでに実行されています。設定を使用できる Gengchou は同時に 1 つだけです。",
     instance_lock_failed: "Gengchou を起動できません: 単一インスタンス ロックを作成できませんでした。",
+    diagnostics_unavailable: "診断ログを利用できないため、クラッシュを含む問題はこの PC に一切記録されません。",
     refresh: "更新",
     refresh_now: "今すぐ更新",
     one_minute: "1分",
