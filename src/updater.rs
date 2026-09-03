@@ -11,9 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use windows::core::{HRESULT, PCWSTR};
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
@@ -197,9 +202,13 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     ensure_target_location_writable(&current_exe)?;
 
+    // Everything below deletes, downloads into, copies into and then executes
+    // out of this directory. The same reparse-point check already guarded the
+    // readiness markers, but only once the helper was running - by then a
+    // redirected `updates` directory had already received the download and the
+    // copy of this executable.
     let stage_dir = updates_dir()?;
-    std::fs::create_dir_all(&stage_dir)
-        .map_err(|e| format!("Unable to create updater working directory: {e}"))?;
+    prepare_update_directory(&stage_dir)?;
 
     let helper_path = stage_dir.join(HELPER_EXE_NAME);
     let download_path = stage_dir.join(DOWNLOAD_EXE_NAME);
@@ -223,6 +232,10 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
             return Err(error);
         }
     };
+    if let Err(error) = verify_download_version(&download_path, &release.latest_version) {
+        let _ = std::fs::remove_file(&download_path);
+        return Err(error);
+    }
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -255,11 +268,19 @@ fn apply_update(
     pid: u32,
     expected_sha256: &str,
 ) -> Result<(), String> {
+    // Read the parent's identity before waiting for it: once it exits there is
+    // nothing left to ask, and the handle used for the question is the one
+    // waited on, so the pid cannot be recycled in between.
+    let parent = ParentProcess::open(pid)?;
+    let parent_image = parent.as_ref().and_then(ParentProcess::image_path);
+
     // Replacing a live image is not a safe fallback: even when Windows allows
     // the rename, the old process still owns the single-instance mutex.
     // A wait failure means that process may still be alive, so do not launch a
     // competing instance on that path.
-    wait_for_process_exit(pid, PROCESS_EXIT_TIMEOUT)?;
+    if let Some(parent) = parent.as_ref() {
+        parent.wait_for_exit(PROCESS_EXIT_TIMEOUT)?;
+    }
 
     // From this point onward the previous process is known to be gone. Every
     // failure before the atomic replace must restart the unchanged target,
@@ -286,6 +307,19 @@ fn apply_update(
         Ok(hash) => hash,
         Err(error) => return relaunch_unchanged_target(&target, error),
     };
+
+    // A target this helper cannot tie to its own installation is not relaunched
+    // either: starting it would execute an arbitrary path chosen by whoever
+    // wrote the arguments, which is worse than doing nothing.
+    let helper_hash = std::env::current_exe()
+        .ok()
+        .and_then(|helper| file_sha256_hex(&helper, "the updater helper").ok());
+    confirm_update_target(
+        &target,
+        parent_image.as_deref(),
+        helper_hash.as_deref(),
+        &original_hash,
+    )?;
     let ready_marker = match new_ready_marker_path() {
         Ok(marker) => marker,
         Err(error) => return relaunch_unchanged_target(&target, error),
@@ -597,6 +631,112 @@ fn verify_download_checksum(
             "The downloaded update failed SHA-256 verification (expected {expected}, got {actual}). The download may be corrupted or tampered with."
         ))
     }
+}
+
+/// Confirm the downloaded binary calls itself the version that was announced.
+///
+/// The WinGet path has always done this - it re-reads `ProductVersion` after
+/// the upgrade and rolls back on a mismatch - while the portable path checked
+/// only the hash. A hash proves the file is the one `SHA256SUMS` names; it says
+/// nothing about which build that file actually is, so a release whose assets
+/// and manifest were published from the wrong artifact would install cleanly
+/// and then report the wrong version for the rest of its life. Rejecting the
+/// download here also means the mismatch never reaches the replace step.
+///
+/// A binary with no version resource is not a failure: the check is a
+/// comparison, and there is nothing to compare.
+fn verify_download_version(download: &Path, expected_version: &str) -> Result<(), String> {
+    let Some(actual) = file_product_version(download) else {
+        crate::diagnose::log(
+            "the downloaded update carries no ProductVersion; only its hash was verified",
+        );
+        return Ok(());
+    };
+    if version_matches(&actual, expected_version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The downloaded update reports version {actual}, but the release announced {expected_version}. Refusing to install it."
+        ))
+    }
+}
+
+/// `ProductVersion` is written as `2.5.2` but Windows may report the padded
+/// `2.5.2.0` form, so compare on the numeric components alone.
+fn version_matches(actual: &str, expected: &str) -> bool {
+    fn components(value: &str) -> Vec<u32> {
+        let mut parts: Vec<u32> = value
+            .trim()
+            .trim_start_matches('v')
+            .split('.')
+            .map(|part| part.trim().parse::<u32>().unwrap_or(0))
+            .collect();
+        while parts.last() == Some(&0) && parts.len() > 1 {
+            parts.pop();
+        }
+        parts
+    }
+    !expected.trim().is_empty() && components(actual) == components(expected)
+}
+
+/// Read `ProductVersion` out of a PE file's version resource.
+fn file_product_version(path: &Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+
+    let wide = wide_str(&path.to_string_lossy());
+    let name = PCWSTR::from_raw(wide.as_ptr());
+    let size = unsafe { GetFileVersionInfoSizeW(name, None) };
+    if size == 0 {
+        return None;
+    }
+    let mut block = vec![0u8; size as usize];
+    unsafe { GetFileVersionInfoW(name, 0, size, block.as_mut_ptr().cast()) }.ok()?;
+
+    // The version resource is per language/codepage. Read the first entry of
+    // the translation table rather than assuming the usual 0409/04B0.
+    let mut translation = std::ptr::null_mut();
+    let mut translation_len = 0u32;
+    let translation_query = wide_str(r"\VarFileInfo\Translation");
+    let found = unsafe {
+        VerQueryValueW(
+            block.as_ptr().cast(),
+            PCWSTR::from_raw(translation_query.as_ptr()),
+            &mut translation,
+            &mut translation_len,
+        )
+    };
+    if !found.as_bool() || translation.is_null() || translation_len < 4 {
+        return None;
+    }
+    let (language, codepage) = unsafe {
+        let entry = translation.cast::<u16>();
+        (*entry, *entry.add(1))
+    };
+
+    let query = wide_str(&format!(
+        r"\StringFileInfo\{language:04x}{codepage:04x}\ProductVersion"
+    ));
+    let mut value = std::ptr::null_mut();
+    let mut value_len = 0u32;
+    let found = unsafe {
+        VerQueryValueW(
+            block.as_ptr().cast(),
+            PCWSTR::from_raw(query.as_ptr()),
+            &mut value,
+            &mut value_len,
+        )
+    };
+    if !found.as_bool() || value.is_null() || value_len == 0 {
+        return None;
+    }
+    let text = unsafe { std::slice::from_raw_parts(value.cast::<u16>(), value_len as usize) };
+    let text: String = String::from_utf16_lossy(text)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Parse `<hex>  <name>` manifest lines (the format release.yml writes).
@@ -1078,30 +1218,68 @@ fn stop_child_for_rollback(child: &mut Child) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
-    if pid == 0 {
-        return Err("The updater cannot wait for process ID 0.".to_string());
-    }
+/// The process that asked for this update, opened once so its identity can be
+/// read and its exit waited on through the same handle.
+///
+/// One handle for both, deliberately: querying the image path and then opening
+/// the process again to wait would leave a window in which the pid is recycled.
+struct ParentProcess(HANDLE);
 
-    unsafe {
-        let handle = match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            Ok(handle) => handle,
+impl Drop for ParentProcess {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+impl ParentProcess {
+    /// `Ok(None)` when the process has already exited.
+    fn open(pid: u32) -> Result<Option<Self>, String> {
+        if pid == 0 {
+            return Err("The updater cannot wait for process ID 0.".to_string());
+        }
+        match unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+        } {
+            Ok(handle) => Ok(Some(Self(handle))),
             // The helper starts after the app requests shutdown. If the PID is
             // already gone, OpenProcess reports ERROR_INVALID_PARAMETER; that
-            // is the success state we were waiting for, not a monitor failure.
+            // is the state we were waiting for, not a monitor failure.
             Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
-                return Ok(())
+                Ok(None)
             }
-            Err(error) => {
-                return Err(format!(
-                    "Unable to monitor the running app process: {error}"
-                ))
-            }
+            Err(error) => Err(format!(
+                "Unable to monitor the running app process: {error}"
+            )),
+        }
+    }
+
+    fn image_path(&self) -> Option<PathBuf> {
+        let mut buffer = [0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                self.0,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .ok()?;
+        let length = length as usize;
+        (length > 0 && length <= buffer.len())
+            .then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+    }
+
+    fn wait_for_exit(&self, timeout: Duration) -> Result<(), String> {
+        let result = unsafe {
+            WaitForSingleObject(self.0, timeout.as_millis().min(u32::MAX as u128) as u32)
         };
-
-        let result = WaitForSingleObject(handle, timeout.as_millis().min(u32::MAX as u128) as u32);
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
-
         if result == WAIT_OBJECT_0 {
             Ok(())
         } else if result == WAIT_TIMEOUT {
@@ -1110,6 +1288,60 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
             Err("Unable to confirm that the running app has exited.".to_string())
         }
     }
+}
+
+/// Whether `--apply-update` was pointed at the installation that started it.
+///
+/// The helper accepts a target path and a source path and replaces one with
+/// the other. Nothing in that contract said the target had to be this install,
+/// so a shortcut or scheduled task planted with different arguments turned the
+/// updater into a general file-replacement step. Two independent facts settle
+/// it, and one of them is always available:
+///
+/// * The parent process's own image path. Exact, and the normal case, since
+///   `begin_self_update` spawns the helper before shutting down.
+/// * Failing that - the parent can be gone before the helper opens it - the
+///   helper's own bytes. It is a copy of the executable that spawned it, so a
+///   target that does not hash the same is not that installation. This is also
+///   what catches an invocation that names a pid which was never alive.
+fn confirm_update_target(
+    target: &Path,
+    parent_image: Option<&Path>,
+    helper_hash: Option<&str>,
+    target_hash: &str,
+) -> Result<(), String> {
+    if let Some(parent_image) = parent_image {
+        return if normalize_path(parent_image) == normalize_path(target) {
+            Ok(())
+        } else {
+            Err(format!(
+                "The update target {} is not the running app at {}. Refusing to replace it.",
+                target.display(),
+                parent_image.display()
+            ))
+        };
+    }
+
+    match helper_hash {
+        Some(helper_hash) if helper_hash.eq_ignore_ascii_case(target_hash) => Ok(()),
+        _ => Err(format!(
+            "The update target {} is not the installation that started this updater. Refusing to replace it.",
+            target.display()
+        )),
+    }
+}
+
+/// Create the updater's working directory, refusing a redirected one.
+///
+/// `begin_self_update` deletes files here, downloads into it, copies this
+/// executable into it and then runs that copy. The same reparse-point check
+/// already guarded the readiness markers, but only inside the helper - by then
+/// a redirected `updates` directory had already received all of that.
+fn prepare_update_directory(directory: &Path) -> Result<(), String> {
+    validate_nearest_existing_update_ancestor(directory)?;
+    std::fs::create_dir_all(directory)
+        .map_err(|e| format!("Unable to create updater working directory: {e}"))?;
+    validate_update_directory(directory)
 }
 
 fn updates_dir() -> Result<PathBuf, String> {
@@ -1133,14 +1365,14 @@ fn ready_markers_dir() -> Result<PathBuf, String> {
 
 fn new_ready_marker_path() -> Result<PathBuf, String> {
     let directory = ready_markers_dir()?;
-    validate_nearest_existing_ready_ancestor(&directory)?;
+    validate_nearest_existing_update_ancestor(&directory)?;
     std::fs::create_dir_all(&directory).map_err(|error| {
         format!(
             "Unable to create the update readiness directory at {}: {error}",
             directory.display()
         )
     })?;
-    validate_ready_directory(&directory)?;
+    validate_update_directory(&directory)?;
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1159,7 +1391,7 @@ fn new_ready_marker_path() -> Result<PathBuf, String> {
     Err("Unable to reserve a unique update readiness marker.".to_string())
 }
 
-fn validate_nearest_existing_ready_ancestor(path: &Path) -> Result<(), String> {
+fn validate_nearest_existing_update_ancestor(path: &Path) -> Result<(), String> {
     let mut candidate = Some(path);
     while let Some(current) = candidate {
         match std::fs::symlink_metadata(current) {
@@ -1202,7 +1434,7 @@ fn validate_ready_marker_path(marker: &Path) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| "The update readiness marker name is invalid.".to_string())?;
 
-    validate_ready_directory(&expected_parent)?;
+    validate_update_directory(&expected_parent)?;
     if path_has_ambiguous_components(marker)
         || normalize_path(parent) != normalize_path(&expected_parent)
         || !name.starts_with(UPDATE_READY_PREFIX)
@@ -1265,7 +1497,7 @@ fn path_has_ambiguous_components(path: &Path) -> bool {
             .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
 }
 
-fn validate_ready_directory(path: &Path) -> Result<(), String> {
+fn validate_update_directory(path: &Path) -> Result<(), String> {
     if path_has_ambiguous_components(path) {
         return Err(format!(
             "Refusing an ambiguous update readiness directory: {}.",
@@ -1625,7 +1857,7 @@ mod tests {
         let dir = TestDir::new("ready-marker-type");
         let ready_dir = dir.join("ready");
         std::fs::create_dir_all(&ready_dir).unwrap();
-        validate_ready_directory(&ready_dir).unwrap();
+        validate_update_directory(&ready_dir).unwrap();
         let marker = ready_dir.join("update-ready-1-2-0.marker");
         std::fs::create_dir(&marker).unwrap();
         assert!(validate_regular_file_if_exists(&marker).is_err());
@@ -1788,15 +2020,152 @@ mod tests {
 
     #[test]
     fn waiting_for_a_live_process_times_out() {
-        let error = wait_for_process_exit(std::process::id(), Duration::ZERO)
+        let parent = ParentProcess::open(std::process::id())
+            .expect("the current test process can be opened")
+            .expect("the current test process is still alive");
+        let error = parent
+            .wait_for_exit(Duration::ZERO)
             .expect_err("the current test process is still alive");
         assert!(error.contains("Timed out"));
     }
 
     #[test]
     fn a_pid_that_has_already_disappeared_counts_as_exited() {
-        wait_for_process_exit(u32::MAX, Duration::ZERO)
-            .expect("a nonexistent process should already satisfy the wait");
+        assert!(
+            ParentProcess::open(u32::MAX)
+                .expect("a nonexistent process is not a monitor failure")
+                .is_none(),
+            "a nonexistent process should already satisfy the wait"
+        );
+    }
+
+    /// `--apply-update` takes a target path and replaces it with a downloaded
+    /// file. Without this check, any invocation that named a different path got
+    /// that replacement performed for it.
+    #[test]
+    fn the_update_target_has_to_be_the_installation_that_asked_for_it() {
+        let target = Path::new(r"C:\Apps\Gengchou\gengchou.exe");
+        let hash = "aa";
+
+        // The normal case: the parent is still open and is that file. Path
+        // spelling is compared the way Windows compares it.
+        assert!(
+            confirm_update_target(target, Some(target), Some(hash), hash).is_ok(),
+            "the running app must be able to update itself"
+        );
+        assert!(
+            confirm_update_target(
+                target,
+                Some(Path::new(r"c:\apps\gengchou/gengchou.exe")),
+                Some(hash),
+                hash
+            )
+            .is_ok(),
+            "case and separators are not an identity difference on Windows"
+        );
+
+        // A parent that is some other program does not get to nominate a
+        // target, and a matching helper hash does not rescue it.
+        let error = confirm_update_target(
+            target,
+            Some(Path::new(r"C:\Windows\System32\cmd.exe")),
+            Some(hash),
+            hash,
+        )
+        .expect_err("a foreign parent must not choose the target");
+        assert!(error.contains("cmd.exe"), "got {error}");
+
+        // The parent can be gone before the helper opens it. The helper is a
+        // copy of the app that spawned it, so its own bytes answer instead.
+        assert!(
+            confirm_update_target(target, None, Some(hash), hash).is_ok(),
+            "a parent that exited quickly must not lose the update"
+        );
+        assert!(
+            confirm_update_target(target, None, Some("bb"), hash).is_err(),
+            "a dead pid plus a foreign target is the shape this check exists for"
+        );
+        assert!(
+            confirm_update_target(target, None, None, hash).is_err(),
+            "with neither fact available, refuse"
+        );
+    }
+
+    /// The staging directory is checked before the download, not after.
+    ///
+    /// It is deleted from, downloaded into, and then executed out of. The
+    /// reparse-point check used to run only once the helper was already
+    /// started from a copy placed there.
+    #[test]
+    fn the_staging_directory_is_refused_before_anything_is_written_to_it() {
+        let dir = TestDir::new("stage-dir");
+
+        let updates = dir.join("updates");
+        prepare_update_directory(&updates).expect("a fresh working directory is usable");
+        assert!(updates.is_dir());
+        // Idempotent: an existing, ordinary directory stays acceptable.
+        prepare_update_directory(&updates).expect("an existing working directory is usable");
+
+        // Anything that is not a plain directory - a file here, a junction in
+        // the field - is refused before a byte is downloaded.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let error = prepare_update_directory(&blocked)
+            .expect_err("a non-directory update path must be refused");
+        assert!(
+            error.contains("non-directory or reparse-point"),
+            "got {error}"
+        );
+    }
+
+    /// A hash proves the file matches `SHA256SUMS`; it says nothing about which
+    /// build that is. The WinGet path has always compared `ProductVersion`.
+    #[test]
+    fn a_download_that_announces_the_wrong_version_is_refused() {
+        assert!(version_matches("2.5.2", "2.5.2"));
+        assert!(
+            version_matches("2.5.2.0", "2.5.2"),
+            "Windows pads the version resource to four components"
+        );
+        assert!(version_matches("2.5.2", "v2.5.2"));
+        assert!(!version_matches("2.5.1", "2.5.2"));
+        assert!(!version_matches("2.5.2", "2.5.20"));
+        assert!(
+            !version_matches("2.5.2", ""),
+            "an unknown expected version is not a match"
+        );
+
+        // This test binary carries the crate's own version resource, so it
+        // stands in for a correctly built release asset.
+        let helper = std::env::current_exe().expect("current exe");
+        assert!(verify_download_version(&helper, env!("CARGO_PKG_VERSION")).is_ok());
+        let error = verify_download_version(&helper, "9.9.9")
+            .expect_err("a build that calls itself something else must be refused");
+        assert!(error.contains("9.9.9"), "got {error}");
+
+        // A file with no version resource is not a mismatch; there is nothing
+        // to compare.
+        let dir = TestDir::new("download-version");
+        let plain = dir.join("plain.exe");
+        std::fs::write(&plain, b"not a PE file").unwrap();
+        assert!(verify_download_version(&plain, "2.5.2").is_ok());
+        assert_eq!(file_product_version(&plain), None);
+    }
+
+    /// The parent process's own image path is what identifies the install, and
+    /// it must be read while that process is still open.
+    #[test]
+    fn the_parent_process_reports_its_own_image_path() {
+        let parent = ParentProcess::open(std::process::id())
+            .expect("the current test process can be opened")
+            .expect("the current test process is still alive");
+        let image = parent
+            .image_path()
+            .expect("a live process has an image path");
+        assert_eq!(
+            normalize_path(&image),
+            normalize_path(&std::env::current_exe().expect("current exe")),
+        );
     }
 
     #[test]
