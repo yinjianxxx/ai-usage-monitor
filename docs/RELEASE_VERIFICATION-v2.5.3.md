@@ -10,9 +10,9 @@
   new versions; it announced them only by rewriting one entry inside the
   Settings submenu. It now raises a silent balloon (once per version), that
   balloon can be clicked to reach the same confirmation the manual check
-  shows, and the detail popup footer carries `v2.5.2 → 2.5.3` for as long as
-  an update is outstanding. No change to how updates are downloaded, verified,
-  staged, applied, or rolled back. No change to the executable,
+  shows, the detail popup footer carries `v2.5.2 → 2.5.3` for as long as an
+  update is outstanding, and that footer line is itself clickable. No change to
+  how updates are downloaded, verified, staged, applied, or rolled back. No change to the executable,
   settings-directory, cache, or update identities.
 - Signing: not in scope (owner has no signing certificate)
 
@@ -24,7 +24,7 @@ at `2.5.3`. Exit codes were read back, not inferred from output.
 - `cargo fmt --all -- --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - exit 0, and again with
   `--release` - exit 0
-- `cargo test --locked` - 380 passed, 0 failed (373 at v2.5.2; the seven new
+- `cargo test --locked` - 381 passed, 0 failed (373 at v2.5.2; the eight new
   tests are listed under *Targeted evidence*)
 - `cargo build --release --locked` - exit 0
 - PE properties of that build: ProductName `Gengchou`, ProductVersion and
@@ -53,9 +53,9 @@ at `2.5.3`. Exit codes were read back, not inferred from output.
 
 ## Targeted evidence
 
-Seven tests were added. Five mutation checks were run: the behaviour a test
+Eight tests were added. Seven mutation checks were run: the behaviour a test
 names was reverted in the source, the mutation was confirmed to be on disk,
-and the test was observed to fail. All five were caught, and all five source
+and the test was observed to fail. All seven were caught, and all seven source
 mutations were reverted.
 
 - `update_balloon_due` with the version comparison removed - caught by
@@ -69,6 +69,9 @@ mutations were reverted.
   `a_balloon_click_is_recognised_on_any_icon`.
 - `take_balloon_click` changed to clone instead of take - caught by
   `only_the_balloon_on_screen_carries_an_offer`.
+- `point_in_detail_update_link` treating a missing rect as a hit, and again
+  with the right edge made inclusive - both caught by
+  `the_footer_line_answers_only_inside_itself`.
 
 `the_footer_says_where_the_running_version_can_go` and
 `a_remembered_update_reaches_the_footer` were not mutation-checked; both assert
@@ -105,6 +108,31 @@ Sandbox side effects: the temporary version lowering was reverted and the
 lockfile rebuilt at `2.5.3`; the sandboxed data directories under `%TEMP%`
 were removed; the sandboxed process was stopped.
 
+### On the owner's own machine
+
+The branch was installed as a dogfood build on 2026-09-03: the same code,
+stamped `2.5.1` so the published `v2.5.2` would read as newer, copied to
+`%LOCALAPPDATA%\Programs\Gengchou-dogfood\` and started in place of the
+WinGet-installed instance, which was left untouched. Settings were backed up
+first. The startup entry, which had been pointing at the repository's
+`targetelease` build, was repointed at the dogfood copy.
+
+The owner then produced the evidence this document had listed as missing:
+
+```
+16:58:45  update available, announced version 2.5.2
+16:58:47  update balloon clicked for 2.5.2
+16:58:56  detail popup: open requested
+```
+
+Nothing posted that click - the balloon was shown by Windows, seen, and
+clicked. The confirmation was declined: no apply, staging, download or
+replacement appears in the log, and the executable is byte-for-byte the one
+copied in. So "an unanswered confirmation never replaces the executable" holds
+on a real profile, not only in a sandbox.
+
+The footer link landed after this run, so it has not been exercised live.
+
 ### The footer, rendered
 
 `--dump-detail-popup` was temporarily pointed at an outstanding update and the
@@ -118,19 +146,22 @@ README image implying an update exists would be a lie.
 
 These are gaps in this document, not passed rows.
 
-- **The footer marker was never seen in a live window.** What is verified: the
-  status-to-footer mapping by unit test including the remembered case, and the
-  drawing itself by a real render. What is not: the one expression that feeds
-  the live snapshot from `update_status`. An attempt to capture the popup of a
-  sandboxed instance was abandoned after a screen-region capture picked up the
-  owner's own desktop contents rather than the popup; that image was deleted
-  immediately and the approach dropped rather than retried.
-- **The balloon was never seen on screen.** Delivery is evidenced by
-  `Shell_NotifyIconW` accepting it and by the absence of the not-delivered log
-  line. Whether Windows chose to show it as a banner, and whether it lands in
-  the notification centre after timing out, was not observed. The claim in
-  both READMEs that a click reaches the update is verified at the message
-  level, not through a real mouse click on a real toast.
+- **The footer marker was never confirmed in a live window.** What is
+  verified: the status-to-footer mapping by unit test including the remembered
+  case, and the drawing itself by a real render. What is not: the one
+  expression that feeds the live snapshot from `update_status`. The owner did
+  open the popup seconds after clicking the balloon, but what it showed was not
+  reported and is not claimed here. An earlier attempt to capture a sandboxed
+  instance's popup was abandoned after a screen-region capture picked up the
+  owner's own desktop contents; that image was deleted immediately and the
+  approach dropped rather than retried.
+- **Whether the balloon survives into the notification centre** after timing
+  out was not observed. That it is shown and can be clicked is now evidenced
+  on the owner's machine - see *On the owner's own machine* - but nobody
+  waited for one to time out and then looked for it.
+- **The footer link has never been clicked.** Its geometry is unit tested and
+  its hover appearance was rendered and looked at, but no live run has gone
+  from pointer to dialog through it.
 - **The manual Windows smoke test was run only for the rows this round
   touches** (launch, balloon, balloon click, update path). The consent,
   provider-detection, credential-watch and surface-interaction rows are

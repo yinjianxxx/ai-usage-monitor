@@ -245,8 +245,9 @@ notification sound.
 Gengchou checks for its own updates once a day and announces a version it finds
 once; repeating that every day would be nagging. Clicking the notification asks
 whether to update now. Miss it and nothing is lost: the detail popup's footer
-reads `v2.5.3 → 2.5.4` until you take it, and the version entry under
-**Settings** carries the same offer.
+reads `v2.5.3 → 2.5.4` until you take it, and clicking that line asks the same
+question. The version entry under **Settings** carries the same offer, and is
+the route for keyboard users.
 
 The popup reserves badges for four conditions, in priority order:
 **Authentication failed**, **Refresh failed**, **Near limit**, and **Limit
