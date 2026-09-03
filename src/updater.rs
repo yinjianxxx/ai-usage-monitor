@@ -649,14 +649,16 @@ fn verify_download_checksum(
 /// and then report the wrong version for the rest of its life. Rejecting the
 /// download here also means the mismatch never reaches the replace step.
 ///
-/// A binary with no version resource is not a failure: the check is a
-/// comparison, and there is nothing to compare.
+/// A binary with no version resource is refused. Every asset this project
+/// publishes carries one - `build.rs` writes it from `CARGO_PKG_VERSION` - so
+/// a payload without one is not a build of this program, and "there was
+/// nothing to compare" is not the same as "it matched".
 fn verify_download_version(download: &Path, expected_version: &str) -> Result<(), String> {
     let Some(actual) = file_product_version(download) else {
-        crate::diagnose::log(
-            "the downloaded update carries no ProductVersion; only its hash was verified",
+        return Err(
+            "The downloaded update carries no ProductVersion, so it cannot be confirmed to be the announced release. Refusing to install it."
+                .to_string(),
         );
-        return Ok(());
     };
     if version_matches(&actual, expected_version) {
         Ok(())
@@ -669,20 +671,30 @@ fn verify_download_version(download: &Path, expected_version: &str) -> Result<()
 
 /// `ProductVersion` is written as `2.5.2` but Windows may report the padded
 /// `2.5.2.0` form, so compare on the numeric components alone.
+///
+/// A component that is not a number makes the whole version unusable rather
+/// than zero. Reading it as zero made `2.5.2.beta` equal `2.5.2` and any
+/// unparseable string equal `0` - a parse failure quietly answering "match",
+/// which is the one answer it must never give.
 fn version_matches(actual: &str, expected: &str) -> bool {
-    fn components(value: &str) -> Vec<u32> {
-        let mut parts: Vec<u32> = value
-            .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(|part| part.trim().parse::<u32>().unwrap_or(0))
-            .collect();
+    fn components(value: &str) -> Option<Vec<u32>> {
+        let value = value.trim().trim_start_matches('v');
+        if value.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for part in value.split('.') {
+            parts.push(part.trim().parse::<u32>().ok()?);
+        }
         while parts.last() == Some(&0) && parts.len() > 1 {
             parts.pop();
         }
-        parts
+        Some(parts)
     }
-    !expected.trim().is_empty() && components(actual) == components(expected)
+    match (components(actual), components(expected)) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => false,
+    }
 }
 
 /// Read `ProductVersion` out of a PE file's version resource.
@@ -2207,6 +2219,12 @@ mod tests {
             !version_matches("2.5.2", ""),
             "an unknown expected version is not a match"
         );
+        // A component that is not a number must not read as zero: that made
+        // every one of these a match.
+        assert!(!version_matches("2.5.2.beta", "2.5.2"));
+        assert!(!version_matches("2.5.x", "2.5"));
+        assert!(!version_matches("garbage", "0"));
+        assert!(!version_matches("", "2.5.2"));
 
         // This test binary carries the crate's own version resource, so it
         // stands in for a correctly built release asset.
@@ -2216,13 +2234,16 @@ mod tests {
             .expect_err("a build that calls itself something else must be refused");
         assert!(error.contains("9.9.9"), "got {error}");
 
-        // A file with no version resource is not a mismatch; there is nothing
-        // to compare.
+        // A file with no version resource is refused rather than passed: every
+        // asset this project publishes carries one, so its absence means the
+        // payload is not a build of this program.
         let dir = TestDir::new("download-version");
         let plain = dir.join("plain.exe");
         std::fs::write(&plain, b"not a PE file").unwrap();
-        assert!(verify_download_version(&plain, "2.5.2").is_ok());
         assert_eq!(file_product_version(&plain), None);
+        let error = verify_download_version(&plain, "2.5.2")
+            .expect_err("a payload with no version resource must be refused");
+        assert!(error.contains("no ProductVersion"), "got {error}");
     }
 
     /// The parent process's own image path is what identifies the install, and

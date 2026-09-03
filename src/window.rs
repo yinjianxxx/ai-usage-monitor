@@ -22,9 +22,7 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentThreadId, ReleaseMutex, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{
@@ -705,20 +703,31 @@ const WIDGET_TOOLTIP_WINDOW_CLASS_NAME: &str = "GengchouWidgetTooltip";
 /// not reflected until the next poll), and be findable by class name so a
 /// second launched instance can ask us to show the detail popup.
 const BROADCAST_WINDOW_CLASS_NAME: &str = "GengchouBroadcast";
-/// Base name of the single-instance mutex.
+/// The file whose exclusive handle is the single-instance guard.
 ///
-/// What must not run twice is not "Gengchou on this machine" but "Gengchou
-/// over one data directory". Settings and the usage cache live under
-/// `%APPDATA%`, so two Windows accounts share no file and have nothing to
-/// exclude each other over, while two sessions of one account (console plus
-/// RDP) share every file and must. The plain machine-wide name this replaces
-/// had the wrong scope: a second signed-in user's launch returned
-/// `ERROR_ALREADY_EXISTS` or `ACCESS_DENIED`, and both of those ended startup
-/// without a window, a tray icon, or a message.
+/// A file, not a named kernel object, because what must not have two writers
+/// is a *directory of files*, and every way of encoding that directory into a
+/// name was wrong somewhere. A `Global\` name can fail to be created and fall
+/// back to a per-session `Local\` one, which stops excluding the other session
+/// of the same account - two processes then write one `settings.json`. A name
+/// derived from a hash of the path treats the same directory reached through a
+/// short (8.3) name, a `.` component, or a different drive spelling as a
+/// different directory.
 ///
-/// The name still carries `Gengchou`, which is the identity constraint in
-/// docs/INVARIANTS.md; what changed is its scope, not the app's identity.
-const INSTANCE_MUTEX_BASE: &str = "Gengchou-Instance-v2";
+/// Holding the directory's own file open with no sharing has neither problem.
+/// It is the same file however the path is spelled, it excludes across
+/// sessions and accounts because the filesystem does, and Windows releases it
+/// when the process ends however it ends - so there is no stale lock to
+/// reason about. Two accounts have different data directories and so never
+/// collide; two sessions of one account have the same one and always do.
+///
+/// Nothing is ever written to it.
+const INSTANCE_LOCK_FILE_NAME: &str = "instance.lock";
+/// `ERROR_SHARING_VIOLATION`: someone already holds the guard.
+const ERROR_SHARING_VIOLATION_CODE: i32 = 32;
+/// A relaunch waits out the instance it is replacing; a fresh launch does not.
+const RELAUNCH_LOCK_ATTEMPTS: u32 = 30;
+const RELAUNCH_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const DETAIL_POPUP_WIDTH: i32 = 408;
 /// Title area above the first provider group.
 const DETAIL_HEADER_H: i32 = 52;
@@ -11948,17 +11957,13 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// Holding this file open with no sharing is the single-instance guard.
+///
+/// Nothing is written to it; the open handle is the whole mechanism, and
+/// dropping it releases the guard.
 pub(crate) struct InstanceGuard {
-    handle: HANDLE,
-}
-
-impl Drop for InstanceGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
-        }
-    }
+    #[allow(dead_code)]
+    lock: std::fs::File,
 }
 
 /// Why a launch is not going to become the running instance.
@@ -12015,8 +12020,8 @@ fn try_acquire_single_instance(is_relaunch: bool) -> Result<InstanceGuard, Insta
         return Err(InstanceRefusal::HandedOff);
     }
 
-    let handle = acquire_named_mutex(&mutex_names(), is_relaunch)?;
-    Ok(InstanceGuard { handle })
+    let lock = acquire_instance_lock(instance_lock_path()?, is_relaunch)?;
+    Ok(InstanceGuard { lock })
 }
 
 fn report_instance_refusal(refusal: &InstanceRefusal) {
@@ -12041,118 +12046,88 @@ fn instance_refusal_message(refusal: &InstanceRefusal, strings: Strings) -> Opti
     }
 }
 
-/// The single-instance mutex names to try, in order.
-///
-/// `Global\` first so two sessions of one account still exclude each other;
-/// `Local\` as the fallback for a `Global\` name that cannot be opened, which
-/// keeps this session single-instanced rather than losing the guard
-/// altogether. The suffix is the data directory, lowercased before hashing
-/// because Windows paths compare case-insensitively.
-///
-/// Deriving it from the directory rather than from the account also follows
-/// the `%APPDATA%` -> config -> `%LOCALAPPDATA%` fallback chain for free: two
-/// processes exclude each other exactly when they would write the same files.
-fn mutex_names() -> [String; 2] {
-    #[allow(unused_mut)]
-    let mut suffix = data_directory_mutex_suffix(settings::app_data_directory());
-
-    #[cfg(debug_assertions)]
-    if let Some(test_suffix) = std::env::var_os("GENGCHOU_TEST_MUTEX_SUFFIX") {
-        if !test_suffix.is_empty() {
-            suffix = format!("{suffix}-{}", test_suffix.to_string_lossy());
-        }
-    }
-
-    instance_mutex_names(&suffix)
+/// Where the single-instance guard lives: inside the directory it protects.
+fn instance_lock_path() -> Result<std::path::PathBuf, InstanceRefusal> {
+    let directory = settings::app_data_directory().map_err(|error| {
+        InstanceRefusal::Unavailable(format!("the data directory is unavailable: {error}"))
+    })?;
+    // The first run has no directory yet, and the guard has to be taken before
+    // anything is loaded or saved.
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        InstanceRefusal::Unavailable(format!("unable to create {}: {error}", directory.display()))
+    })?;
+    Ok(directory.join(INSTANCE_LOCK_FILE_NAME))
 }
 
-fn instance_mutex_names(suffix: &str) -> [String; 2] {
-    [
-        format!("Global\\{INSTANCE_MUTEX_BASE}-{suffix}"),
-        format!("Local\\{INSTANCE_MUTEX_BASE}-{suffix}"),
-    ]
-}
-
-/// Hash the data directory into the mutex name's suffix.
+/// Take the guard by opening its file with no sharing.
 ///
-/// Both degraded paths return a fixed suffix, which puts every account that
-/// hits them back on one shared machine-wide guard. That is the old behavior,
-/// not a new failure, but it is never silent: it is the only way the name can
-/// stop distinguishing accounts.
-fn data_directory_mutex_suffix(directory: std::io::Result<std::path::PathBuf>) -> String {
-    let directory = match directory {
-        Ok(directory) => directory,
-        Err(error) => {
-            diagnose::log(format!(
-                "unable to resolve the data directory for the single-instance name: {error}"
-            ));
-            return "unresolved".to_string();
-        }
+/// A relaunch waits, because the instance it is replacing is on its way out;
+/// `WAIT_ABANDONED` has no analogue to handle here, since Windows closes the
+/// handle when that process ends however it ends.
+fn acquire_instance_lock(
+    path: std::path::PathBuf,
+    is_relaunch: bool,
+) -> Result<std::fs::File, InstanceRefusal> {
+    let attempts = if is_relaunch {
+        RELAUNCH_LOCK_ATTEMPTS
+    } else {
+        1
     };
-    let key = directory.to_string_lossy().to_lowercase();
-    match updater::sha256_hex(key.as_bytes()) {
-        Ok(digest) if digest.len() >= 16 => digest[..16].to_string(),
-        Ok(digest) => {
-            diagnose::log(format!(
-                "single-instance name digest was too short ({} chars)",
-                digest.len()
-            ));
-            "unhashed".to_string()
+    let mut refusal = InstanceRefusal::Unavailable("no attempt was made".to_string());
+    for attempt in 1..=attempts {
+        match open_instance_lock(&path) {
+            Ok(lock) => return Ok(lock),
+            Err(next) => refusal = next,
         }
-        Err(error) => {
+        if attempt < attempts {
             diagnose::log(format!(
-                "unable to hash the data directory for the single-instance name: {error}"
+                "relaunch: {} is still held after attempt {attempt}/{attempts}",
+                path.display()
             ));
-            "unhashed".to_string()
+            std::thread::sleep(RELAUNCH_LOCK_RETRY_INTERVAL);
         }
+    }
+    match &refusal {
+        InstanceRefusal::RunningElsewhere if is_relaunch => {
+            diagnose::log("startup aborted: previous instance never released the lock");
+            Err(InstanceRefusal::PreviousInstanceStuck)
+        }
+        InstanceRefusal::RunningElsewhere => {
+            diagnose::log(format!(
+                "startup aborted: {} is held by another instance",
+                path.display()
+            ));
+            Err(refusal)
+        }
+        InstanceRefusal::Unavailable(detail) => {
+            diagnose::log(format!(
+                "startup aborted: unable to take the guard: {detail}"
+            ));
+            Err(refusal)
+        }
+        other => Err(other.clone()),
     }
 }
 
-fn acquire_named_mutex(names: &[String; 2], is_relaunch: bool) -> Result<HANDLE, InstanceRefusal> {
-    let mut last_error = String::from("no mutex name was tried");
-    for name in names {
-        let mutex_name = native_interop::wide_str(name);
-        unsafe {
-            let handle = match CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    last_error = format!("{name}: {error}");
-                    continue;
-                }
-            };
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                return Ok(handle);
-            }
-            if !is_relaunch {
-                // The name carries the scope: a `Global\` one is held across
-                // sessions, a `Local\` one within this session.
-                diagnose::log(format!("startup aborted: {name} is already held"));
-                let _ = CloseHandle(handle);
-                return Err(InstanceRefusal::RunningElsewhere);
-            }
+fn open_instance_lock(path: &std::path::Path) -> Result<std::fs::File, InstanceRefusal> {
+    use std::os::windows::fs::OpenOptionsExt;
 
-            diagnose::log(format!(
-                "relaunch: waiting for previous instance mutex {name}"
-            ));
-            for attempt in 1..=3 {
-                let wait_result = WaitForSingleObject(handle, 10_000);
-                if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
-                    return Ok(handle);
-                }
-                diagnose::log(format!(
-                    "relaunch: previous instance still owns {name} after wait {attempt}/3 ({wait_result:?})"
-                ));
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        // The point of the whole exercise: no other handle may be opened
+        // while this one lives.
+        .share_mode(0)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION_CODE) {
+                InstanceRefusal::RunningElsewhere
+            } else {
+                InstanceRefusal::Unavailable(format!("{}: {error}", path.display()))
             }
-            let _ = CloseHandle(handle);
-            diagnose::log("startup aborted: previous instance never released the mutex");
-            return Err(InstanceRefusal::PreviousInstanceStuck);
-        }
-    }
-    diagnose::log_error(
-        "startup aborted: unable to create single-instance mutex",
-        &last_error,
-    );
-    Err(InstanceRefusal::Unavailable(last_error))
+        })
 }
 
 /// Ask an instance already running on this desktop to show its detail popup,
@@ -18815,42 +18790,78 @@ mod reset_notification_tests {
         assert_eq!(bottom_right_default_position(work, 2_000, 1_100, 8), (8, 8));
     }
 
+    /// Two data directories never exclude each other; one always excludes
+    /// itself, however its path is spelled.
+    ///
+    /// The spelling half is why this is a file and not a name derived from the
+    /// path: a hash cannot see that `DIR~1` and `.\` components and a
+    /// lowercase drive letter all name one directory, and every difference it
+    /// could not see was a second writer on one `settings.json`.
     #[test]
-    fn two_accounts_get_two_single_instance_names_and_one_account_gets_one() {
-        let alice = data_directory_mutex_suffix(Ok(PathBuf::from(
-            r"C:\Users\alice\AppData\Roaming\Gengchou",
-        )));
-        let bob = data_directory_mutex_suffix(Ok(PathBuf::from(
-            r"C:\Users\bob\AppData\Roaming\Gengchou",
-        )));
-        assert_ne!(
-            alice, bob,
-            "two accounts must not serialize on one machine-wide guard"
-        );
+    fn the_guard_follows_the_directory_and_not_the_spelling_of_its_path() {
+        let root = std::env::temp_dir().join(format!(
+            "gengchou-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let alice = root.join("alice").join("Gengchou");
+        let bob = root.join("bob").join("Gengchou");
+        std::fs::create_dir_all(&alice).expect("alice's data directory");
+        std::fs::create_dir_all(&bob).expect("bob's data directory");
 
-        // Windows paths compare case-insensitively, so the same directory
-        // spelled differently in two sessions must still exclude itself.
-        let alice_shouting = data_directory_mutex_suffix(Ok(PathBuf::from(
-            r"C:\USERS\ALICE\APPDATA\ROAMING\GENGCHOU",
-        )));
-        assert_eq!(alice, alice_shouting);
+        let alice_lock = alice.join(INSTANCE_LOCK_FILE_NAME);
+        let held = open_instance_lock(&alice_lock).expect("the first instance takes the guard");
 
-        let names = instance_mutex_names(&alice);
-        assert_eq!(names[0], format!("Global\\{INSTANCE_MUTEX_BASE}-{alice}"));
-        assert_eq!(names[1], format!("Local\\{INSTANCE_MUTEX_BASE}-{alice}"));
+        // A second account shares no file and must not be excluded.
         assert!(
-            names[0].starts_with("Global\\"),
-            "the cross-session name must be tried first"
+            open_instance_lock(&bob.join(INSTANCE_LOCK_FILE_NAME)).is_ok(),
+            "two accounts have nothing to exclude each other over"
         );
+
+        // The same directory, spelled differently, is still the same file -
+        // including from another session of the same account, which is the
+        // case that shares every file.
+        assert_eq!(
+            open_instance_lock(&alice_lock).unwrap_err(),
+            InstanceRefusal::RunningElsewhere
+        );
+        let detoured = alice.join(".").join(INSTANCE_LOCK_FILE_NAME);
+        assert_eq!(
+            open_instance_lock(&detoured).unwrap_err(),
+            InstanceRefusal::RunningElsewhere,
+            "a `.` component does not make it a different directory"
+        );
+        let shouting = PathBuf::from(alice_lock.to_string_lossy().to_uppercase());
+        assert_eq!(
+            open_instance_lock(&shouting).unwrap_err(),
+            InstanceRefusal::RunningElsewhere,
+            "Windows paths compare case-insensitively"
+        );
+
+        // Windows releases the handle when the holder ends, however it ends.
+        drop(held);
+        assert!(
+            open_instance_lock(&alice_lock).is_ok(),
+            "the guard must be free once its holder is gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A path that cannot be opened at all is not "someone else is running".
     #[test]
-    fn a_data_directory_that_cannot_be_resolved_falls_back_to_a_fixed_name() {
-        let suffix = data_directory_mutex_suffix(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no APPDATA",
-        )));
-        assert_eq!(suffix, "unresolved");
+    fn a_guard_that_cannot_be_opened_is_reported_as_unusable() {
+        let missing = std::env::temp_dir()
+            .join(format!("gengchou-no-such-dir-{}", std::process::id()))
+            .join("nested")
+            .join(INSTANCE_LOCK_FILE_NAME);
+        assert!(matches!(
+            open_instance_lock(&missing),
+            Err(InstanceRefusal::Unavailable(_))
+        ));
     }
 
     #[test]

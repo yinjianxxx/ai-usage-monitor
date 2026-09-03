@@ -31,26 +31,41 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// `wsl.exe` beside a test binary the decoy ran, and the real one only ran
 /// once the decoy was removed.
 ///
-/// `GetSystemDirectoryW` rather than `%SystemRoot%`, because an environment
-/// variable can be pointed elsewhere. If it ever fails there is nothing better
-/// to fall back to than the bare name, which is what every call site did
-/// before; that fallback is logged rather than passed over.
+/// `GetSystemDirectoryW` first, rather than `%SystemRoot%`, because an
+/// environment variable can be pointed elsewhere. `%SystemRoot%\System32` is
+/// tried only if that call fails, because a spoofable absolute path is still
+/// strictly better than the bare name: the bare name resolves against this
+/// executable's own directory, which is the hole this function exists to
+/// close. Falling back to it would have reopened that hole on the one path
+/// nobody tests.
 pub fn system_program(name: &str) -> PathBuf {
     static SYSTEM_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
     let directory = SYSTEM_DIRECTORY.get_or_init(|| {
         let mut buffer = [0u16; 260];
         let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
-        if length == 0 || length > buffer.len() {
-            crate::diagnose::log(
-                "unable to resolve the Windows system directory; system programs fall back to a bare name",
-            );
-            return None;
+        if length > 0 && length <= buffer.len() {
+            return Some(PathBuf::from(OsString::from_wide(&buffer[..length])));
         }
-        Some(PathBuf::from(OsString::from_wide(&buffer[..length])))
+        let from_environment = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join("System32"));
+        crate::diagnose::log(match &from_environment {
+            Some(root) => format!(
+                "unable to resolve the Windows system directory; using {}",
+                root.display()
+            ),
+            None => "unable to resolve the Windows system directory, and SystemRoot is unusable"
+                .to_string(),
+        });
+        from_environment
     });
     match directory {
         Some(directory) => directory.join(name),
-        None => PathBuf::from(name),
+        // Nothing absolute is available. A bare name here would run whatever
+        // sits beside a portable build, so keep it absolute and let the launch
+        // fail loudly instead.
+        None => PathBuf::from(r"\\?\GLOBALROOT\SystemRoot\System32").join(name),
     }
 }
 
@@ -100,10 +115,14 @@ pub fn run_with_timeout(
             }
             Ok(None) => {
                 end_process_tree(&job, &mut child);
-                // The readers see EOF as soon as the write ends close; joining
-                // keeps them from outliving this call.
-                let _ = collect(stdout);
-                let _ = collect(stderr);
+                // Deliberately not joined. The output is discarded on this
+                // path, and a reader only finishes at EOF - which never comes
+                // if a descendant that escaped the job inherited the write
+                // end. Joining here turned a reported timeout into a caller
+                // that never returns at all, hanging the poll thread for the
+                // life of the process.
+                drop(stdout);
+                drop(stderr);
                 return Err(ProcessRunError::TimedOut);
             }
             // A `try_wait` failure means this child can no longer be observed,
@@ -112,19 +131,27 @@ pub fn run_with_timeout(
             // with nobody left to end them.
             Err(_) => {
                 end_process_tree(&job, &mut child);
-                let _ = collect(stdout);
-                let _ = collect(stderr);
+                drop(stdout);
+                drop(stderr);
                 return Err(ProcessRunError::WaitFailed);
             }
         }
     };
 
+    // The child has exited, so every write end it owned is closed and the
+    // readers are at EOF already. The grace covers the one case where they are
+    // not: a descendant that escaped the job before it was assigned, still
+    // holding the inherited pipe. Waiting on that forever is the same hang as
+    // the timeout path above, so it is bounded and reported.
     Ok(std::process::Output {
         status,
-        stdout: collect(stdout)?,
-        stderr: collect(stderr)?,
+        stdout: collect(stdout, DRAIN_GRACE)?,
+        stderr: collect(stderr, DRAIN_GRACE)?,
     })
 }
+
+/// How long a reader may still take once the child itself has exited.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// End the child and everything it started, then reap it.
 fn end_process_tree(job: &Option<ProcessTreeJob>, child: &mut std::process::Child) {
@@ -137,25 +164,33 @@ fn end_process_tree(job: &Option<ProcessTreeJob>, child: &mut std::process::Chil
     let _ = child.wait();
 }
 
-type DrainHandle = Option<std::thread::JoinHandle<Vec<u8>>>;
+type DrainHandle = Option<std::sync::mpsc::Receiver<Vec<u8>>>;
 
 fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> DrainHandle {
     pipe.map(|mut pipe| {
+        // A channel rather than a `JoinHandle`, because a join cannot be
+        // bounded and this wait has to be.
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
             let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
-            buffer
-        })
+            let _ = sender.send(buffer);
+        });
+        receiver
     })
 }
 
-fn collect(handle: DrainHandle) -> Result<Vec<u8>, ProcessRunError> {
-    match handle {
-        // A reader that panicked has no output to report and no empty answer
-        // that would be honest, so it is a failed run rather than a silent one.
-        Some(handle) => handle.join().map_err(|_| ProcessRunError::WaitFailed),
-        None => Ok(Vec::new()),
-    }
+fn collect(handle: DrainHandle, grace: std::time::Duration) -> Result<Vec<u8>, ProcessRunError> {
+    let Some(handle) = handle else {
+        return Ok(Vec::new());
+    };
+    handle.recv_timeout(grace).map_err(|error| {
+        // Either the reader is still blocked on a pipe somebody else holds
+        // open, or it died without sending. Neither has output to report, and
+        // an empty answer would not be honest.
+        crate::diagnose::log(format!("a child's output could not be collected: {error}"));
+        ProcessRunError::WaitFailed
+    })
 }
 
 /// A job object holding one child and everything it goes on to start.

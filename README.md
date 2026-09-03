@@ -322,6 +322,7 @@ raising a false sign-in warning.
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
 | Diagnostics (append-only within each generation; rotated while running; current plus one `.old`) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 | A settings file that could not be read, kept aside rather than lost; one generation | `%APPDATA%\Gengchou\settings.json.corrupt` |
+| An empty file whose open handle is the single-instance guard; nothing is written to it | `%APPDATA%\Gengchou\instance.lock` |
 
 If `%APPDATA%` is unavailable, settings and the usage cache fall back to the
 Windows configuration directory and then `%LOCALAPPDATA%`. If no durable path
