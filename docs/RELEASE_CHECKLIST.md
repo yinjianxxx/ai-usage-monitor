@@ -31,6 +31,12 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   providers on FirstRun, Rescan, Manual, poll, and the credential watch.
 - Confirm tests cover the 4 MiB JSON response ceiling, settings/cache stale
   snapshot rejection, and diagnostic-log runtime/external rotation.
+- Two updater behaviours are covered by unit tests only, deliberately, and do
+  not need a live run recorded each release: the staging-directory reparse
+  check (creating a real junction needs privileges this suite does not assume)
+  and the recycled-pid case of the update-target check (a live run cannot
+  arrange a recycled pid). Design limits that are accepted rather than open are
+  listed under *Known limits* in [`INVARIANTS.md`](INVARIANTS.md).
 - When a release adds a provider, state the downgrade consequence in the
   release notes. `provider_order` stores provider names, and a build that does
   not know one of them cannot use the file: v2.5.0 and later drop the unknown
@@ -397,6 +403,15 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   run manifest validation, and inspect the complete diff before submitting.
 - Submit `ynjmxn.Gengchou` only after the matching GitHub release is public,
   then wait for the WinGet validation pipeline and review.
-- After the WinGet pull request is merged, install the public package on a
-  clean Windows profile, confirm the installed command is `gengchou`, and test
-  launch, update detection, and uninstall.
+- After the WinGet pull request is merged, confirm the version directory exists
+  under `manifests/y/ynjmxn/Gengchou/` in the public registry.
+
+Installing the merged package on a clean Windows profile is **permanently out
+of scope**, at the owner's instruction, along with the real-machine upgrade
+matrix. This is a single-machine, single-user project with no clean profile to
+install into, and a row that is never run is worse than no row: it makes every
+release record either dishonest or cluttered with the same exception. What
+stands in for it: the WinGet validation pipeline installs and uninstalls the
+package before merge, the submitted manifest is generated from the public
+release ZIP and its released SHA-256, and the release assets are verified
+against `SHA256SUMS` and GitHub attestations before publication.
