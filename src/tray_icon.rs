@@ -9,8 +9,9 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
     ExtractIconExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO,
     NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_LARGE_ICON, NIIF_NONE, NIIF_NOSOUND, NIIF_USER,
-    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT,
-    NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4, NOTIFY_ICON_INFOTIP_FLAGS,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION,
+    NIN_BALLOONUSERCLICK, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+    NOTIFY_ICON_INFOTIP_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -67,6 +68,10 @@ pub enum TrayAction {
         kind: Option<TrayIconKind>,
         anchor_to_icon: bool,
     },
+    /// The user clicked the balloon itself. What that offers, if anything, is
+    /// `take_balloon_click`; the icon it arrived on says nothing, because a
+    /// balloon is delivered to whichever icon the tray happened to have.
+    BalloonClicked,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -632,7 +637,39 @@ unsafe fn deliver_balloon(
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
 }
 
+/// What clicking the balloon now on screen offers.
+///
+/// Kept here because every balloon is raised through this module, which makes
+/// it the one place that can guarantee the offer belongs to the balloon the
+/// user actually saw: raising any other balloon replaces it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BalloonClick {
+    /// Offer this version, the way the update menu entry would.
+    Update { version: String },
+}
+
+static BALLOON_CLICK: Mutex<Option<BalloonClick>> = Mutex::new(None);
+
+fn set_balloon_click(click: Option<BalloonClick>) {
+    *BALLOON_CLICK.lock().unwrap_or_else(|e| e.into_inner()) = click;
+}
+
+/// Take what the balloon the user just clicked offers, if it offers anything.
+///
+/// Taking clears it: an offer is answered once. It is deliberately not
+/// cleared when the balloon times out, because a balloon that has left the
+/// screen can still be clicked from the Windows notification centre, and that
+/// click deserves the same answer as the one on the banner.
+pub fn take_balloon_click() -> Option<BalloonClick> {
+    BALLOON_CLICK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 /// Show a Windows balloon notification from a provider's tray icon.
+///
+/// Clicking it does nothing; provider news is news, not an offer.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
@@ -640,7 +677,7 @@ pub fn notify_balloon(
     title: &str,
     message: &str,
 ) {
-    notify_balloon_anchored(hwnd, Some(kind), tone, title, message);
+    notify_balloon_anchored(hwnd, Some(kind), tone, title, message, None);
 }
 
 /// Show a balloon that belongs to the app rather than to one provider.
@@ -648,8 +685,14 @@ pub fn notify_balloon(
 /// An available update is nobody's provider news, so the app icon is the
 /// anchor to try first; the same fallback walk still applies, because
 /// detailed mode removes that icon.
-pub fn notify_app_balloon(hwnd: HWND, tone: BalloonTone, title: &str, message: &str) {
-    notify_balloon_anchored(hwnd, None, tone, title, message);
+pub fn notify_app_balloon(
+    hwnd: HWND,
+    tone: BalloonTone,
+    title: &str,
+    message: &str,
+    click: Option<BalloonClick>,
+) {
+    notify_balloon_anchored(hwnd, None, tone, title, message, click);
 }
 
 fn notify_balloon_anchored(
@@ -658,7 +701,12 @@ fn notify_balloon_anchored(
     tone: BalloonTone,
     title: &str,
     message: &str,
+    click: Option<BalloonClick>,
 ) {
+    // Before delivery, and unconditionally: whatever the last balloon offered
+    // is gone the moment this one takes its place on screen, so a click on
+    // the new balloon can never answer the old one's question.
+    set_balloon_click(click);
     unsafe {
         let balloon_icon = match tone {
             BalloonTone::Info => cached_balloon_icon(hwnd),
@@ -1246,6 +1294,44 @@ mod tests {
         }
     }
 
+    /// A balloon is delivered to whichever icon the tray happens to have, so
+    /// the click must be recognised whatever icon id it arrives on, and it
+    /// must not be mistaken for a click on the icon itself.
+    #[test]
+    fn a_balloon_click_is_recognised_on_any_icon() {
+        for id in [APP_TRAY_ICON_ID, TrayIconKind::Grok.id()] {
+            let clicked = LPARAM(((id << 16) | NIN_BALLOONUSERCLICK) as usize as isize);
+            assert_eq!(
+                handle_message(clicked),
+                TrayAction::BalloonClicked,
+                "id {id}"
+            );
+        }
+    }
+
+    /// An offer is answered once, and only by the balloon that made it: the
+    /// next balloon to appear replaces it, so a click on a quota-reset or
+    /// provider-detection balloon can never start an update.
+    #[test]
+    fn only_the_balloon_on_screen_carries_an_offer() {
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.9".to_string(),
+        }));
+        set_balloon_click(None);
+        assert_eq!(take_balloon_click(), None, "a later balloon replaced it");
+
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.9".to_string(),
+        }));
+        assert_eq!(
+            take_balloon_click(),
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            })
+        );
+        assert_eq!(take_balloon_click(), None, "taking answers it once");
+    }
+
     #[test]
     fn version_four_callback_decodes_icon_and_keyboard_events() {
         let select = LPARAM(((TrayIconKind::Codex.id() << 16) | NIN_KEYSELECT) as usize as isize);
@@ -1409,6 +1495,7 @@ pub fn handle_message(lparam: LPARAM) -> TrayAction {
             kind,
             anchor_to_icon: true,
         },
+        NIN_BALLOONUSERCLICK => TrayAction::BalloonClicked,
         _ => TrayAction::None,
     }
 }

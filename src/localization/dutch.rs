@@ -46,7 +46,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "Bijwerken naar",
     update_available: "Update beschikbaar",
     update_prompt_now: "Versie {version} is beschikbaar. Wil je nu bijwerken?",
-    update_available_balloon_body: "Versie {version} is beschikbaar. Open {settings} in het systeemvakmenu om bij te werken.",
+    update_available_balloon_body: "Versie {version} is beschikbaar. Klik op deze melding om bij te werken, of open {settings} in het systeemvakmenu.",
     exit: "Afsluiten",
     show_widget: "Taakbalkwidget",
     show_floating_monitor: "Zwevend venster",

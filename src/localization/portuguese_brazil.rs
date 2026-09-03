@@ -46,7 +46,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "Atualizar para",
     update_available: "Atualização disponível",
     update_prompt_now: "Versão {version} está disponível. Deseja atualizar agora?",
-    update_available_balloon_body: "A versão {version} está disponível. Abra {settings} no menu da bandeja para atualizar.",
+    update_available_balloon_body: "A versão {version} está disponível. Clique nesta notificação para atualizar ou abra {settings} no menu da bandeja.",
     exit: "Sair",
     show_widget: "Widget da barra de tarefas",
     show_floating_monitor: "Janela flutuante",

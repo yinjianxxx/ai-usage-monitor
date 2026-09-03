@@ -9975,7 +9975,102 @@ fn announce_update_balloon(hwnd: HWND, strings: Strings, latest: &str) {
         tray_icon::BalloonTone::Info,
         strings.update_available,
         &body,
+        Some(tray_icon::BalloonClick::Update {
+            version: latest.to_string(),
+        }),
     );
+}
+
+/// What the version entry under Settings does when it is clicked.
+///
+/// The entry's own text is already the answer ("Update to X"), so a known
+/// release is taken straight to the install; only an unanswered or remembered
+/// state costs a fresh check first.
+fn run_version_action(hwnd: HWND) {
+    let (install_channel, release) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (
+                s.install_channel,
+                match &s.update_status {
+                    UpdateStatus::Available(release) => Some(release.clone()),
+                    _ => None,
+                },
+            ),
+            None => (InstallChannel::Portable, None),
+        }
+    };
+
+    match install_channel {
+        InstallChannel::Winget => {
+            if release.is_some() {
+                begin_winget_update(hwnd);
+            } else {
+                begin_update_check(hwnd, true);
+            }
+        }
+        InstallChannel::Portable => {
+            if let Some(release) = release {
+                begin_update_apply(hwnd, release);
+            } else {
+                begin_update_check(hwnd, true);
+            }
+        }
+    }
+}
+
+/// Answer a click on the update balloon.
+///
+/// Unlike the menu entry, whose text is the answer, a balloon body is easy to
+/// hit by accident - so this asks before it replaces the executable. Saying
+/// yes then takes exactly the route the menu entry takes. An offer that no
+/// longer matches what is known (already applied, or a check running) is sent
+/// through a fresh interactive check, which answers in the dialog it always
+/// did rather than acting on a stale claim.
+///
+/// The two guards live here so they can be tested without a window: the click
+/// must answer the version the balloon offered, and nothing else may be in
+/// flight.
+fn balloon_offer_is_current(known: Option<&str>, offered: &str, busy: bool) -> bool {
+    !busy && known == Some(offered)
+}
+
+fn offer_update_from_balloon(hwnd: HWND, offered: &str) {
+    let (strings, install_channel, release) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => {
+                let known = match &s.update_status {
+                    UpdateStatus::Available(release) => Some(release),
+                    _ => None,
+                };
+                let current = balloon_offer_is_current(
+                    known.map(|release| release.latest_version.as_str()),
+                    offered,
+                    update_status_is_busy(&s.update_status),
+                );
+                (
+                    s.language.strings(),
+                    s.install_channel,
+                    known.filter(|_| current).cloned(),
+                )
+            }
+            None => return,
+        }
+    };
+
+    let Some(release) = release else {
+        begin_update_check(hwnd, true);
+        return;
+    };
+
+    if !show_update_prompt(strings, &release) {
+        return;
+    }
+    match install_channel {
+        InstallChannel::Portable => begin_update_apply(hwnd, release),
+        InstallChannel::Winget => begin_winget_update(hwnd),
+    }
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
@@ -14146,36 +14241,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     trigger_manual_refresh(hwnd);
                 }
                 IDM_VERSION_ACTION => {
-                    let (install_channel, release) = {
-                        let state = lock_state();
-                        match state.as_ref() {
-                            Some(s) => (
-                                s.install_channel,
-                                match &s.update_status {
-                                    UpdateStatus::Available(release) => Some(release.clone()),
-                                    _ => None,
-                                },
-                            ),
-                            None => (InstallChannel::Portable, None),
-                        }
-                    };
-
-                    match install_channel {
-                        InstallChannel::Winget => {
-                            if release.is_some() {
-                                begin_winget_update(hwnd);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                        InstallChannel::Portable => {
-                            if let Some(release) = release {
-                                begin_update_apply(hwnd, release);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                    }
+                    run_version_action(hwnd);
                 }
                 2 => {
                     request_quit(hwnd);
@@ -14499,6 +14565,14 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     match kind {
                         Some(kind) => tray_icon::restore_focus(hwnd, kind),
                         None => tray_icon::restore_app_focus(hwnd),
+                    }
+                }
+                tray_icon::TrayAction::BalloonClicked => {
+                    if let Some(tray_icon::BalloonClick::Update { version }) =
+                        tray_icon::take_balloon_click()
+                    {
+                        diagnose::log(format!("update balloon clicked for {version}"));
+                        offer_update_from_balloon(hwnd, &version);
                     }
                 }
                 tray_icon::TrayAction::None => {}
@@ -16272,6 +16346,21 @@ mod reset_notification_tests {
             );
             assert!(!body.contains('{'), "{} leftover: {body}", language.code());
         }
+    }
+
+    /// A click can arrive long after the balloon was raised - from the
+    /// notification centre, or on a balloon that has since been overtaken.
+    /// Acting on what the balloon said rather than on what is true now would
+    /// replace the executable on a claim nobody rechecked.
+    #[test]
+    fn a_balloon_click_only_acts_on_the_version_it_offered() {
+        assert!(balloon_offer_is_current(Some("9.9.9"), "9.9.9", false));
+        assert!(!balloon_offer_is_current(Some("9.9.8"), "9.9.9", false));
+        assert!(!balloon_offer_is_current(None, "9.9.9", false));
+        assert!(
+            !balloon_offer_is_current(Some("9.9.9"), "9.9.9", true),
+            "a check or install already in flight must not be cut in front of"
+        );
     }
 
     /// Declining the one-time prompt must read nothing, no matter what the
