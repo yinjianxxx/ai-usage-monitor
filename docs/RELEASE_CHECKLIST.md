@@ -38,6 +38,16 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   file**, fall back to defaults, and overwrite the user's layout, language, and
   provider selection on the next save. Downgrading across that boundary is a
   settings reset, not a rollback.
+- The same applies to any new `#[serde(tag = ...)]` variant, not just provider
+  names. `widget_placement`, `floating_placement` and `last_update_outcome`
+  became tolerant of an unknown variant in v2.5.2 - an older build there loses
+  that one field and keeps the file - but **v2.5.1 and earlier reject the whole
+  settings file** the same way. Adding a variant is therefore a downgrade
+  consequence to state in the release notes, exactly like adding a provider.
+- An unreadable settings file is kept as `settings.json.corrupt` and reported
+  once; only one generation is kept. Returning defaults is not a read-only
+  outcome, so any change that makes the parse stricter has to keep that rescue
+  ahead of the first save.
 - Before each Gengchou minor release (`vX.Y.0`), review the pinned Rust toolchain
   and principal dependencies and record whether an upgrade is justified.
   Between minor releases, review them immediately only for a security advisory,
@@ -49,11 +59,34 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - Debug compact-surface gate: `cargo run --locked -- --dump-widget
   tmp/compact-release-check`; inspect every generated theme, warning/error,
   High Contrast, tooltip, and mixed-digit alignment fixture.
+- Every regression test added for this release asserts on the production path,
+  not on a helper or a copy of the value under test, and each one is
+  mutation-checked: revert the behaviour it names and watch it fail. Two v2.5.1
+  tests were written against a field-for-field copy of the detection scope and
+  against an unchanged intersection helper, and stayed green under the exact
+  revert they claimed to guard.
+- An independent agent reviews the release candidate read-only before the tag,
+  with the already-dispositioned findings listed so it does not repeat them.
+  The v2.5.1 final review returned two accepted blockers after four earlier
+  rounds, one of them a regression introduced by the round before it.
 
 ## Manual Windows smoke test
 
 - Start one instance, launch the EXE again, and confirm the existing detail
   popup opens without a second resident process.
+- With Gengchou running, sign in as a second Windows account and start it
+  there. It must come up with its own widget, tray icons and settings; the two
+  must not see each other. Then, from the first account, use Fast User
+  Switching to open a second session of that same account and launch it: this
+  one must refuse and say so, because both sessions write one `settings.json`.
+  A refusal that closes without a dialog is a failure. If a second account is
+  not available, record that this row was skipped rather than marking it
+  passed.
+- Confirm `%APPDATA%\Gengchou\instance.lock` exists while the app runs, stays
+  empty, and cannot be opened by anything else until the app exits. Kill the
+  process rather than exiting it and confirm the next launch still starts:
+  Windows releases the handle, so there is no stale lock to clear, and any
+  future change that adds one is a regression.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
 - On a fresh profile, confirm exactly one permission prompt appears, covering
@@ -128,6 +161,14 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   plus `diagnose.log.old` remain. Rename the current file externally, create a
   replacement, and confirm the next line follows the replacement rather than
   the renamed file.
+- Corrupt `settings.json` - a UTF-8 BOM is enough, and PowerShell 5.1's
+  `Set-Content -Encoding utf8` writes one - then start. Confirm the original
+  bytes are kept at `settings.json.corrupt`, that one warning names that path,
+  and that the run then behaves like a fresh profile. Repeat once more and
+  confirm only the newer original is kept. Do this while an update is being
+  applied too: the readiness confirmation must complete before that warning,
+  otherwise the helper's 30-second budget expires behind the dialog and rolls
+  the update back.
 - Confirm Refresh is one submenu whose first item is Refresh now, followed by a
   separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
   minutes); exercise Refresh now and each interval once. While a slow manual
@@ -168,6 +209,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   continues while inactive. The widget must stay hidden rather than appearing
   as a desktop popup, then re-embed from cached state as soon as the taskbar
   returns.
+- Walk every entry point of a behaviour that has more than one, not just the
+  one that is easiest to reach. Granting a pending provider is reachable from
+  **Provider access** and from the review inside **Detect providers again**;
+  the v2.5.1 walk-through used the first and shipped a defect that only the
+  second exposed.
 - Confirm Provider tray icons, Widget, and Floating Window appear in that
   order before Settings as direct checked toggles. Confirm the taskbar and
   floating-window position resets remain under Settings and no floating-window
@@ -249,9 +295,17 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 
 ## Update and release hand-off
 
-- Verify a portable update releases the old PID and single-instance mutex,
+- Verify a portable update releases the old PID and the single-instance lock,
   replaces the target, starts one new PID, and preserves the rollback backup
   until the new process reports ready.
+- Run the updater helper directly with a target that is not this install -
+  `--apply-update <some other file> <payload> <a dead pid> <payload sha256>` -
+  and confirm it exits non-zero, leaves that file byte-identical, and creates
+  no `.old` beside it. Repeat with a live but unrelated parent PID. Both must
+  refuse before anything is replaced or launched.
+- Point the release's own download at a build whose `ProductVersion` differs
+  from the announced tag and confirm the portable update refuses it after the
+  hash check rather than installing it.
 - Hold the confirmed `gengchou.exe.old` backup open without delete sharing and
   launch normally: the app must still reach its UI, log the exact deferred
   cleanup path, then remove the backup on the next launch after the handle is

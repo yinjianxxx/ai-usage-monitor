@@ -168,15 +168,40 @@ impl PartialEq for IncomingAccess {
     }
 }
 
+/// Read an optional tagged enum, treating a value this build cannot represent
+/// as absent instead of failing the whole file.
+///
+/// A `#[serde(tag = ...)]` enum rejects a tag it does not know, and one
+/// rejected field fails `SettingsFile` entirely - which meant the user's
+/// layout, language, provider selection and consent record were replaced by
+/// defaults on the next save. `provider_order` already drops names it does not
+/// know for exactly this reason; these are the remaining fields that could
+/// carry a value a future build writes and this one has never seen.
+///
+/// The cost is bounded and one-way: installing an older build after a newer
+/// one loses the single setting the older build cannot express, and loses it
+/// for good once that build saves. Losing one field beats losing the file.
+fn unknown_variant_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(T::deserialize(value).ok())
+}
+
 /// Deserialization DTO. Pending and revoked are `Option` so a missing key is
 /// distinct from an explicit `false`.
 #[derive(Deserialize)]
 struct SettingsFileWire {
     #[serde(default)]
     placement_schema_version: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unknown_variant_as_none")]
     widget_placement: Option<WidgetPlacement>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unknown_variant_as_none")]
     floating_placement: Option<FloatingPlacement>,
     #[serde(default)]
     tray_offset: i32,
@@ -190,7 +215,7 @@ struct SettingsFileWire {
     language: Option<String>,
     #[serde(default)]
     last_update_check_unix: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unknown_variant_as_none")]
     last_update_outcome: Option<LastUpdateOutcome>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
@@ -1033,6 +1058,16 @@ pub fn app_data_file(name: &str) -> io::Result<PathBuf> {
     Ok(app_data_dir(APP_DIR_NAME)?.join(name))
 }
 
+/// The directory this process reads settings and the usage cache from.
+///
+/// Exposed so the single-instance guard can be named after the location it
+/// protects instead of after the machine: two accounts resolve different
+/// directories and have nothing to exclude each other over, while two sessions
+/// of one account resolve the same directory and must.
+pub(crate) fn app_data_directory() -> io::Result<PathBuf> {
+    app_data_dir(APP_DIR_NAME)
+}
+
 pub(crate) fn record_persistence_warning(context: &str, error: &dyn std::fmt::Display) {
     let warning = format!("{context}: {error}");
     diagnose::log(format!("persistence warning queued: {warning}"));
@@ -1051,42 +1086,149 @@ pub(crate) fn take_persistence_warning() -> Option<String> {
     })
 }
 
-fn read_settings_content() -> Option<String> {
+/// What was on disk where the settings file should be.
+///
+/// `Missing` and `Unreadable` were once the same `None`, which is what let a
+/// file that exists but cannot be read fall through to defaults with no
+/// rescue: invalid UTF-8, a denied ACL or a sharing violation all took the
+/// "there is nothing here" path, and the first save then overwrote the
+/// original. Only `Missing` is genuinely nothing.
+enum SettingsContent {
+    Missing,
+    Text(String),
+    Unreadable(String),
+}
+
+fn read_settings_content() -> SettingsContent {
     let current_path = match settings_path_for(APP_DIR_NAME) {
         Ok(path) => path,
         Err(error) => {
             record_persistence_warning("Unable to locate the settings directory", &error);
-            return None;
+            // Without a path there is no file to preserve and nowhere to put
+            // it; defaults are all that is left.
+            return SettingsContent::Missing;
         }
     };
-    match std::fs::read_to_string(&current_path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            record_persistence_warning("Unable to read settings", &error);
+    let read = std::fs::read_to_string(&current_path);
+    if let Err(error) = read.as_ref() {
+        if error.kind() != io::ErrorKind::NotFound {
             diagnose::log_error(
                 &format!("settings read failed path={}", current_path.display()),
-                &error,
+                error,
             );
-            None
         }
+    }
+    classify_settings_read(read)
+}
+
+/// Only "the file is not there" is nothing. Every other read failure means a
+/// file exists that this build cannot use, and losing it to defaults is the
+/// outcome the quarantine exists to prevent.
+fn classify_settings_read(read: io::Result<String>) -> SettingsContent {
+    match read {
+        Ok(content) => SettingsContent::Text(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SettingsContent::Missing,
+        Err(error) => SettingsContent::Unreadable(error.to_string()),
     }
 }
 
 pub(crate) fn load() -> SettingsFile {
-    let Some(content) = read_settings_content() else {
-        return SettingsFile::default();
+    let content = match read_settings_content() {
+        SettingsContent::Missing => return SettingsFile::default(),
+        SettingsContent::Text(content) => content,
+        // A file that cannot be read is preserved on the same terms as one
+        // that cannot be parsed. The reason differs; the consequence of
+        // loading defaults over it does not.
+        SettingsContent::Unreadable(error) => {
+            return defaults_after_unreadable_settings(settings_path_for(APP_DIR_NAME), &error);
+        }
     };
     let settings: SettingsFile = match serde_json::from_str(&content) {
         Ok(settings) => settings,
         Err(error) => {
-            diagnose::log(format!(
-                "settings parse failed; using defaults without overwriting the file: {error}"
-            ));
-            return SettingsFile::default();
+            return defaults_after_unreadable_settings(settings_path_for(APP_DIR_NAME), &error);
         }
     };
     apply_normalized_load(settings, save)
+}
+
+/// Where an unreadable settings file is kept.
+///
+/// One generation, like the diagnostic log: a second bad file replaces the
+/// first, because the copy worth having is the most recent one.
+fn quarantine_path_for(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".corrupt");
+    path.with_file_name(name)
+}
+
+/// Move an unreadable settings file aside so falling back to defaults cannot
+/// erase it.
+///
+/// Returning defaults does not leave the file alone for long. The defaults
+/// carry `credential_consent_decided = false` and no `last_update_check_unix`,
+/// so startup shows the first-run prompt and runs an update check, and both of
+/// those save: the user's layout, language, provider selection and consent
+/// record were replaced within seconds of launch, with nothing on screen to
+/// say so.
+///
+/// A rename that fails falls back to a copy - on Windows a file another
+/// process still holds open refuses to be renamed but can usually be read. The
+/// original is never deleted, and a failure to preserve it is reported rather
+/// than swallowed.
+fn quarantine_unreadable_settings(path: &Path) -> io::Result<PathBuf> {
+    let quarantined = quarantine_path_for(path);
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => Ok(quarantined),
+        Err(rename_error) => match std::fs::copy(path, &quarantined) {
+            Ok(_) => Ok(quarantined),
+            Err(_) => Err(rename_error),
+        },
+    }
+}
+
+/// Everything `load` does when the file cannot be parsed: keep the original,
+/// surface it, and start from defaults.
+///
+/// Taking the path as an argument so this can be asserted end to end on a
+/// throwaway file - `load` itself resolves the real `%APPDATA%` location, and
+/// a test that called it would rewrite the user's own settings. The warning is
+/// the half that was missing entirely: the old path wrote one diagnostic line
+/// and nothing reached the user.
+fn defaults_after_unreadable_settings(
+    path: io::Result<PathBuf>,
+    error: &dyn std::fmt::Display,
+) -> SettingsFile {
+    let path = match path {
+        Ok(path) => path,
+        Err(path_error) => {
+            diagnose::log(format!("settings could not be loaded: {error}"));
+            record_persistence_warning("Unable to locate the settings file", &path_error);
+            return SettingsFile::default();
+        }
+    };
+    match quarantine_unreadable_settings(&path) {
+        Ok(quarantined) => {
+            diagnose::log(format!(
+                "settings could not be loaded; original kept at {} and defaults loaded: {error}",
+                quarantined.display()
+            ));
+            record_persistence_warning(
+                "The settings file could not be read. A copy was kept and defaults were loaded",
+                &format!("{}\n{error}", quarantined.display()),
+            );
+        }
+        Err(keep_error) => {
+            diagnose::log(format!(
+                "settings parse failed and the original could not be kept ({keep_error}); defaults will replace it: {error}"
+            ));
+            record_persistence_warning(
+                "The settings file could not be read and could not be preserved. Defaults will replace it",
+                &format!("{keep_error}\n{error}"),
+            );
+        }
+    }
+    SettingsFile::default()
 }
 
 /// Normalize a just-parsed settings file and try to persist repairs.
@@ -1364,6 +1506,132 @@ mod tests {
     #[test]
     fn malformed_json_is_rejected() {
         assert!(serde_json::from_str::<SettingsFile>("{not-json").is_err());
+    }
+
+    /// A file that exists but cannot be read is not the same as no file.
+    ///
+    /// Both used to return `None`, so invalid UTF-8, a denied ACL and a
+    /// sharing violation all took the "there is nothing here" path: defaults
+    /// loaded with no quarantine, and the first save overwrote the original.
+    /// That is the same data loss the `.corrupt` rescue was added to stop, and
+    /// it left the README's claim about unreadable files overstated.
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_not_treated_as_absent() {
+        assert!(matches!(
+            classify_settings_read(Ok("{}".to_string())),
+            SettingsContent::Text(content) if content == "{}"
+        ));
+        assert!(
+            matches!(
+                classify_settings_read(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))),
+                SettingsContent::Missing
+            ),
+            "a first run has nothing to preserve"
+        );
+
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(
+                    classify_settings_read(Err(io::Error::new(kind, "unreadable"))),
+                    SettingsContent::Unreadable(_)
+                ),
+                "{kind:?} leaves a real file on disk that defaults would erase"
+            );
+        }
+    }
+
+    /// An unreadable settings file must be kept, not silently replaced.
+    ///
+    /// Falling back to defaults is not a read-only outcome: the defaults carry
+    /// no consent decision and no update-check timestamp, so startup shows the
+    /// first-run prompt and runs an update check, and both of those save. The
+    /// user's layout, language, provider selection and consent record went
+    /// away within seconds of launch, with only a diagnostic line to show for
+    /// it. Asserted on `defaults_after_unreadable_settings`, which every
+    /// failed load hands off to - a parse failure and, since this round, a
+    /// read failure - so dropping the rescue from it fails here. `load` itself
+    /// resolves the real `%APPDATA%` location and cannot be called from a
+    /// test.
+    #[test]
+    fn an_unreadable_settings_file_is_kept_before_defaults_replace_it() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gengchou-settings-corrupt-test-{}-{nonce}",
+            std::process::id(),
+        ));
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).expect("test directory");
+        std::fs::write(&path, "{not json").expect("seed an unreadable file");
+        let parse_error =
+            serde_json::from_str::<SettingsFile>("{not json").expect_err("the file is unreadable");
+
+        let recovered = defaults_after_unreadable_settings(Ok(path.clone()), &parse_error);
+
+        assert_eq!(
+            recovered.poll_interval_ms,
+            default_poll_interval(),
+            "the caller still starts from defaults"
+        );
+        let kept = root.join("settings.json.corrupt");
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "{not json",
+            "the original bytes must survive"
+        );
+        assert!(
+            !path.exists(),
+            "the unreadable file must be out of the way so the next save is a clean write"
+        );
+
+        // One generation, like the diagnostic log: the newer original wins.
+        std::fs::write(&path, "{also not json").expect("seed a second unreadable file");
+        defaults_after_unreadable_settings(Ok(path.clone()), &parse_error);
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{also not json");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A value a newer build wrote must cost that one field, not the file.
+    ///
+    /// These are `#[serde(tag = ...)]` enums, so an unknown tag failed
+    /// `SettingsFile` outright and the defaults that replaced it were saved
+    /// moments later - the downgrade reset the release checklist already
+    /// documents for `provider_order`, which is the one field that was made
+    /// tolerant at the time. These are the rest of them.
+    #[test]
+    fn a_placement_or_outcome_from_a_newer_build_costs_only_that_field() {
+        let settings = parse_settings(
+            r#"{
+                "widget_placement": {"mode": "orbiting_the_cursor"},
+                "floating_placement": {"mode": "orbiting_the_cursor"},
+                "last_update_outcome": {"result": "downloading"},
+                "language": "ja",
+                "poll_interval_ms": 60000,
+                "show_grok": true
+            }"#,
+        );
+
+        assert!(settings.widget_placement.is_none());
+        assert!(settings.floating_placement.is_none());
+        assert_eq!(settings.last_update_outcome, None);
+        assert_eq!(
+            settings.language.as_deref(),
+            Some("ja"),
+            "the rest of the file must survive"
+        );
+        assert_eq!(settings.poll_interval_ms, POLL_1_MIN);
+        assert!(settings.show_grok);
+
+        // A variant this build does know is still read.
+        let known = parse_settings(r#"{"widget_placement": {"mode": "primary_left"}}"#);
+        assert_eq!(known.widget_placement, Some(WidgetPlacement::PrimaryLeft));
     }
 
     #[test]

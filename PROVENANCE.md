@@ -24,7 +24,7 @@ supported installations completed it, v2.3.0 retired the bridge.
 |---|---|---|
 | Package and EXE | claude-code-usage-monitor | gengchou |
 | Version line | 1.4.x | 2.x |
-| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\Gengchou (v2.2.4 temporarily held the retired project mutex during the bridge) |
+| Single instance | Global\ClaudeCodeUsageMonitor mutex | Exclusive handle on `%APPDATA%\Gengchou\instance.lock` (v2.2.4 temporarily held the retired project mutex during the bridge; v2.5.1 and earlier used a machine-wide `Global\Gengchou` mutex) |
 | Window class | ClaudeCodeUsageMonitor | Gengchou |
 | Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\Gengchou |
 | Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\Gengchou\diagnose.log |

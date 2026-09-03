@@ -216,6 +216,18 @@ pub fn credential_consent_copy(language: LanguageId) -> CredentialConsentCopy {
 pub struct Strings {
     pub locale_name: &'static str,
     pub window_title: &'static str,
+    /// Shown when a launch cannot become the running instance and there is no
+    /// existing window on this desktop to bring forward. Usually a second
+    /// session of the same account, so the wording names that as likely rather
+    /// than asserting it. Without this the launch simply exited.
+    pub instance_already_running: &'static str,
+    /// Shown when the single-instance guard itself could not be created. The
+    /// Win32 error is appended untranslated.
+    pub instance_lock_failed: &'static str,
+    /// Shown once when diagnostic logging could not be started. The reason is
+    /// appended untranslated. Without it the app runs with no black box at
+    /// all: the panic hook writes to that same log.
+    pub diagnostics_unavailable: &'static str,
     pub refresh: &'static str,
     pub refresh_now: &'static str,
     pub one_minute: &'static str,

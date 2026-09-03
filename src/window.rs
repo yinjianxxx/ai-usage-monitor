@@ -22,9 +22,7 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentThreadId, ReleaseMutex, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{
@@ -610,6 +608,19 @@ impl PollCoordinator {
         self.force_claude_refresh.store(false, Ordering::Release);
     }
 
+    /// Release ownership after a pass unwound.
+    ///
+    /// The coalesced follow-up is dropped on purpose: re-running the pass that
+    /// just panicked would panic again. Clearing `in_flight` last means a
+    /// request racing this call can lose its refresh, which the periodic poll
+    /// timer makes good on the next tick - the alternative, leaving
+    /// `in_flight` set, loses every refresh for the life of the process.
+    fn abandon_pass(&self) {
+        self.pending.store(false, Ordering::Release);
+        self.force_claude_refresh.store(false, Ordering::Release);
+        self.in_flight.store(false, Ordering::Release);
+    }
+
     /// Return true when this worker should immediately perform the one
     /// coalesced follow-up pass. The second check closes the race where a
     /// request arrives between the first pending check and releasing ownership.
@@ -630,6 +641,42 @@ impl PollCoordinator {
 }
 
 static POLL_COORDINATOR: PollCoordinator = PollCoordinator::new();
+
+/// Releases the poll coordinator if the pass it covers unwinds.
+///
+/// `in_flight` is what keeps a second worker from starting, so a pass that
+/// unwound past `finish_pass` left it set for the life of the process: every
+/// later request was collapsed into a pending pass that nobody ran, and usage
+/// froze while the app itself kept running. `Cargo.toml` deliberately keeps
+/// panics unwinding rather than aborting, so the thread really does come apart
+/// here.
+struct PollPassGuard<'a> {
+    coordinator: Option<&'a PollCoordinator>,
+}
+
+impl<'a> PollPassGuard<'a> {
+    fn arm(coordinator: &'a PollCoordinator) -> Self {
+        Self {
+            coordinator: Some(coordinator),
+        }
+    }
+
+    /// The pass returned normally; leave ownership to `finish_pass`.
+    fn finished(mut self) {
+        self.coordinator = None;
+    }
+}
+
+impl Drop for PollPassGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(coordinator) = self.coordinator {
+            diagnose::log(
+                "poll pass panicked; releasing the coordinator so a later request can start a new worker",
+            );
+            coordinator.abandon_pass();
+        }
+    }
+}
 
 fn watchdog_needs_taskbar_recovery(
     widget_exists: bool,
@@ -656,7 +703,31 @@ const WIDGET_TOOLTIP_WINDOW_CLASS_NAME: &str = "GengchouWidgetTooltip";
 /// not reflected until the next poll), and be findable by class name so a
 /// second launched instance can ask us to show the detail popup.
 const BROADCAST_WINDOW_CLASS_NAME: &str = "GengchouBroadcast";
-const CURRENT_MUTEX_NAME: &str = "Global\\Gengchou";
+/// The file whose exclusive handle is the single-instance guard.
+///
+/// A file, not a named kernel object, because what must not have two writers
+/// is a *directory of files*, and every way of encoding that directory into a
+/// name was wrong somewhere. A `Global\` name can fail to be created and fall
+/// back to a per-session `Local\` one, which stops excluding the other session
+/// of the same account - two processes then write one `settings.json`. A name
+/// derived from a hash of the path treats the same directory reached through a
+/// short (8.3) name, a `.` component, or a different drive spelling as a
+/// different directory.
+///
+/// Holding the directory's own file open with no sharing has neither problem.
+/// It is the same file however the path is spelled, it excludes across
+/// sessions and accounts because the filesystem does, and Windows releases it
+/// when the process ends however it ends - so there is no stale lock to
+/// reason about. Two accounts have different data directories and so never
+/// collide; two sessions of one account have the same one and always do.
+///
+/// Nothing is ever written to it.
+const INSTANCE_LOCK_FILE_NAME: &str = "instance.lock";
+/// `ERROR_SHARING_VIOLATION`: someone already holds the guard.
+const ERROR_SHARING_VIOLATION_CODE: i32 = 32;
+/// A relaunch waits out the instance it is replacing; a fresh launch does not.
+const RELAUNCH_LOCK_ATTEMPTS: u32 = 30;
+const RELAUNCH_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const DETAIL_POPUP_WIDTH: i32 = 408;
 /// Title area above the first provider group.
 const DETAIL_HEADER_H: i32 = 52;
@@ -857,6 +928,23 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "GENGCHOU_LAST_RELAUNCH_UNIX";
 /// keeps failing. The child is flagged via `ENV_RELAUNCH` so it waits for this
 /// instance's single-instance mutex to be released before taking over (see the
 /// guard in `run`).
+/// The command a watchdog relaunch runs.
+///
+/// Split out so a test can assert what it does to the environment: this is the
+/// only child that inherits the whole environment, so it is where an update
+/// transaction's readiness marker has to be cleared. A relaunched process that
+/// inherited it would take a finished transaction for an active one and refuse
+/// to start.
+fn relaunch_command(exe: &std::path::Path, args: &[String], now: u64) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .env(ENV_RELAUNCH, "1")
+        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .env_remove(updater::UPDATE_READY_ENV);
+    command
+}
+
 fn relaunch_self() {
     // Back off if we are relaunching very soon after the relaunch that spawned
     // us: that signals the shell is crash-looping, not a one-off restart.
@@ -879,12 +967,7 @@ fn relaunch_self() {
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
+    match relaunch_command(&exe, &args, now).spawn() {
         Ok(_) => {
             diagnose::log("watchdog: relaunched fresh instance, exiting old one");
             std::process::exit(0);
@@ -1115,6 +1198,48 @@ fn request_process_quit() {
 /// from under us). The taskbar widget is never shown as a desktop popup: when
 /// the shell is unavailable it stays hidden until a later shell event or the
 /// watchdog can verify a successful re-attachment.
+/// Every fixed-interval timer a revived widget has to arm, with the window it
+/// is armed on being the widget itself.
+///
+/// One list rather than a run of `arm_timer` calls, because this set has
+/// already drifted once: a recreated widget was left without its tray-order
+/// sample and the fallback ordering check stopped at the first Explorer
+/// restart.
+///
+/// `widget_is_poll_controller` is the degraded path. `poll_controller_hwnd`
+/// answers with the process-level broadcast helper when it exists and with the
+/// widget otherwise, and `WM_TIMER` only ever reaches the window a timer was
+/// armed on - so when `create_broadcast_helper` failed at startup, polling,
+/// the credential watch and the periodic provider sweep are all armed on the
+/// widget and die with it. The helper, when it exists, outlives the widget and
+/// keeps them, which is why the normal path re-arms nothing but its own.
+///
+/// Only a recreated widget lost anything: re-arming a survivor's poll timer
+/// would push the next poll out by a whole interval every time Explorer
+/// restarts. `TIMER_COUNTDOWN`, `TIMER_RESET_POLL` and `TIMER_UPDATE_CHECK`
+/// are deliberately absent - each is scheduled from current state by its own
+/// function, which the revival path calls.
+fn revive_timer_plan(
+    widget_was_recreated: bool,
+    widget_is_poll_controller: bool,
+    poll_interval_ms: u32,
+    auth_watch_active: bool,
+) -> Vec<(usize, u32, &'static str)> {
+    let mut plan = vec![(TIMER_TRAY_ORDER, TRAY_ORDER_SAMPLE_MS, "tray order sample")];
+    if widget_was_recreated && widget_is_poll_controller {
+        plan.push((TIMER_POLL, poll_interval_ms, "poll"));
+        plan.push((
+            TIMER_PROVIDER_DETECT,
+            PROVIDER_DETECT_INTERVAL_MS,
+            "provider detection",
+        ));
+        if auth_watch_active {
+            plan.push((TIMER_AUTH_WATCH, AUTH_WATCH_INTERVAL_MS, "auth watch"));
+        }
+    }
+    plan
+}
+
 unsafe fn revive_execute() {
     if QUIT_REQUESTED.load(Ordering::SeqCst) {
         clear_reviving();
@@ -1144,7 +1269,8 @@ unsafe fn revive_execute() {
         }
     };
 
-    let hwnd = if IsWindow(existing_hwnd).as_bool() {
+    let widget_was_recreated = !IsWindow(existing_hwnd).as_bool();
+    let hwnd = if !widget_was_recreated {
         diagnose::log("revival: window still alive; re-attaching only");
         existing_hwnd
     } else {
@@ -1225,6 +1351,45 @@ unsafe fn revive_execute() {
     // therefore did not stop while this taskbar child was absent.
     schedule_countdown_timer();
     schedule_auto_update_check(hwnd);
+    // Timers belong to the window they were set on, so a recreated widget
+    // starts with none. The WinEvent hook that `attach_to_taskbar` reinstalls
+    // catches a drag, but the periodic sample is what notices an order change
+    // the hook missed - without this it stopped for good at the first Explorer
+    // restart. When the broadcast helper could not be created at startup this
+    // widget is also the poll controller, so polling, the credential watch and
+    // the provider sweep died with the old window too; `revive_timer_plan`
+    // owns that whole set.
+    let widget_is_poll_controller = live_broadcast_helper_hwnd().is_none();
+    if widget_was_recreated && widget_is_poll_controller {
+        // Session notifications were registered on the window Explorer just
+        // destroyed, and they are what tells this process the session locked
+        // or disconnected.
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() {
+            diagnose::log("revival: session notifications could not be re-registered");
+        }
+    }
+    {
+        let mut state = lock_state();
+        let (poll_interval_ms, auth_watch_active) = state
+            .as_ref()
+            .map(|s| (s.poll_interval_ms, s.auth_watch_active))
+            .unwrap_or((POLL_5_MIN, false));
+        for (timer, interval_ms, label) in revive_timer_plan(
+            widget_was_recreated,
+            widget_is_poll_controller,
+            poll_interval_ms,
+            auth_watch_active,
+        ) {
+            match (timer, state.as_mut()) {
+                // Goes through `arm_poll_timer` so `next_poll_deadline` stays
+                // in step with the timer that was actually set.
+                (TIMER_POLL, Some(s)) => arm_poll_timer(s, hwnd, interval_ms),
+                _ => {
+                    arm_timer(hwnd, timer, interval_ms, label);
+                }
+            }
+        }
+    }
 
     REVIVE_ATTEMPTS.store(0, Ordering::SeqCst);
     clear_reviving();
@@ -4664,6 +4829,50 @@ fn spawn_provider_detection(reason: DetectionReason) {
     });
 }
 
+/// What a finished detection pass is allowed to change.
+struct DetectionOutcome {
+    after: settings::ProviderVisibility,
+    announcements: Vec<tray_icon::TrayIconKind>,
+    changed: bool,
+}
+
+/// Decide a finished pass against the scope that is current *now*.
+///
+/// The worker sampled its scope before it started, and a provider can be
+/// revoked or moved to pending while it was out reading credentials - a WSL
+/// probe alone can take seconds. Applying the raw result would let a stale
+/// "found it" undo a revocation the user made in the meantime, and on the
+/// Manual path that also re-enables the provider, so its token goes out on the
+/// next poll. Kept as a pure function so that guarantee is testable without an
+/// `AppState`; the caller's remaining job is to sample the scope and the
+/// visibility in the same locked section it writes the answer back to.
+fn resolve_detection(
+    reason: DetectionReason,
+    detected: poller::DetectedProviders,
+    before: settings::ProviderVisibility,
+    scope: poller::DetectionScope,
+) -> DetectionOutcome {
+    let detected = mask_detection(detected, scope);
+    let mut after = before;
+    let announcements = match reason {
+        DetectionReason::FirstRun => {
+            settings::apply_first_run_detection(&mut after, detected);
+            Vec::new()
+        }
+        DetectionReason::Manual => {
+            settings::apply_manual_detection(&mut after, detected);
+            Vec::new()
+        }
+        DetectionReason::Rescan => settings::take_detection_announcements(&mut after, detected),
+    };
+    let changed = after != before;
+    DetectionOutcome {
+        after,
+        announcements,
+        changed,
+    }
+}
+
 fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedProviders) {
     let (changed, announcements, language) = {
         let mut state = lock_state();
@@ -4674,24 +4883,20 @@ fn apply_provider_detection(reason: DetectionReason, detected: poller::DetectedP
         if !s.credential_consent_granted {
             return;
         }
-        // A single provider can be revoked or moved to pending mid-pass too.
-        // The scope was sampled before the worker started, so a stale result
-        // must be masked against the current reason-specific scope.
-        let detected = mask_detection(detected, credential_read_scope(s, reason.into()));
-        let before = state_provider_visibility(s);
-        let mut after = before;
-        let announcements = match reason {
-            DetectionReason::FirstRun => {
-                settings::apply_first_run_detection(&mut after, detected);
-                Vec::new()
-            }
-            DetectionReason::Manual => {
-                settings::apply_manual_detection(&mut after, detected);
-                Vec::new()
-            }
-            DetectionReason::Rescan => settings::take_detection_announcements(&mut after, detected),
-        };
-        let changed = after != before;
+        // Scope, decision and write-back all inside this one lock: a
+        // revocation cannot slip between reading the scope and applying the
+        // answer.
+        let outcome = resolve_detection(
+            reason,
+            detected,
+            state_provider_visibility(s),
+            credential_read_scope(s, reason.into()),
+        );
+        let DetectionOutcome {
+            after,
+            announcements,
+            changed,
+        } = outcome;
         if changed {
             apply_provider_visibility(s, after);
             s.provider_refresh_states.reset_hidden(
@@ -9630,6 +9835,25 @@ fn show_pending_persistence_warning_once() {
     show_error_message(strings.settings, &message);
 }
 
+/// Say once that this run has no diagnostic log.
+///
+/// `take_init_error` is destructive, so this is one-shot by construction: the
+/// detail popup and the floating window must not each raise it again.
+fn show_diagnostics_unavailable_once() {
+    let Some(error) = diagnose::take_init_error() else {
+        return;
+    };
+    let strings = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.language.strings())
+            .unwrap_or(LanguageId::English.strings())
+    };
+    let message = format!("{}\n\n{error}", strings.diagnostics_unavailable);
+    show_error_message(strings.window_title, &message);
+}
+
 fn show_update_prompt(strings: Strings, release: &ReleaseDescriptor) -> bool {
     let message = strings
         .update_prompt_now
@@ -11355,56 +11579,81 @@ fn spawn_credential_watch_check() {
     if CREDENTIAL_WATCH_BUSY.swap(true, Ordering::AcqRel) {
         return;
     }
-    std::thread::spawn(|| {
-        let watch = {
-            let mut state = lock_state();
-            state.as_mut().and_then(|s| {
-                if !s.auth_watch_active {
-                    return None;
-                }
-                let scope = credential_read_scope(s, CredentialReadReason::CredentialWatch);
-                let Some(mode) = credential_watch_mode_for_shown(
-                    scope.claude,
-                    scope.codex,
-                    scope.antigravity,
-                    scope.grok,
-                ) else {
-                    diagnose::log(
-                        "credential watch stopped: no provider is in scope for a credential read",
-                    );
-                    s.auth_watch_active = false;
-                    s.auth_watch_snapshot.clear();
-                    return None;
-                };
-                Some((
-                    mode,
-                    s.auth_watch_mode == mode,
-                    s.auth_watch_snapshot.clone(),
-                ))
-            })
-        };
-        if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
-            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-            let changed = current_snapshot != previous_snapshot;
-            if credential_watch_outcome(baseline_matches, changed) == CredentialWatchOutcome::Repoll
+    std::thread::spawn(|| hold_credential_watch_busy(run_credential_watch_check));
+}
+
+/// Clears `CREDENTIAL_WATCH_BUSY` when the guard goes out of scope.
+///
+/// That flag is what stops the 15-second timer from stacking checks on top of
+/// a slow probe, so a panic that unwound past a plain store at the end of the
+/// check left it set for the life of the process: the credential watch never
+/// ran again, silently, while polling carried on as if nothing had happened.
+struct CredentialWatchBusyGuard;
+
+impl Drop for CredentialWatchBusyGuard {
+    fn drop(&mut self) {
+        CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Run `check` and release the busy flag however it ends.
+///
+/// Taking the check as an argument so the release contract can be asserted
+/// with a check that panics, on the function the spawned thread calls rather
+/// than on the guard alone: dropping the guard from this call site would leave
+/// a guard-only test green.
+fn hold_credential_watch_busy(check: impl FnOnce()) {
+    let _busy = CredentialWatchBusyGuard;
+    check();
+}
+
+fn run_credential_watch_check() {
+    let watch = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| {
+            if !s.auth_watch_active {
+                return None;
+            }
+            let scope = credential_read_scope(s, CredentialReadReason::CredentialWatch);
+            let Some(mode) = credential_watch_mode_for_shown(
+                scope.claude,
+                scope.codex,
+                scope.antigravity,
+                scope.grok,
+            ) else {
+                diagnose::log(
+                    "credential watch stopped: no provider is in scope for a credential read",
+                );
+                s.auth_watch_active = false;
+                s.auth_watch_snapshot.clear();
+                return None;
+            };
+            Some((
+                mode,
+                s.auth_watch_mode == mode,
+                s.auth_watch_snapshot.clone(),
+            ))
+        })
+    };
+    if let Some((watch_mode, baseline_matches, previous_snapshot)) = watch {
+        let current_snapshot = poller::credential_watch_snapshot(watch_mode);
+        let changed = current_snapshot != previous_snapshot;
+        if credential_watch_outcome(baseline_matches, changed) == CredentialWatchOutcome::Repoll {
             {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        if s.auth_watch_active {
-                            // Mode and snapshot together: storing the snapshot
-                            // under a stale mode is what made the next tick
-                            // repeat this pass.
-                            s.auth_watch_mode = watch_mode;
-                            s.auth_watch_snapshot = current_snapshot;
-                        }
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    if s.auth_watch_active {
+                        // Mode and snapshot together: storing the snapshot
+                        // under a stale mode is what made the next tick
+                        // repeat this pass.
+                        s.auth_watch_mode = watch_mode;
+                        s.auth_watch_snapshot = current_snapshot;
                     }
                 }
-                request_poll();
             }
+            request_poll();
         }
-        CREDENTIAL_WATCH_BUSY.store(false, Ordering::Release);
-    });
+    }
 }
 
 unsafe fn handle_auth_watch_timer(hwnd: HWND) {
@@ -11708,78 +11957,187 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// Holding this file open with no sharing is the single-instance guard.
+///
+/// Nothing is written to it; the open handle is the whole mechanism, and
+/// dropping it releases the guard.
 pub(crate) struct InstanceGuard {
-    handle: HANDLE,
+    #[allow(dead_code)]
+    lock: std::fs::File,
 }
 
-impl Drop for InstanceGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
-        }
-    }
+/// Why a launch is not going to become the running instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstanceRefusal {
+    /// An instance is already up on this desktop and was asked to show its
+    /// detail popup. The user got an answer; there is nothing more to say.
+    HandedOff,
+    /// An instance already owns this data directory and there is no window on
+    /// this desktop to bring forward, so this launch has to explain itself
+    /// rather than vanish.
+    ///
+    /// Normally that instance is another session of the same account. It can
+    /// also be one in this session that has no findable broadcast window yet,
+    /// reached through the `Local\` fallback below - which is why the message
+    /// names the likely case rather than asserting it.
+    RunningElsewhere,
+    /// The guard could not be created at all.
+    Unavailable(String),
+    /// A relaunch waited out the previous instance and gave up. Logged, not
+    /// shown: nobody clicked anything, and a dialog raised by the taskbar
+    /// watchdog during sign-out would appear from nowhere.
+    PreviousInstanceStuck,
 }
 
 pub(crate) fn acquire_single_instance() -> Option<InstanceGuard> {
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let handle = acquire_named_mutex(&mutex_name(), is_relaunch)?;
-    Some(InstanceGuard { handle })
-}
-
-fn mutex_name() -> String {
-    #[cfg(debug_assertions)]
-    if let Some(suffix) = std::env::var_os("GENGCHOU_TEST_MUTEX_SUFFIX") {
-        if !suffix.is_empty() {
-            let suffix = suffix.to_string_lossy();
-            return format!("{CURRENT_MUTEX_NAME}-{suffix}");
+    match try_acquire_single_instance(is_relaunch) {
+        Ok(guard) => Some(guard),
+        Err(refusal) => {
+            report_instance_refusal(&refusal);
+            None
         }
     }
-    CURRENT_MUTEX_NAME.to_string()
 }
 
-fn acquire_named_mutex(name: &str, is_relaunch: bool) -> Option<HANDLE> {
-    let mutex_name = native_interop::wide_str(name);
-    unsafe {
-        let handle = match CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) {
-            Ok(handle) => handle,
-            Err(error) => {
-                diagnose::log_error(
-                    "startup aborted: unable to create single-instance mutex",
-                    error,
-                );
-                return None;
-            }
-        };
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            return Some(handle);
-        }
-        if !is_relaunch {
-            notify_existing_instance();
-            diagnose::log("startup aborted: another instance is already running");
-            let _ = CloseHandle(handle);
-            return None;
-        }
+fn try_acquire_single_instance(is_relaunch: bool) -> Result<InstanceGuard, InstanceRefusal> {
+    // Two different questions, answered by two different mechanisms.
+    //
+    // "Is there already a Gengchou on this desktop?" is a window question:
+    // window stations are per session, so finding the broadcast helper proves
+    // the instance is one this user can see right now, whatever build it is.
+    // Handing off to it is what a second double-click should do, and it keeps
+    // working across the release that changes the mutex name below.
+    //
+    // "May I own this data directory?" is the mutex question, and that one has
+    // to reach across sessions.
+    //
+    // A relaunch skips the window check: the instance being replaced may still
+    // have its window while it shuts down, and deferring to it would abandon
+    // the recovery this process exists to perform.
+    if !is_relaunch && notify_existing_instance() {
+        diagnose::log("startup aborted: an instance on this desktop was asked to show details");
+        return Err(InstanceRefusal::HandedOff);
+    }
 
-        diagnose::log(format!(
-            "relaunch: waiting for previous instance mutex {name}"
-        ));
-        for attempt in 1..=3 {
-            let wait_result = WaitForSingleObject(handle, 10_000);
-            if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
-                return Some(handle);
-            }
+    let lock = acquire_instance_lock(instance_lock_path()?, is_relaunch)?;
+    Ok(InstanceGuard { lock })
+}
+
+fn report_instance_refusal(refusal: &InstanceRefusal) {
+    // Settings have not been read yet - reading them here would run the
+    // corrupt-file rescue and queue its warning for a process that is about to
+    // exit - so the language override is unknown and the system language
+    // stands in.
+    let strings = localization::detect_system_language().strings();
+    if let Some(message) = instance_refusal_message(refusal, strings) {
+        show_error_message(strings.window_title, &message);
+    }
+}
+
+/// What to put in front of the user, if anything, when a launch is refused.
+fn instance_refusal_message(refusal: &InstanceRefusal, strings: Strings) -> Option<String> {
+    match refusal {
+        InstanceRefusal::HandedOff | InstanceRefusal::PreviousInstanceStuck => None,
+        InstanceRefusal::RunningElsewhere => Some(strings.instance_already_running.to_string()),
+        InstanceRefusal::Unavailable(detail) => {
+            Some(format!("{}\n\n{detail}", strings.instance_lock_failed))
+        }
+    }
+}
+
+/// Where the single-instance guard lives: inside the directory it protects.
+fn instance_lock_path() -> Result<std::path::PathBuf, InstanceRefusal> {
+    let directory = settings::app_data_directory().map_err(|error| {
+        InstanceRefusal::Unavailable(format!("the data directory is unavailable: {error}"))
+    })?;
+    // The first run has no directory yet, and the guard has to be taken before
+    // anything is loaded or saved.
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        InstanceRefusal::Unavailable(format!("unable to create {}: {error}", directory.display()))
+    })?;
+    Ok(directory.join(INSTANCE_LOCK_FILE_NAME))
+}
+
+/// Take the guard by opening its file with no sharing.
+///
+/// A relaunch waits, because the instance it is replacing is on its way out;
+/// `WAIT_ABANDONED` has no analogue to handle here, since Windows closes the
+/// handle when that process ends however it ends.
+fn acquire_instance_lock(
+    path: std::path::PathBuf,
+    is_relaunch: bool,
+) -> Result<std::fs::File, InstanceRefusal> {
+    let attempts = if is_relaunch {
+        RELAUNCH_LOCK_ATTEMPTS
+    } else {
+        1
+    };
+    let mut refusal = InstanceRefusal::Unavailable("no attempt was made".to_string());
+    for attempt in 1..=attempts {
+        match open_instance_lock(&path) {
+            Ok(lock) => return Ok(lock),
+            Err(next) => refusal = next,
+        }
+        if attempt < attempts {
             diagnose::log(format!(
-                "relaunch: previous instance still owns {name} after wait {attempt}/3 ({wait_result:?})"
+                "relaunch: {} is still held after attempt {attempt}/{attempts}",
+                path.display()
             ));
+            std::thread::sleep(RELAUNCH_LOCK_RETRY_INTERVAL);
         }
-        let _ = CloseHandle(handle);
-        diagnose::log("startup aborted: previous instance never released the mutex");
-        None
+    }
+    match &refusal {
+        InstanceRefusal::RunningElsewhere if is_relaunch => {
+            diagnose::log("startup aborted: previous instance never released the lock");
+            Err(InstanceRefusal::PreviousInstanceStuck)
+        }
+        InstanceRefusal::RunningElsewhere => {
+            diagnose::log(format!(
+                "startup aborted: {} is held by another instance",
+                path.display()
+            ));
+            Err(refusal)
+        }
+        InstanceRefusal::Unavailable(detail) => {
+            diagnose::log(format!(
+                "startup aborted: unable to take the guard: {detail}"
+            ));
+            Err(refusal)
+        }
+        other => Err(other.clone()),
     }
 }
 
-fn notify_existing_instance() {
+fn open_instance_lock(path: &std::path::Path) -> Result<std::fs::File, InstanceRefusal> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        // The point of the whole exercise: no other handle may be opened
+        // while this one lives.
+        .share_mode(0)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION_CODE) {
+                InstanceRefusal::RunningElsewhere
+            } else {
+                InstanceRefusal::Unavailable(format!("{}: {error}", path.display()))
+            }
+        })
+}
+
+/// Ask an instance already running on this desktop to show its detail popup,
+/// reporting whether one was found.
+///
+/// `FindWindowW` searches the calling process's window station and desktop, so
+/// a hit is by construction an instance the user can see right now - and a
+/// miss says nothing about other sessions, which is why the mutex still has to
+/// answer that separately.
+fn notify_existing_instance() -> bool {
     unsafe {
         let helper_class = native_interop::wide_str(BROADCAST_WINDOW_CLASS_NAME);
         if let Ok(existing) = FindWindowW(PCWSTR::from_raw(helper_class.as_ptr()), PCWSTR::null()) {
@@ -11791,9 +12149,11 @@ fn notify_existing_instance() {
                     LPARAM(WM_LBUTTONUP as isize),
                 );
                 diagnose::log("asked existing Gengchou instance to show details");
+                return true;
             }
         }
     }
+    false
 }
 
 pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
@@ -12111,6 +12471,32 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
             "taskbar widget hidden pending shell recovery"
         });
 
+        // Confirm the update transaction here: this is exactly the milestone
+        // `confirm_update_ready` documents - the single-instance mutex is
+        // held, the window and tray icons exist, and the first render is
+        // done - and it is the last point before startup can block on the
+        // user. The helper gives a new build 30 seconds to report ready and
+        // otherwise rolls back to the previous binary, while everything below
+        // can put a modal on screen and wait forever: the first-run consent
+        // prompt, and the persistence warning that fires whenever the last
+        // save failed. An update that landed on either of those was killed and
+        // rolled back while the user was still reading the dialog.
+        if let Err(error) = updater::confirm_update_ready() {
+            diagnose::log(format!(
+                "unable to confirm successful update startup; startup stopped: {error}"
+            ));
+            let strings = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| s.language.strings())
+                    .unwrap_or(LanguageId::English.strings())
+            };
+            let message = format!("{}\n\n{error}", strings.update_failed);
+            show_error_message(strings.updates, &message);
+            return;
+        }
+
         // Show the one-time access prompt only after the compact surface and
         // tray icons exist, so an owner with WS_EX_NOACTIVATE cannot strand
         // the modal before any app UI is visible. This remains before
@@ -12129,6 +12515,9 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
 
         schedule_countdown_timer();
         show_pending_persistence_warning_once();
+        // After confirm_update_ready above, like every other modal: this one
+        // can appear at every launch while a profile stays broken.
+        show_diagnostics_unavailable_once();
 
         // Provider polling belongs to the process-level helper so it survives
         // taskbar/RDP destruction of the embedded widget HWND.
@@ -12160,21 +12549,6 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         // Initial theme check
         check_theme_change();
 
-        if let Err(error) = updater::confirm_update_ready() {
-            diagnose::log(format!(
-                "unable to confirm successful update startup; startup stopped: {error}"
-            ));
-            let strings = {
-                let state = lock_state();
-                state
-                    .as_ref()
-                    .map(|s| s.language.strings())
-                    .unwrap_or(LanguageId::English.strings())
-            };
-            let message = format!("{}\n\n{error}", strings.update_failed);
-            show_error_message(strings.updates, &message);
-            return;
-        }
         if let Some(error) = startup_notice {
             let strings = {
                 let state = lock_state();
@@ -12471,10 +12845,21 @@ fn request_poll_with(force_claude_refresh: bool) {
 }
 
 fn poll_worker() {
+    run_poll_passes(&POLL_COORDINATOR, do_poll);
+}
+
+/// Run coalesced passes until no follow-up is owed.
+///
+/// Separate from `poll_worker`, and taking the coordinator and the pass as
+/// arguments, so the panic contract in `PollPassGuard` can be asserted on the
+/// loop the running app enters rather than on a copy of it.
+fn run_poll_passes(coordinator: &PollCoordinator, mut pass: impl FnMut(u64, bool)) {
     loop {
-        let (generation, force_claude_refresh) = POLL_COORDINATOR.begin_pass();
-        do_poll(generation, force_claude_refresh);
-        if !POLL_COORDINATOR.finish_pass() {
+        let (generation, force_claude_refresh) = coordinator.begin_pass();
+        let guard = PollPassGuard::arm(coordinator);
+        pass(generation, force_claude_refresh);
+        guard.finished();
+        if !coordinator.finish_pass() {
             break;
         }
         diagnose::log("poll request coalesced; starting pending refresh");
@@ -12577,6 +12962,14 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             );
 
             let mut auth_transition_kind = None;
+            // Collected under the lock, sent after it. `Shell_NotifyIconW`
+            // reaches Explorer synchronously, and Explorer can call straight
+            // back into this app's window procedure, which takes `STATE`.
+            // Sending from inside this section - on the poll worker, holding
+            // that lock - put the UI thread and this worker on opposite sides
+            // of the same wait. The other three balloon sites in this file
+            // already release first; this was the one that did not.
+            let mut reset_notifications = Vec::new();
             let mut state = lock_state();
             if !POLL_COORDINATOR.is_current(generation) {
                 diagnose::log(format!(
@@ -12609,7 +13002,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 // reset that elapsed while the app was closed is old news,
                 // not an event worth a balloon (pre-cache behavior: the
                 // first poll of a run never notified).
-                let reset_notifications = if s.data_is_cached {
+                reset_notifications = if s.data_is_cached {
                     Vec::new()
                 } else {
                     collect_reset_notifications(
@@ -12639,17 +13032,6 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 s.last_poll_ok = true;
                 s.last_success_unix = Some(updated_unix);
                 refresh_usage_texts(s);
-
-                for notification in reset_notifications {
-                    diagnose::log(format!("reset notification shown: {}", notification.body));
-                    tray_icon::notify_balloon(
-                        main_hwnd,
-                        notification.kind,
-                        tray_icon::BalloonTone::Info,
-                        &notification.title,
-                        &notification.body,
-                    );
-                }
 
                 s.retry_count = 0;
                 // Re-arm from completion instead of keeping the old periodic
@@ -12710,6 +13092,16 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             // show these numbers immediately.
             let cache_snapshot = state.as_ref().and_then(capture_usage_cache_snapshot);
             drop(state);
+            for notification in reset_notifications {
+                diagnose::log(format!("reset notification shown: {}", notification.body));
+                tray_icon::notify_balloon(
+                    main_hwnd,
+                    notification.kind,
+                    tray_icon::BalloonTone::Info,
+                    &notification.title,
+                    &notification.body,
+                );
+            }
             if let Some(snapshot) = cache_snapshot.as_ref() {
                 save_usage_cache(snapshot);
             }
@@ -13139,6 +13531,12 @@ fn tray_reposition_is_suppressed() -> bool {
 /// own tray icons (and, right after sign-in, every other startup app's)
 /// widens TrayNotifyWnd asynchronously; positioning against a rect that is
 /// still changing is what made the widget visibly jump right after launch.
+///
+/// This blocks the UI thread before the message loop starts, for up to
+/// `max_wait` (3s at the one call site) but normally one 250ms sample. That
+/// used to eat into the updater's fixed 30s readiness budget; it no longer
+/// can, because `confirm_update_ready` now runs earlier. Anything added ahead
+/// of that confirmation puts the budget back at risk - see docs/INVARIANTS.md.
 fn wait_for_tray_geometry_stable(max_wait: Duration) {
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + max_wait;
@@ -14810,6 +15208,133 @@ mod reset_notification_tests {
             .expect("current cache write"));
     }
 
+    /// A recreated widget must get back everything that died with the old one.
+    ///
+    /// `WM_TIMER` only reaches the window a timer was armed on, and
+    /// `recreate_widget_window` hands back a different `HWND`. When the
+    /// broadcast helper could not be created at startup the widget is also the
+    /// poll controller, so polling, the credential watch and the periodic
+    /// provider sweep were armed on the window Explorer just destroyed: with
+    /// nothing to re-arm them the monitor stopped for good at the first
+    /// Explorer restart, silently, while the app kept running. The tray-order
+    /// sample was the same bug found one round earlier, which is why this set
+    /// is data now instead of a run of `arm_timer` calls.
+    #[test]
+    fn a_recreated_widget_gets_back_every_timer_that_died_with_the_old_one() {
+        let ids = |plan: Vec<(usize, u32, &'static str)>| {
+            plan.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>()
+        };
+
+        // Degraded path: the widget is the poll controller.
+        let degraded = revive_timer_plan(true, true, POLL_1_MIN, true);
+        assert_eq!(
+            degraded
+                .iter()
+                .find(|(id, _, _)| *id == TIMER_POLL)
+                .map(|(_, interval, _)| *interval),
+            Some(POLL_1_MIN),
+            "the poll timer must come back on the user's own interval"
+        );
+        let degraded = ids(degraded);
+        for timer in [
+            TIMER_TRAY_ORDER,
+            TIMER_POLL,
+            TIMER_PROVIDER_DETECT,
+            TIMER_AUTH_WATCH,
+        ] {
+            assert!(degraded.contains(&timer), "missing timer {timer}");
+        }
+
+        // The watch is only re-armed when it was actually running.
+        assert!(!ids(revive_timer_plan(true, true, POLL_5_MIN, false)).contains(&TIMER_AUTH_WATCH));
+
+        // Normal path: the helper owns those and outlived the widget, so
+        // re-arming them here would move them onto a window that is not the
+        // controller.
+        assert_eq!(
+            ids(revive_timer_plan(true, false, POLL_1_MIN, true)),
+            vec![TIMER_TRAY_ORDER]
+        );
+
+        // A widget that was never destroyed kept its timers. Re-arming the
+        // poll timer would push the next poll out by a full interval on every
+        // Explorer restart.
+        assert_eq!(
+            ids(revive_timer_plan(false, true, POLL_1_MIN, true)),
+            vec![TIMER_TRAY_ORDER]
+        );
+    }
+
+    /// Serializes the tests that install a panic hook. The hook is
+    /// process-global, so two of them running at once would leave the wrong
+    /// one installed for the rest of the run.
+    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `body`, which is expected to panic, without the default hook
+    /// printing that panic into the test output.
+    fn catch_expected_panic(body: impl FnOnce()) -> bool {
+        let _serialized = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::panic::set_hook(previous);
+        outcome.is_err()
+    }
+
+    /// A poll pass that panics must still hand the coordinator back.
+    ///
+    /// `in_flight` is what keeps a second worker from starting, so a pass that
+    /// unwound past `finish_pass` left it set for the life of the process:
+    /// every later request was collapsed into a pending pass that nobody ran,
+    /// and usage froze while the app itself kept running - silently, because
+    /// the panic hook wrote to a log nobody was reading. Asserted on
+    /// `run_poll_passes`, the loop the running app enters, rather than on
+    /// `PollPassGuard`: a revert that dropped the guard from the loop would
+    /// leave a guard-only test green.
+    #[test]
+    fn a_panicking_poll_pass_releases_the_coordinator() {
+        let coordinator = PollCoordinator::new();
+        assert!(
+            coordinator.request(false),
+            "the first request owns the single worker"
+        );
+
+        let unwound = catch_expected_panic(|| {
+            run_poll_passes(&coordinator, |_, _| panic!("a poll pass panicked"));
+        });
+
+        assert!(
+            unwound,
+            "the panic must still reach the thread boundary so the hook records it"
+        );
+        assert!(
+            coordinator.request(false),
+            "a later request must be able to start a new worker"
+        );
+    }
+
+    /// Same contract for the credential watch, where the damage would be that
+    /// a re-login is never picked up: the busy flag stops the 15-second timer
+    /// from stacking checks on a slow probe, so a panic that unwound past a
+    /// store at the end of the check disabled the watch for good. Asserted on
+    /// `hold_credential_watch_busy`, which is what the spawned thread calls.
+    #[test]
+    fn a_panicking_credential_watch_check_releases_the_busy_flag() {
+        CREDENTIAL_WATCH_BUSY.store(true, Ordering::Release);
+
+        let unwound = catch_expected_panic(|| {
+            hold_credential_watch_busy(|| panic!("a credential watch check panicked"));
+        });
+
+        assert!(unwound, "the panic must still reach the thread boundary");
+        assert!(
+            !CREDENTIAL_WATCH_BUSY.load(Ordering::Acquire),
+            "the busy flag must be released so the next tick can check again"
+        );
+    }
+
     #[test]
     fn update_prompt_is_a_busy_state_until_the_modal_choice_returns() {
         assert!(!update_status_is_busy(&UpdateStatus::Idle));
@@ -15579,6 +16104,40 @@ mod reset_notification_tests {
         );
     }
 
+    /// The watchdog relaunch is the only child that inherits this process's
+    /// whole environment, so an update transaction's readiness marker has to be
+    /// cleared on its command. A relaunched process that inherited it would
+    /// treat a finished transaction as an active one and refuse to start - the
+    /// shape of the v2.4.0 startup failure. This used to be handled by removing
+    /// the variable from the running process, which Rust 2024 turns into an
+    /// `unsafe` operation because worker threads are already reading the
+    /// environment by then.
+    #[test]
+    fn a_relaunch_does_not_inherit_an_update_readiness_marker() {
+        let command = relaunch_command(
+            std::path::Path::new(r"C:\gengchou.exe"),
+            &["--flag".to_string()],
+            1_700_000_000,
+        );
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&(updater::UPDATE_READY_ENV.to_string(), None)),
+            "the readiness marker must be removed, got {envs:?}"
+        );
+        assert!(envs.contains(&(ENV_RELAUNCH.to_string(), Some("1".to_string()))));
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == ENV_LAST_RELAUNCH_UNIX && value.is_some()));
+    }
+
     /// The version entry should state what is known, not offer a chore. Before
     /// the last result was persisted it reset to "check for updates" on every
     /// launch, even though the answer from yesterday was still valid.
@@ -16195,22 +16754,110 @@ mod reset_notification_tests {
         assert!(merged.usage(tray_icon::TrayIconKind::Codex).is_none());
     }
 
-    #[test]
-    fn a_pending_result_cannot_reenable_a_provider() {
-        let found_everything = poller::DetectedProviders {
+    fn found_everything() -> poller::DetectedProviders {
+        poller::DetectedProviders {
             claude: true,
             codex: true,
             antigravity: true,
             grok: true,
-        };
-        let now_pending = poller::DetectionScope {
+        }
+    }
+
+    /// Everything in scope except Claude, which the user just revoked or left
+    /// pending while the pass was out reading credentials.
+    fn scope_without_claude() -> poller::DetectionScope {
+        poller::DetectionScope {
             claude: false,
             codex: true,
             antigravity: true,
             grok: true,
+        }
+    }
+
+    /// The race this guards: the user revokes a provider while a detection
+    /// worker is still out - a WSL probe alone can take seconds - and the
+    /// worker then reports that provider as found. Asserted on
+    /// `resolve_detection`, which is what the running app calls, rather than
+    /// on `mask_detection`, which is only the helper it uses: a revert that
+    /// dropped the mask from the decision would leave the helper untouched.
+    #[test]
+    fn a_result_that_arrives_after_a_revocation_cannot_reenable_a_provider() {
+        // Manual is the dangerous one: it assigns visibility from what it
+        // found, so an unmasked result puts the provider back on screen and
+        // back in the poll.
+        let before = settings::ProviderVisibility {
+            show_codex: true,
+            allow_codex_credentials: true,
+            codex_announced: true,
+            claude_announced: true,
+            ..Default::default()
         };
-        let applied = mask_detection(found_everything, now_pending);
-        assert!(!applied.claude);
+        let outcome = resolve_detection(
+            DetectionReason::Manual,
+            found_everything(),
+            before,
+            scope_without_claude(),
+        );
+        assert!(
+            !outcome.after.show_claude_code,
+            "a revoked provider must not be shown again by a stale result"
+        );
+        assert!(
+            !outcome.after.allow_claude_credentials,
+            "and it must not regain credential access"
+        );
+        assert!(outcome.after.show_antigravity && outcome.after.show_grok);
+    }
+
+    /// Same for the periodic sweep, where the damage would be a balloon for a
+    /// provider the user just closed rather than a re-enable.
+    #[test]
+    fn a_revoked_provider_is_not_announced_by_a_stale_sweep() {
+        let before = settings::ProviderVisibility {
+            claude_announced: false,
+            codex_announced: true,
+            antigravity_announced: true,
+            grok_announced: true,
+            ..Default::default()
+        };
+        let outcome = resolve_detection(
+            DetectionReason::Rescan,
+            found_everything(),
+            before,
+            scope_without_claude(),
+        );
+        assert!(
+            !outcome
+                .announcements
+                .contains(&tray_icon::TrayIconKind::Claude),
+            "a provider outside the scope owes no balloon"
+        );
+        assert!(!outcome.after.claude_announced);
+    }
+
+    /// First run assigns from what it found, so an out-of-scope provider must
+    /// not be assigned either - and the pass must still report no change when
+    /// the scope leaves nothing to apply.
+    #[test]
+    fn first_run_assigns_only_what_the_scope_allows() {
+        let outcome = resolve_detection(
+            DetectionReason::FirstRun,
+            found_everything(),
+            settings::ProviderVisibility::default(),
+            scope_without_claude(),
+        );
+        assert!(!outcome.after.show_claude_code && !outcome.after.allow_claude_credentials);
+        assert!(outcome.after.show_codex && outcome.after.allow_codex_credentials);
+        assert!(outcome.changed);
+
+        let nothing_in_scope = resolve_detection(
+            DetectionReason::Manual,
+            found_everything(),
+            settings::ProviderVisibility::default(),
+            poller::DetectionScope::default(),
+        );
+        assert!(!nothing_in_scope.changed);
+        assert!(nothing_in_scope.announcements.is_empty());
     }
 
     /// Build a watch set from the fixed Claude/Codex/Antigravity/Grok order
@@ -18141,5 +18788,107 @@ mod reset_notification_tests {
             (1_732, 980)
         );
         assert_eq!(bottom_right_default_position(work, 2_000, 1_100, 8), (8, 8));
+    }
+
+    /// Two data directories never exclude each other; one always excludes
+    /// itself, however its path is spelled.
+    ///
+    /// The spelling half is why this is a file and not a name derived from the
+    /// path: a hash cannot see that `DIR~1` and `.\` components and a
+    /// lowercase drive letter all name one directory, and every difference it
+    /// could not see was a second writer on one `settings.json`.
+    #[test]
+    fn the_guard_follows_the_directory_and_not_the_spelling_of_its_path() {
+        let root = std::env::temp_dir().join(format!(
+            "gengchou-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let alice = root.join("alice").join("Gengchou");
+        let bob = root.join("bob").join("Gengchou");
+        std::fs::create_dir_all(&alice).expect("alice's data directory");
+        std::fs::create_dir_all(&bob).expect("bob's data directory");
+
+        let alice_lock = alice.join(INSTANCE_LOCK_FILE_NAME);
+        let held = open_instance_lock(&alice_lock).expect("the first instance takes the guard");
+
+        // A second account shares no file and must not be excluded.
+        assert!(
+            open_instance_lock(&bob.join(INSTANCE_LOCK_FILE_NAME)).is_ok(),
+            "two accounts have nothing to exclude each other over"
+        );
+
+        // The same directory, spelled differently, is still the same file -
+        // including from another session of the same account, which is the
+        // case that shares every file.
+        assert_eq!(
+            open_instance_lock(&alice_lock).unwrap_err(),
+            InstanceRefusal::RunningElsewhere
+        );
+        let detoured = alice.join(".").join(INSTANCE_LOCK_FILE_NAME);
+        assert_eq!(
+            open_instance_lock(&detoured).unwrap_err(),
+            InstanceRefusal::RunningElsewhere,
+            "a `.` component does not make it a different directory"
+        );
+        let shouting = PathBuf::from(alice_lock.to_string_lossy().to_uppercase());
+        assert_eq!(
+            open_instance_lock(&shouting).unwrap_err(),
+            InstanceRefusal::RunningElsewhere,
+            "Windows paths compare case-insensitively"
+        );
+
+        // Windows releases the handle when the holder ends, however it ends.
+        drop(held);
+        assert!(
+            open_instance_lock(&alice_lock).is_ok(),
+            "the guard must be free once its holder is gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path that cannot be opened at all is not "someone else is running".
+    #[test]
+    fn a_guard_that_cannot_be_opened_is_reported_as_unusable() {
+        let missing = std::env::temp_dir()
+            .join(format!("gengchou-no-such-dir-{}", std::process::id()))
+            .join("nested")
+            .join(INSTANCE_LOCK_FILE_NAME);
+        assert!(matches!(
+            open_instance_lock(&missing),
+            Err(InstanceRefusal::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn only_a_launch_with_nowhere_to_hand_off_to_says_anything() {
+        let strings = LanguageId::English.strings();
+
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::HandedOff, strings),
+            None,
+            "the existing window is the answer; a dialog on top of it is noise"
+        );
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::PreviousInstanceStuck, strings),
+            None,
+            "nobody clicked anything on the watchdog relaunch path"
+        );
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::RunningElsewhere, strings),
+            Some(strings.instance_already_running.to_string())
+        );
+
+        let unavailable = instance_refusal_message(
+            &InstanceRefusal::Unavailable("Global\\X: access denied".to_string()),
+            strings,
+        )
+        .expect("an unusable guard must be reported");
+        assert!(unavailable.starts_with(strings.instance_lock_failed));
+        assert!(unavailable.ends_with("Global\\X: access denied"));
     }
 }

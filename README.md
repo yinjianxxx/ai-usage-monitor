@@ -55,7 +55,9 @@ show the exact pixels the shipped code draws. Regenerate them any time with
   Hover a badge to see every reported window with reset times. Drag the left
   divider to reposition it, or drop it on another taskbar to change monitors.
   If Explorer is temporarily gone, the widget hides and re-embeds rather than
-  landing on the desktop.
+  landing on the desktop. A vertical taskbar is not supported: the badges are
+  laid out along a horizontal bar and are wider than a left- or right-docked
+  one, so use the floating window or the tray icons there.
 - **Floating window.** A separate always-on-top numeric view, not a stretched
   copy of the widget: up to the two highest-usage windows per provider, each
   label, percentage, and countdown aligned above its micro gauge. Drag it from
@@ -319,11 +321,19 @@ raising a false sign-in warning.
 | Settings — including provider permission flags; never tokens | `%APPDATA%\Gengchou\settings.json` |
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
 | Diagnostics (append-only within each generation; rotated while running; current plus one `.old`) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
+| A settings file that could not be read, kept aside rather than lost; one generation | `%APPDATA%\Gengchou\settings.json.corrupt` |
+| An empty file whose open handle is the single-instance guard; nothing is written to it | `%APPDATA%\Gengchou\instance.lock` |
 
 If `%APPDATA%` is unavailable, settings and the usage cache fall back to the
 Windows configuration directory and then `%LOCALAPPDATA%`. If no durable path
 can be used, the app continues for the current session and shows one storage
 warning instead of silently claiming that changes were saved.
+
+A settings file that cannot be read is kept as `settings.json.corrupt` before
+Gengchou starts from defaults, and one warning names that path. Starting from
+defaults is not a read-only outcome: the first save that follows would
+otherwise replace your layout, language, provider selection and access
+decisions with nothing to recover them from.
 
 Gengchou's own direct writes are limited to the paths above. Claude Desktop
 session access is read-only: Gengchou reads the encrypted cache and Chromium

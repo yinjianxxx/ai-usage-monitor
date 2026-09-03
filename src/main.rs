@@ -24,10 +24,9 @@ fn main() {
     // --diagnose flag is accepted but no longer required.
     match diagnose::init() {
         Ok(path) => diagnose::log(format!("startup args={args:?} log_path={}", path.display())),
-        Err(error) => {
-            // Logging may not be available yet, but keep startup behavior unchanged.
-            let _ = error;
-        }
+        // Nothing can be logged about a logging failure, so hold the reason
+        // until there is a window to put it in front of the user.
+        Err(error) => diagnose::record_init_error(error),
     }
 
     // Any panic must leave a trace in the diagnostic log; with the default

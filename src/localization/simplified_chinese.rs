@@ -5,6 +5,9 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "通过 WinGet 更新";
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "zh-CN",
     window_title: "更筹",
+    instance_already_running: "更筹已经在使用你的设置运行，多半是在本机的另一个 Windows 会话里。同一时间只能有一个使用它们。",
+    instance_lock_failed: "更筹无法启动：无法创建单实例锁。",
+    diagnostics_unavailable: "诊断日志不可用，因此包括崩溃在内的问题不会在这台电脑上留下任何记录。",
     refresh: "刷新",
     refresh_now: "立即刷新",
     one_minute: "1 分钟",

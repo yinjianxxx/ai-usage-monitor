@@ -5,6 +5,10 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "WinGet으로 업데이트";
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "ko-KR",
     window_title: "Gengchou",
+    instance_already_running:
+        "Gengchou가 이미 사용자의 설정을 사용하여 실행 중입니다. 이 PC의 다른 Windows 세션일 가능성이 높습니다. 한 번에 하나만 사용할 수 있습니다.",
+    instance_lock_failed: "Gengchou를 시작할 수 없습니다: 단일 인스턴스 잠금을 만들지 못했습니다.",
+    diagnostics_unavailable: "진단 로그를 사용할 수 없으므로 충돌을 포함한 문제가 이 PC에 전혀 기록되지 않습니다.",
     refresh: "새로고침",
     refresh_now: "지금 새로 고침",
     one_minute: "1분",

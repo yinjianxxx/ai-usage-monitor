@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "gengchou"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "base64",
  "dirs",

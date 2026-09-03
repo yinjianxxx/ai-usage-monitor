@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::os::windows::process::CommandExt;
 
@@ -53,7 +53,7 @@ fn updates_disabled() -> bool {
     std::env::var_os("DISABLE_UPDATES").is_some_and(|value| !value.is_empty())
 }
 
-fn find_executable() -> Option<PathBuf> {
+pub(crate) fn find_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CLAUDE_CLI_PATH")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -109,45 +109,19 @@ fn first_nonempty_line(bytes: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// The CLI is normally reached through `claude.cmd`, so the timeout has to end
+/// the `cmd.exe` shim and the `node` process under it together; the shared
+/// runner does that with a job object and also drains the pipes while the
+/// child runs. `--version` output is small, but nothing here bounds it.
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::ExitStatus> {
-    let mut child = command.spawn().ok()?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => return None,
-        }
-    }
+    run_output_with_timeout(command, timeout).map(|output| output.status)
 }
 
 fn run_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut child = command.spawn().ok()?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => return None,
-        }
-    }
+    crate::native_interop::run_with_timeout(command, timeout).ok()
 }
 
 #[cfg(test)]

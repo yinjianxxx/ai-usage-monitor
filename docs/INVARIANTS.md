@@ -10,6 +10,16 @@ identity, or release automation.
 - Keep `Gengchou` as the data-directory, updater, single-instance, and WinGet
   identity. A display-name change must not silently create a second install or
   data location.
+- The single-instance guard is an exclusive handle on `instance.lock` inside
+  the data directory it protects, not a named kernel object. A name has to
+  encode that directory, and every encoding fails somewhere: a `Global\` name
+  can fall back to a per-session `Local\` one and stop excluding the other
+  session of the same account, and a hash of the path cannot see that a short
+  name, a `.` component and a different case name one directory. Two accounts
+  never exclude each other; two sessions of one account always do.
+- A launch that cannot become the running instance either hands off to a window
+  on this desktop or says why. Exiting without either is the failure the guard
+  exists to prevent.
 - Preserve the retained upstream attribution and current publisher metadata.
 
 ## Credentials and privacy
@@ -45,6 +55,20 @@ identity, or release automation.
 - Routine notifications use the Gengchou icon and are silent. Only a current
   credential problem requiring user action uses the Windows warning glyph and
   notification sound.
+- Windows programs this app starts are named by absolute path, on every path
+  including the failure ones. A bare name is resolved against this executable's
+  own directory before the system directory, so a portable build would run a
+  same-named file dropped beside it - including the `wsl.exe` that reads
+  credentials and the `powershell.exe` that drives a WinGet update. A fallback
+  to a bare name is that same hole, so there is none.
+- A probe's output is drained while the child runs, and a timeout ends the
+  whole process tree. Reading only after exit deadlocks a child that fills the
+  pipe buffer, and that deadlock is indistinguishable from a probe that never
+  answered; killing only the direct child leaves the work running under a
+  `.cmd` shim.
+- No wait on a child's output is unbounded. A descendant that escaped the job
+  object can hold the inherited pipe open forever, and waiting on that turns a
+  reportable timeout into a caller that never returns.
 
 ## Persistence and diagnostics
 
@@ -55,7 +79,16 @@ identity, or release automation.
   it, then replaces the destination in the same directory.
 - Diagnostic logging rejects reparse-point paths, reopens the current pathname
   for every write, serializes cooperating processes, and keeps exactly the
-  current log plus one `diagnose.log.old` generation.
+  current log plus one `diagnose.log.old` generation. Its cross-process lock is
+  derived from the log path, so accounts that write different files do not wait
+  on each other.
+- A settings file that cannot be *loaded* - parsed or read - is preserved as
+  `settings.json.corrupt` and reported to the user before defaults are loaded.
+  Only a file that is genuinely absent takes the silent path; treating an
+  unreadable one as absent is the same data loss by another route. Loading defaults is not
+  a read-only outcome: the first save that follows replaces the user's layout,
+  language, provider selection and access decisions. A value a newer build
+  wrote costs at most the one field that cannot be represented, never the file.
 
 ## Network and updates
 
@@ -63,6 +96,23 @@ identity, or release automation.
 - Update payloads remain hash-verified, staged, atomically replaced, and rolled
   back unless the new process reports ready. Never replace a still-running
   executable or restart an unverified path.
+- A downloaded payload must also report the version the release announced, and
+  must carry a version to report. The hash proves the file is the one
+  `SHA256SUMS` names; it does not say which build that is, and both install
+  channels check this. An unparseable version is a mismatch, never a match.
+- `--apply-update` acts only on a target that matches this installation, by the
+  parent process's image path or by the helper's own bytes. This narrows shape,
+  not provenance: it does not prove the target started the helper, and it
+  crosses no privilege boundary. What it removes is the helper being usable as
+  a general "replace and run this path" step.
+- That check runs before anything that replaces **or starts** the target. Every
+  failure path in the helper restarts the target, so a check placed after one
+  of them is not a check at all.
+- Every directory the updater writes into or runs out of is checked for
+  reparse points and ambiguous components before it is used, not after.
+- The new process confirms readiness before any startup step that can wait on
+  the user. The helper's timeout is fixed, so a dialog placed ahead of that
+  confirmation rolls a healthy update back while the user is still reading it.
 
 ## Release history
 

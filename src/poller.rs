@@ -11,10 +11,13 @@ use serde::Deserialize;
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
+// Shared with the Claude CLI helper: both need output drained while the child
+// runs and the whole process tree killed on timeout.
 use crate::models::{
     AppUsageData, ProviderStatus, UsageData, UsageWindow, FIVE_HOURS_SECONDS, ONE_DAY_SECONDS,
     ONE_WEEK_SECONDS,
 };
+use crate::native_interop::run_with_timeout;
 use crate::tray_icon::TrayIconKind;
 use crate::{claude_cli, claude_desktop};
 
@@ -1236,41 +1239,6 @@ fn clear_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandRunError {
-    SpawnFailed,
-    TimedOut,
-    WaitFailed,
-}
-
-/// Spawn a command and wait up to `timeout` for it to finish while preserving
-/// the distinction between an unavailable probe and a completed command.
-fn run_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> Result<std::process::Output, CommandRunError> {
-    let mut child = cmd.spawn().map_err(|_| CommandRunError::SpawnFailed)?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|_| CommandRunError::WaitFailed)
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CommandRunError::TimedOut);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => return Err(CommandRunError::WaitFailed),
-        }
-    }
-}
-
 fn build_agent_for_url(url: &str, timeout: Duration) -> Result<ureq::Agent, PollError> {
     crate::http_client::build_agent(url, timeout).map_err(|error| {
         diagnose::log_error("unable to initialize provider HTTP client", error);
@@ -1694,7 +1662,7 @@ printf '%s\n' "$config_dir/.credentials.json"
 
 fn read_wsl_credential_bytes(distro: &str) -> Result<Vec<u8>, ClaudeCredentialProblem> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -1762,7 +1730,7 @@ cat -- "$credential_path"
 /// distro, timeout): move on to the next source.
 fn read_wsl_script_output(distro: &str, script: &'static str) -> Option<Vec<u8>> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -1835,7 +1803,7 @@ fn read_antigravity_credentials_from_wsl(distros: &[String]) -> Option<Antigravi
 
 fn resolved_wsl_credential_path(distro: &str) -> Option<String> {
     let output = run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .arg("-d")
             .arg(distro)
             // `-e` and not `--`: with `--`, wsl.exe hands the remaining
@@ -1966,6 +1934,25 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
                 return Ok(None);
             }
         };
+    if let Some(usage) = claude_usage_from_response(response) {
+        Ok(Some(usage))
+    } else {
+        diagnose::log("Claude usage response did not contain a usable quota window");
+        Ok(None)
+    }
+}
+
+/// Build usage from the Claude usage endpoint payload, or `None` when it
+/// carries no usable window.
+///
+/// A 200 with neither bucket is not a successful reading of "nothing". Every
+/// surface filters an empty `UsageData` out and draws it exactly like no data,
+/// so calling it a success wiped the numbers on screen while the status line
+/// claimed a fresh update, and `merge_missing_provider_data` dropped the
+/// previous values because the slot was `Some`. `None` reaches the caller as a
+/// failed refresh, which keeps the last good numbers and marks them stale.
+/// Antigravity and Grok already refuse an empty window this way.
+fn claude_usage_from_response(response: UsageResponse) -> Option<UsageData> {
     let mut windows = Vec::new();
 
     if let Some(bucket) = &response.five_hour {
@@ -1984,7 +1971,11 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         ));
     }
 
-    Ok(Some(UsageData::from_windows(windows)))
+    // Checked on the built value, not on `windows`: `from_windows` also drops
+    // a window whose percentage is not finite, so a payload that carries only
+    // those is just as empty.
+    let usage = UsageData::from_windows(windows);
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn classify_http_status(code: u16, retry_after_ms: Option<u32>) -> PollError {
@@ -2180,7 +2171,14 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
         windows.extend(codex_usage_window(&window, "Secondary"));
     }
 
-    Some(UsageData::from_windows(windows))
+    // A `rate_limit` object whose windows are both empty is not usable data.
+    // The `?` above only covers a missing `rate_limit`, so this shape reached
+    // the caller as a successful pass carrying nothing: every surface draws an
+    // empty `UsageData` exactly like no data, and the merge dropped the
+    // previous values because the slot was `Some`. Checked on the built value
+    // so a window whose percentage is not finite counts as empty too.
+    let usage = UsageData::from_windows(windows);
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn codex_usage_window(window: &CodexRateLimitWindow, fallback_label: &str) -> Option<UsageWindow> {
@@ -2943,7 +2941,10 @@ fn diagnostic_first_line(bytes: &[u8]) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-fn run_diagnostic_command(program: &str, args: &[&str]) -> Option<std::process::Output> {
+fn run_diagnostic_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<std::process::Output> {
     run_with_timeout(
         Command::new(program)
             .args(args)
@@ -3020,15 +3021,25 @@ pub fn claude_auth_diagnostics_report() -> String {
         }
     }
 
-    let cli_path = run_diagnostic_command("where.exe", &["claude"])
-        .filter(|output| output.status.success())
-        .and_then(|output| diagnostic_first_line(&output.stdout));
+    let cli_path = run_diagnostic_command(
+        crate::native_interop::system_program("where.exe"),
+        &["claude"],
+    )
+    .filter(|output| output.status.success())
+    .and_then(|output| diagnostic_first_line(&output.stdout));
     lines.push(format!(
         "ClaudeCliPath: {}",
         cli_path.as_deref().unwrap_or("not_found")
     ));
 
-    let cli_version = run_diagnostic_command("claude", &["--version"])
+    // Resolved the same way the update path resolves it, rather than by bare
+    // name: a bare name is looked up in this executable's own directory first,
+    // and a portable build's directory is not a trusted place to find a CLI.
+    let cli = crate::claude_cli::find_executable();
+
+    let cli_version = cli
+        .as_ref()
+        .and_then(|cli| run_diagnostic_command(cli, &["--version"]))
         .filter(|output| output.status.success())
         .and_then(|output| diagnostic_first_line(&output.stdout));
     lines.push(format!(
@@ -3036,7 +3047,10 @@ pub fn claude_auth_diagnostics_report() -> String {
         cli_version.as_deref().unwrap_or("unavailable")
     ));
 
-    match run_diagnostic_command("claude", &["auth", "status"]) {
+    match cli
+        .as_ref()
+        .and_then(|cli| run_diagnostic_command(cli, &["auth", "status"]))
+    {
         Some(output) if output.status.success() => {
             let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
             let logged_in = status
@@ -3475,7 +3489,7 @@ fn list_wsl_distros() -> Vec<String> {
 
 fn enumerate_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .args(["-l", "-q"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
@@ -3507,7 +3521,7 @@ fn enumerate_wsl_distros() -> Vec<String> {
 /// stops a distro, and a stale answer here means probing a stopped distro.
 fn list_running_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
-        Command::new("wsl.exe")
+        Command::new(crate::native_interop::system_program("wsl.exe"))
             .args(["-l", "-q", "--running"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
@@ -3888,6 +3902,8 @@ mod tests {
 
     #[test]
     fn command_runner_distinguishes_spawn_failure_from_timeout() {
+        use crate::native_interop::ProcessRunError;
+
         let missing_program = std::env::temp_dir().join(format!(
             "gengchou-missing-command-{}-{}",
             std::process::id(),
@@ -3896,7 +3912,7 @@ mod tests {
         let mut missing_command = Command::new(missing_program);
         assert!(matches!(
             run_with_timeout(&mut missing_command, Duration::from_millis(10)),
-            Err(CommandRunError::SpawnFailed)
+            Err(ProcessRunError::SpawnFailed)
         ));
 
         assert!(matches!(
@@ -3914,7 +3930,7 @@ mod tests {
                     .stderr(std::process::Stdio::null()),
                 Duration::from_millis(10),
             ),
-            Err(CommandRunError::TimedOut)
+            Err(ProcessRunError::TimedOut)
         ));
     }
 
@@ -5121,6 +5137,48 @@ mod tests {
         assert_eq!(
             data.usage(TrayIconKind::Codex).unwrap().windows[0].percentage,
             42.0
+        );
+    }
+
+    /// A 200 that carries no usable window must read as a failed refresh, not
+    /// as a successful pass with nothing in it.
+    ///
+    /// "Success with nothing to show" is unrepresentable: every surface
+    /// filters an empty `UsageData` out and draws it exactly like no data,
+    /// while the status line reports a fresh successful update - and
+    /// `merge_missing_provider_data` only carries the previous numbers forward
+    /// when the slot is `None`, so an empty `Some` wiped them. Antigravity and
+    /// Grok already refuse this shape; Claude never did, and Codex only
+    /// refused a missing `rate_limit`, not a `rate_limit` whose windows are
+    /// both absent.
+    #[test]
+    fn an_empty_quota_payload_is_not_a_successful_refresh() {
+        let codex: CodexUsageResponse = serde_json::from_str(
+            r#"{"rate_limit": {"primary_window": null, "secondary_window": null}}"#,
+        )
+        .expect("Codex response should deserialize");
+        assert!(
+            codex_usage_from_response(codex).is_none(),
+            "a rate limit with no window is not usable data"
+        );
+
+        let claude: UsageResponse = serde_json::from_str(r#"{"five_hour": null}"#)
+            .expect("Claude response should deserialize");
+        assert!(
+            claude_usage_from_response(claude).is_none(),
+            "a usage payload with neither bucket is not usable data"
+        );
+
+        // The guard must not swallow a payload that does carry a window.
+        let usable: UsageResponse =
+            serde_json::from_str(r#"{"five_hour": {"utilization": 12.0, "resets_at": null}}"#)
+                .expect("Claude response should deserialize");
+        assert_eq!(
+            claude_usage_from_response(usable)
+                .expect("one bucket is usable")
+                .windows
+                .len(),
+            1
         );
     }
 

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
@@ -8,10 +11,223 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+};
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Absolute path to a program that ships in the Windows system directory.
+///
+/// `Command::new("wsl.exe")` does not mean "the Windows one". Rust resolves a
+/// bare program name by searching the directory of the current executable
+/// before the system directory, so a file dropped next to a portable
+/// `gengchou.exe` is what runs - and a downloads folder, where a portable
+/// build normally lives, is exactly where a stray executable ends up.
+/// Confirmed on the pinned toolchain rather than assumed: with a decoy
+/// `wsl.exe` beside a test binary the decoy ran, and the real one only ran
+/// once the decoy was removed.
+///
+/// `GetSystemDirectoryW` first, rather than `%SystemRoot%`, because an
+/// environment variable can be pointed elsewhere. `%SystemRoot%\System32` is
+/// tried only if that call fails, because a spoofable absolute path is still
+/// strictly better than the bare name: the bare name resolves against this
+/// executable's own directory, which is the hole this function exists to
+/// close. Falling back to it would have reopened that hole on the one path
+/// nobody tests.
+pub fn system_program(name: &str) -> PathBuf {
+    static SYSTEM_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let directory = SYSTEM_DIRECTORY.get_or_init(|| {
+        let mut buffer = [0u16; 260];
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if length > 0 && length <= buffer.len() {
+            return Some(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        let from_environment = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join("System32"));
+        crate::diagnose::log(match &from_environment {
+            Some(root) => format!(
+                "unable to resolve the Windows system directory; using {}",
+                root.display()
+            ),
+            None => "unable to resolve the Windows system directory, and SystemRoot is unusable"
+                .to_string(),
+        });
+        from_environment
+    });
+    match directory {
+        Some(directory) => directory.join(name),
+        // Nothing absolute is available. A bare name here would run whatever
+        // sits beside a portable build, so keep it absolute and let the launch
+        // fail loudly instead.
+        None => PathBuf::from(r"\\?\GLOBALROOT\SystemRoot\System32").join(name),
+    }
+}
+
+/// Why a child process did not produce a usable answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessRunError {
+    SpawnFailed,
+    TimedOut,
+    WaitFailed,
+}
+
+/// Run a command, wait up to `timeout`, and return everything it wrote.
+///
+/// Two things this does that `Child::wait_with_output` after a `try_wait` loop
+/// does not:
+///
+/// * It drains stdout and stderr while the child is still running.
+///   `wait_with_output` only reads after the process has exited, and a child
+///   that fills the pipe buffer never gets there: it blocks in `write`, the
+///   loop hits the deadline, and an ordinary answer that was merely large is
+///   reported as a probe that never responded. The credential probes read
+///   token files whose size is not ours to bound.
+/// * It kills the whole process tree on timeout. `Child::kill` ends only the
+///   process that was spawned, and the Claude CLI is normally reached through
+///   `claude.cmd`, so killing it left the `cmd.exe` shim's `node` running with
+///   the timed-out command still in flight.
+///
+/// The job object is assigned right after spawn rather than before, because
+/// `std` gives no way to resume a suspended child. A grandchild created in
+/// that window escapes the kill; everything after it does not, which is the
+/// difference between a leaked tree and one straggler.
+pub fn run_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, ProcessRunError> {
+    let mut child = command.spawn().map_err(|_| ProcessRunError::SpawnFailed)?;
+    let job = ProcessTreeJob::containing(&child);
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                end_process_tree(&job, &mut child);
+                // Deliberately not joined. The output is discarded on this
+                // path, and a reader only finishes at EOF - which never comes
+                // if a descendant that escaped the job inherited the write
+                // end. Joining here turned a reported timeout into a caller
+                // that never returns at all, hanging the poll thread for the
+                // life of the process.
+                drop(stdout);
+                drop(stderr);
+                return Err(ProcessRunError::TimedOut);
+            }
+            // A `try_wait` failure means this child can no longer be observed,
+            // which is not a reason to walk away from it: returning here used
+            // to leave the process, its tree and both reader threads running
+            // with nobody left to end them.
+            Err(_) => {
+                end_process_tree(&job, &mut child);
+                drop(stdout);
+                drop(stderr);
+                return Err(ProcessRunError::WaitFailed);
+            }
+        }
+    };
+
+    // The child has exited, so every write end it owned is closed and the
+    // readers are at EOF already. The grace covers the one case where they are
+    // not: a descendant that escaped the job before it was assigned, still
+    // holding the inherited pipe. Waiting on that forever is the same hang as
+    // the timeout path above, so it is bounded and reported.
+    Ok(std::process::Output {
+        status,
+        stdout: collect(stdout, DRAIN_GRACE)?,
+        stderr: collect(stderr, DRAIN_GRACE)?,
+    })
+}
+
+/// How long a reader may still take once the child itself has exited.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// End the child and everything it started, then reap it.
+fn end_process_tree(job: &Option<ProcessTreeJob>, child: &mut std::process::Child) {
+    match job {
+        Some(job) => job.terminate(),
+        None => {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+}
+
+type DrainHandle = Option<std::sync::mpsc::Receiver<Vec<u8>>>;
+
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> DrainHandle {
+    pipe.map(|mut pipe| {
+        // A channel rather than a `JoinHandle`, because a join cannot be
+        // bounded and this wait has to be.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            let _ = sender.send(buffer);
+        });
+        receiver
+    })
+}
+
+fn collect(handle: DrainHandle, grace: std::time::Duration) -> Result<Vec<u8>, ProcessRunError> {
+    let Some(handle) = handle else {
+        return Ok(Vec::new());
+    };
+    handle.recv_timeout(grace).map_err(|error| {
+        // Either the reader is still blocked on a pipe somebody else holds
+        // open, or it died without sending. Neither has output to report, and
+        // an empty answer would not be honest.
+        crate::diagnose::log(format!("a child's output could not be collected: {error}"));
+        ProcessRunError::WaitFailed
+    })
+}
+
+/// A job object holding one child and everything it goes on to start.
+struct ProcessTreeJob(HANDLE);
+
+impl ProcessTreeJob {
+    fn containing(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.ok()?;
+        let assigned = unsafe {
+            AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as isize as *mut _))
+        };
+        if assigned.is_err() {
+            // Nested jobs need Windows 8; without one the caller still kills
+            // the direct child, which is what it did before.
+            crate::diagnose::log("unable to place a child process in a job object");
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return None;
+        }
+        Some(Self(job))
+    }
+
+    fn terminate(&self) {
+        let _ = unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for ProcessTreeJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 // Window style constants
 pub const WS_POPUP_STYLE: u32 = 0x80000000;
@@ -450,6 +666,183 @@ impl Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Windows program Gengchou starts must be named by absolute path.
+    ///
+    /// A bare name is resolved against this executable's own directory before
+    /// the system directory, so a portable build sitting in a downloads folder
+    /// would run whatever `wsl.exe` happens to have landed beside it - and the
+    /// credential probes are what run `wsl.exe`. Asserted on `system_program`
+    /// because that is what every call site now passes to `Command::new`.
+    #[test]
+    fn a_system_program_is_named_by_absolute_path() {
+        let wsl = system_program("wsl.exe");
+        assert!(wsl.is_absolute(), "got {}", wsl.display());
+        assert_eq!(
+            wsl.file_name().and_then(|name| name.to_str()),
+            Some("wsl.exe")
+        );
+
+        let directory = wsl.parent().expect("an absolute path has a parent");
+        assert!(
+            directory.is_dir(),
+            "the resolved system directory must exist: {}",
+            directory.display()
+        );
+        // Windows reports this directory in mixed case, so compare folded.
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let expected = PathBuf::from(system_root).join("System32");
+            assert_eq!(
+                directory.to_string_lossy().to_lowercase(),
+                expected.to_string_lossy().to_lowercase()
+            );
+        }
+
+        // A nested name stays under the same root.
+        let powershell = system_program(r"WindowsPowerShell\v1.0\powershell.exe");
+        assert!(powershell
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with(&directory.to_string_lossy().to_lowercase()));
+        assert_eq!(
+            powershell.file_name().and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+    }
+
+    fn powershell() -> std::process::Command {
+        let mut command =
+            std::process::Command::new(system_program(r"WindowsPowerShell\v1.0\powershell.exe"));
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        command
+    }
+
+    /// A large but perfectly ordinary answer must not read as a dead probe.
+    ///
+    /// The pipe buffer is a few kilobytes. Waiting for exit before reading it
+    /// deadlocks a child that writes more than that: it blocks in `write`, the
+    /// deadline passes, and the probe is reported as one that never answered.
+    #[test]
+    fn a_child_that_outgrows_the_pipe_buffer_still_reports_its_output() {
+        const SIZE: usize = 300_000;
+        let mut command = powershell();
+        command
+            .arg(format!("[Console]::Out.Write('x' * {SIZE})"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let output = run_with_timeout(&mut command, std::time::Duration::from_secs(30))
+            .expect("a child that writes a lot is not a timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), SIZE);
+    }
+
+    /// Ending a run must take the child's descendants with it.
+    ///
+    /// The Claude CLI is normally `claude.cmd`, so the process actually doing
+    /// the work is a `node` under a `cmd.exe` shim. Ending only the direct
+    /// child left that work running past the deadline meant to stop it.
+    ///
+    /// This drives `end_process_tree`, which both of `run_with_timeout`'s
+    /// failure paths route through, rather than driving a real timeout. An
+    /// earlier version did the latter and was flaky: it needed the grandchild
+    /// to finish starting before the deadline expired, so a cold machine and a
+    /// genuine regression produced the same red test. Waiting for the
+    /// grandchild to exist first removes the race - a slow interpreter start
+    /// costs seconds here instead of a false failure.
+    #[test]
+    fn ending_a_run_takes_the_grandchildren_with_it() {
+        // No parentheses or spaces in the name: `cmd /c` re-parses its
+        // argument, and a name like `ThreadId(3)` is a syntax error there.
+        let stem = std::env::temp_dir().join(format!(
+            "gengchou-tree-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let marker = stem.with_extension("pid");
+        // A `.cmd` shim around a long-running interpreter: the exact shape of
+        // `claude.cmd` around `node`.
+        let shim = stem.with_extension("cmd");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\n\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"$PID | Set-Content -LiteralPath '{}'; Start-Sleep -Seconds 120\"\r\n",
+                system_program(r"WindowsPowerShell\v1.0\powershell.exe").display(),
+                marker.display()
+            ),
+        )
+        .expect("write the shim");
+
+        let mut child = std::process::Command::new(system_program("cmd.exe"))
+            .arg("/c")
+            .arg(&shim)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the shim");
+
+        let job = ProcessTreeJob::containing(&child);
+        assert!(
+            job.is_some(),
+            "a freshly spawned child must be placeable in a job object"
+        );
+
+        let grandchild = process_id_once_recorded(&marker, std::time::Duration::from_secs(60));
+        end_process_tree(&job, &mut child);
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&shim);
+
+        assert!(
+            process_has_exited(grandchild),
+            "grandchild {grandchild} outlived the end of the run that started it"
+        );
+    }
+
+    /// Block until the grandchild has written a usable process id, or give up.
+    ///
+    /// The deadline is generous on purpose: it bounds a hang, it does not time
+    /// the interpreter. A partially written file simply is not parseable yet.
+    fn process_id_once_recorded(marker: &std::path::Path, deadline: std::time::Duration) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                return pid;
+            }
+            assert!(
+                started.elapsed() < deadline,
+                "the grandchild recorded no process id within {deadline:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Whether a process id refers to something that is no longer running.
+    ///
+    /// A pid that cannot be opened at all counts as gone: the only handle this
+    /// test ever had was through the job object that just terminated it.
+    fn process_has_exited(pid: u32) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+            return true;
+        };
+        // Two seconds of slack: TerminateJobObject is asynchronous.
+        let result = unsafe { WaitForSingleObject(handle, 2_000) };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result == WAIT_OBJECT_0
+    }
 
     #[test]
     fn embedding_validation_requires_expected_parent_and_child_style() {
