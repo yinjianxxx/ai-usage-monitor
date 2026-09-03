@@ -248,16 +248,52 @@ Verified live: two sandboxed data directories each ran an instance
 simultaneously; each `instance.lock` refused a second exclusive open while its
 holder ran; both were free immediately after the holders exited.
 
+## Manual smoke test, partial
+
+Run against the release build at `43cd4b3`, in a sandboxed data directory with
+consent pre-set to declined. All four launches logged `poll skipped; no shown
+provider has credential access`: no credential was read and no provider was
+contacted.
+
+| Row | Result |
+| --- | --- |
+| Startup: main window, broadcast helper, taskbar selection, widget embedded and ready | passed, 4 of 4 launches |
+| `instance.lock` exists and stays empty | passed, 0 bytes |
+| A second exclusive open is refused while the holder runs | passed |
+| The guard is free after the process is **killed**, not exited | passed - no stale lock to clear |
+| A launch after that kill starts normally and retakes the guard | passed |
+| A second launch on the same data directory does not become resident | passed, `exit=0`, the first stayed up |
+| Exit from the menu shuts down cleanly | passed - `deliberate quit requested`, `message loop exited`, `code=0` |
+| The guard is released on that clean exit | passed |
+| Data directory contents | only `settings.json` and `instance.lock` |
+| Diagnostic log | one `startup aborted: an instance on this desktop was asked to show details`, which is the expected result of the second launch; nothing else |
+
+Two observations from the run that are behaviour, not defects, and are recorded
+so the next person does not re-investigate them:
+
+- `WM_CLOSE` does not end the process. That is deliberate - external
+  destruction starts in-process recovery instead of terminating, which is one
+  of the stability changes in PROVENANCE.md. The exit path is the menu command,
+  which is what the row above exercises.
+- The broadcast helper window does not handle `WM_COMMAND`; the widget and the
+  detail popup do. Posting the exit command to the helper does nothing, which
+  is correct.
+
+Not exercised: any actual clicking. The rows above assert that windows exist
+and that the documented exit path works, not that the detail popup, context
+menu or manual refresh behave correctly under real input.
+
 ## Not verified
 
 These are gaps in this document, not passed rows.
 
-- **The full manual Windows smoke test in docs/RELEASE_CHECKLIST.md was not
-  run this round.** What was run is the targeted live evidence above plus the
-  automated gates. The consent, provider-detection, credential-watch and
-  surface-interaction rows are inherited from v2.5.1 on the reasoning that this
-  branch touches none of that code; that reasoning is not a substitute for
-  running them.
+- **Most of the manual Windows smoke test was not run.** The rows that were
+  run are listed under *Manual smoke test, partial* above. The consent,
+  provider-detection, credential-watch and surface-interaction rows are
+  inherited from v2.5.1 on the reasoning that this branch touches none of that
+  code. That reasoning is not a substitute for running them - this round
+  already produced one counter-example, where code its own author had read
+  twice still had the defect an independent pass found immediately.
 - **Two accounts, and one account in two sessions.** Skipped at the owner's
   instruction, permanently. Windows 11 Pro is single-session: Fast User
   Switching and RDP to localhost both take over the console, so it cannot be
