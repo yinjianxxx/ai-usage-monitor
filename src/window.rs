@@ -1457,6 +1457,10 @@ struct DetailPopupState {
     providers: Vec<DetailProviderGroup>,
     status: String,
     version: String,
+    /// The version an update check has found, when one is outstanding. The
+    /// footer is the one surface a user opens on purpose, so this is where a
+    /// missed balloon stops costing anything.
+    available_version: Option<String>,
     refreshing: bool,
 }
 
@@ -1584,6 +1588,7 @@ fn detail_fallback_snapshot() -> DetailPopupState {
         providers: Vec::new(),
         status: LanguageId::English.strings().detail_waiting.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: None,
         refreshing: false,
     }
 }
@@ -5305,6 +5310,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
         providers,
         status: detail_status_text(s, strings),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: outstanding_update_version(&s.update_status),
         refreshing: s.manual_refresh_in_progress,
     }
 }
@@ -6540,6 +6546,7 @@ pub fn dump_detail_popup(
         providers,
         status,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: None,
         refreshing: false,
     };
 
@@ -8608,13 +8615,23 @@ fn paint_detail_content(
             },
             &palette.divider,
         );
+        // The version line is measured rather than given a fixed slot: it
+        // grows when an update is outstanding, and the status line gives up
+        // exactly that much instead of being drawn over. The floor keeps the
+        // ordinary case laid out as it always was.
+        let version_label =
+            detail_version_label(&snapshot.version, snapshot.available_version.as_deref());
+        let version_width =
+            measure_detail_text_width(hdc, &version_label, "Segoe UI", 11, FW_NORMAL.0 as i32)
+                .max(sc(74) - margin);
+        let version_left = (width - margin - version_width).max(margin);
         draw_detail_body_text(
             hdc,
             &snapshot.status,
             RECT {
                 left: margin,
                 top: footer_top + sc(8),
-                right: width - sc(74),
+                right: version_left,
                 bottom: height - sc(6),
             },
             &palette.muted,
@@ -8624,9 +8641,9 @@ fn paint_detail_content(
         );
         draw_detail_text(
             hdc,
-            &format!("v{}", snapshot.version),
+            &version_label,
             RECT {
-                left: width - sc(74),
+                left: version_left,
                 top: footer_top + sc(8),
                 right: width - margin,
                 bottom: height - sc(6),
@@ -10031,6 +10048,26 @@ fn run_version_action(hwnd: HWND) {
 /// The two guards live here so they can be tested without a window: the click
 /// must answer the version the balloon offered, and nothing else may be in
 /// flight.
+/// The version an outstanding update offers, freshly found or remembered.
+///
+/// A remembered result reads the same as a fresh one here for the same reason
+/// it does in the menu: from the user's side the situation is identical.
+fn outstanding_update_version(status: &UpdateStatus) -> Option<String> {
+    match status {
+        UpdateStatus::Available(release) => Some(release.latest_version.clone()),
+        UpdateStatus::AvailableRemembered { version } => Some(version.clone()),
+        _ => None,
+    }
+}
+
+/// The footer's version line: the running version, and where it can go.
+fn detail_version_label(current: &str, available: Option<&str>) -> String {
+    match available {
+        Some(available) => format!("v{current} → {available}"),
+        None => format!("v{current}"),
+    }
+}
+
 fn balloon_offer_is_current(known: Option<&str>, offered: &str, busy: bool) -> bool {
     !busy && known == Some(offered)
 }
@@ -16348,6 +16385,34 @@ mod reset_notification_tests {
         }
     }
 
+    /// The footer is the surface a user opens on purpose, so it is where a
+    /// missed balloon stops mattering. Without the second half it reports the
+    /// running version and stays silent about the one that is waiting.
+    #[test]
+    fn the_footer_says_where_the_running_version_can_go() {
+        assert_eq!(detail_version_label("2.5.3", None), "v2.5.3");
+        assert_eq!(
+            detail_version_label("2.5.3", Some("2.5.4")),
+            "v2.5.3 → 2.5.4"
+        );
+    }
+
+    /// A remembered update has to reach the footer too: after a restart there
+    /// is no fresh check behind it, and that is exactly when a user who
+    /// missed the balloon goes looking.
+    #[test]
+    fn a_remembered_update_reaches_the_footer() {
+        assert_eq!(outstanding_update_version(&UpdateStatus::Idle), None);
+        assert_eq!(outstanding_update_version(&UpdateStatus::UpToDate), None);
+        assert_eq!(
+            outstanding_update_version(&UpdateStatus::AvailableRemembered {
+                version: "9.9.9".to_string(),
+            })
+            .as_deref(),
+            Some("9.9.9")
+        );
+    }
+
     /// A click can arrive long after the balloon was raised - from the
     /// notification centre, or on a balloon that has since been overtaken.
     /// Acting on what the balloon said rather than on what is true now would
@@ -17785,6 +17850,7 @@ mod reset_notification_tests {
             providers: vec![group.clone()],
             status: "Updated now".to_string(),
             version: "test".to_string(),
+            available_version: None,
             refreshing: false,
         };
 
@@ -17818,6 +17884,7 @@ mod reset_notification_tests {
             ],
             status: snapshot.status,
             version: snapshot.version,
+            available_version: None,
             refreshing: false,
         };
         let _dpi = DpiScope::new(120);
@@ -17858,6 +17925,7 @@ mod reset_notification_tests {
                 providers: vec![two_row_group.clone(), two_row_group.clone()],
                 status: "Every 1m".to_string(),
                 version: "test".to_string(),
+                available_version: None,
                 refreshing: false,
             },
             DetailPopupState {
@@ -17865,6 +17933,7 @@ mod reset_notification_tests {
                 providers: vec![hinted_one_row_group, one_row_group, two_row_group],
                 status: "Authentication failed".to_string(),
                 version: "test".to_string(),
+                available_version: None,
                 refreshing: false,
             },
         ];
@@ -17907,6 +17976,7 @@ mod reset_notification_tests {
             providers: vec![group.clone(), group.clone(), group],
             status: "Every 1m".to_string(),
             version: "test".to_string(),
+            available_version: None,
             refreshing: false,
         };
         let _dpi = DpiScope::new(144);
