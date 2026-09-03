@@ -74,6 +74,14 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 
 - Start one instance, launch the EXE again, and confirm the existing detail
   popup opens without a second resident process.
+- With Gengchou running, sign in as a second Windows account and start it
+  there. It must come up with its own widget, tray icons and settings; the two
+  must not see each other. Then, from the first account, use Fast User
+  Switching to open a second session of that same account and launch it: this
+  one must refuse and say so, because both sessions write one `settings.json`.
+  A refusal that closes without a dialog is a failure. If a second account is
+  not available, record that this row was skipped rather than marking it
+  passed.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
 - On a fresh profile, confirm exactly one permission prompt appears, covering
@@ -285,6 +293,14 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 - Verify a portable update releases the old PID and single-instance mutex,
   replaces the target, starts one new PID, and preserves the rollback backup
   until the new process reports ready.
+- Run the updater helper directly with a target that is not this install -
+  `--apply-update <some other file> <payload> <a dead pid> <payload sha256>` -
+  and confirm it exits non-zero, leaves that file byte-identical, and creates
+  no `.old` beside it. Repeat with a live but unrelated parent PID. Both must
+  refuse before anything is replaced or launched.
+- Point the release's own download at a build whose `ProductVersion` differs
+  from the announced tag and confirm the portable update refuses it after the
+  hash check rather than installing it.
 - Hold the confirmed `gengchou.exe.old` backup open without delete sharing and
   launch normally: the app must still reach its UI, log the exact deferred
   cleanup path, then remove the backup on the next launch after the handle is

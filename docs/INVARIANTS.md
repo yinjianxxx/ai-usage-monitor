@@ -56,6 +56,11 @@ identity, or release automation.
   directory, so a portable build would run a same-named file dropped beside
   it - including the `wsl.exe` that reads credentials and the `powershell.exe`
   that drives a WinGet update.
+- A probe's output is drained while the child runs, and a timeout ends the
+  whole process tree. Reading only after exit deadlocks a child that fills the
+  pipe buffer, and that deadlock is indistinguishable from a probe that never
+  answered; killing only the direct child leaves the work running under a
+  `.cmd` shim.
 
 ## Persistence and diagnostics
 
@@ -81,6 +86,15 @@ identity, or release automation.
 - Update payloads remain hash-verified, staged, atomically replaced, and rolled
   back unless the new process reports ready. Never replace a still-running
   executable or restart an unverified path.
+- A downloaded payload must also report the version the release announced. The
+  hash proves the file is the one `SHA256SUMS` names; it does not say which
+  build that is, and both install channels check this.
+- `--apply-update` replaces only the installation that started it, proven by
+  the parent process's image path or, when that process is already gone, by
+  the helper's own bytes. A target that fails both is refused and not
+  relaunched: starting it would execute a path the arguments chose.
+- Every directory the updater writes into or runs out of is checked for
+  reparse points and ambiguous components before it is used, not after.
 - The new process confirms readiness before any startup step that can wait on
   the user. The helper's timeout is fixed, so a dialog placed ahead of that
   confirmation rolls a healthy update back while the user is still reading it.

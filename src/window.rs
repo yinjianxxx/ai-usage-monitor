@@ -13551,6 +13551,12 @@ fn tray_reposition_is_suppressed() -> bool {
 /// own tray icons (and, right after sign-in, every other startup app's)
 /// widens TrayNotifyWnd asynchronously; positioning against a rect that is
 /// still changing is what made the widget visibly jump right after launch.
+///
+/// This blocks the UI thread before the message loop starts, for up to
+/// `max_wait` (3s at the one call site) but normally one 250ms sample. That
+/// used to eat into the updater's fixed 30s readiness budget; it no longer
+/// can, because `confirm_update_ready` now runs earlier. Anything added ahead
+/// of that confirmation puts the budget back at risk - see docs/INVARIANTS.md.
 fn wait_for_tray_geometry_stable(max_wait: Duration) {
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + max_wait;

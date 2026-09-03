@@ -55,7 +55,9 @@ show the exact pixels the shipped code draws. Regenerate them any time with
   Hover a badge to see every reported window with reset times. Drag the left
   divider to reposition it, or drop it on another taskbar to change monitors.
   If Explorer is temporarily gone, the widget hides and re-embeds rather than
-  landing on the desktop.
+  landing on the desktop. A vertical taskbar is not supported: the badges are
+  laid out along a horizontal bar and are wider than a left- or right-docked
+  one, so use the floating window or the tray icons there.
 - **Floating window.** A separate always-on-top numeric view, not a stretched
   copy of the widget: up to the two highest-usage windows per provider, each
   label, percentage, and countdown aligned above its micro gauge. Drag it from
