@@ -9947,6 +9947,37 @@ fn available_version_label(
     }
 }
 
+/// Whether an automatic check that found `latest` should raise a balloon.
+///
+/// The check repeats every 24 hours, so the balloon is tied to the version
+/// rather than to the check: re-announcing a version the user has already
+/// been told about once a day is nagging, and the menu item carries that
+/// standing offer anyway. The outcome it reads is persisted, so a restart
+/// does not re-announce either.
+fn update_balloon_due(previous: Option<&settings::LastUpdateOutcome>, latest: &str) -> bool {
+    !matches!(
+        previous,
+        Some(settings::LastUpdateOutcome::Available { version }) if version == latest
+    )
+}
+
+/// Say that an update exists. An automatic check leaves no other trace than
+/// the version item inside the settings submenu, which is not somewhere a
+/// user opens unprompted.
+fn announce_update_balloon(hwnd: HWND, strings: Strings, latest: &str) {
+    let body = strings
+        .update_available_balloon_body
+        .replace("{version}", latest)
+        .replace("{settings}", strings.settings);
+    diagnose::log(format!("update available, announced version {latest}"));
+    tray_icon::notify_app_balloon(
+        hwnd,
+        tray_icon::BalloonTone::Info,
+        strings.update_available,
+        &body,
+    );
+}
+
 fn begin_update_check(hwnd: HWND, interactive: bool) {
     if !updater::update_channel_configured() {
         return;
@@ -9995,17 +10026,32 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 }
             }
             Ok(UpdateCheckResult::Available(release)) => {
-                {
+                let announce = {
                     let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Available(release.clone());
-                        s.last_update_outcome = Some(settings::LastUpdateOutcome::Available {
-                            version: release.latest_version.clone(),
-                        });
-                        s.last_update_check_unix = Some(checked_at);
+                    match state.as_mut() {
+                        Some(s) => {
+                            // Read before the overwrite: the outcome carried
+                            // over from the last check is what says whether
+                            // this version has already been announced.
+                            let announce = !interactive
+                                && update_balloon_due(
+                                    s.last_update_outcome.as_ref(),
+                                    &release.latest_version,
+                                );
+                            s.update_status = UpdateStatus::Available(release.clone());
+                            s.last_update_outcome = Some(settings::LastUpdateOutcome::Available {
+                                version: release.latest_version.clone(),
+                            });
+                            s.last_update_check_unix = Some(checked_at);
+                            announce
+                        }
+                        None => false,
                     }
-                }
+                };
                 save_state_settings();
+                if announce {
+                    announce_update_balloon(hwnd, strings, &release.latest_version);
+                }
                 if interactive {
                     {
                         let mut state = lock_state();
@@ -16181,6 +16227,50 @@ mod reset_notification_tests {
         } else {
             // Without a release channel the entry is only ever the version.
             assert_eq!(remembered, format!("v{}", env!("CARGO_PKG_VERSION")));
+        }
+    }
+
+    /// The balloon is the only unprompted trace of an automatic check, so it
+    /// must fire for a version the user has not been told about - and only
+    /// once for it, because the check repeats every day.
+    #[test]
+    fn an_update_is_announced_once_per_version() {
+        assert!(update_balloon_due(None, "9.9.9"));
+        assert!(update_balloon_due(
+            Some(&settings::LastUpdateOutcome::UpToDate),
+            "9.9.9"
+        ));
+        assert!(update_balloon_due(
+            Some(&settings::LastUpdateOutcome::Available {
+                version: "9.9.8".to_string(),
+            }),
+            "9.9.9"
+        ));
+        assert!(!update_balloon_due(
+            Some(&settings::LastUpdateOutcome::Available {
+                version: "9.9.9".to_string(),
+            }),
+            "9.9.9"
+        ));
+    }
+
+    /// The balloon has to name the version and point somewhere; a body that
+    /// kept a raw placeholder would do neither.
+    #[test]
+    fn the_update_balloon_body_names_the_version_and_the_menu() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let body = strings
+                .update_available_balloon_body
+                .replace("{version}", "9.9.9")
+                .replace("{settings}", strings.settings);
+            assert!(body.contains("9.9.9"), "{} version", language.code());
+            assert!(
+                body.contains(strings.settings),
+                "{} menu path",
+                language.code()
+            );
+            assert!(!body.contains('{'), "{} leftover: {body}", language.code());
         }
     }
 

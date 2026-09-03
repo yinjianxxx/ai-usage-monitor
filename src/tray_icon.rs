@@ -632,10 +632,29 @@ unsafe fn deliver_balloon(
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
 }
 
-/// Show a Windows balloon notification from the tray icon.
+/// Show a Windows balloon notification from a provider's tray icon.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
+    tone: BalloonTone,
+    title: &str,
+    message: &str,
+) {
+    notify_balloon_anchored(hwnd, Some(kind), tone, title, message);
+}
+
+/// Show a balloon that belongs to the app rather than to one provider.
+///
+/// An available update is nobody's provider news, so the app icon is the
+/// anchor to try first; the same fallback walk still applies, because
+/// detailed mode removes that icon.
+pub fn notify_app_balloon(hwnd: HWND, tone: BalloonTone, title: &str, message: &str) {
+    notify_balloon_anchored(hwnd, None, tone, title, message);
+}
+
+fn notify_balloon_anchored(
+    hwnd: HWND,
+    kind: Option<TrayIconKind>,
     tone: BalloonTone,
     title: &str,
     message: &str,
@@ -652,20 +671,22 @@ pub fn notify_balloon(
         // so its icon has been removed - and detailed mode removes the app icon
         // too, leaving both of the obvious anchors gone. Fall through to any
         // icon that is actually registered rather than dropping the balloon.
-        let delivered = deliver_balloon(
-            notify_icon_data(hwnd, kind),
-            info_flags,
-            balloon_icon,
-            title,
-            message,
-        ) || deliver_balloon(
+        let delivered = kind.is_some_and(|kind| {
+            deliver_balloon(
+                notify_icon_data(hwnd, kind),
+                info_flags,
+                balloon_icon,
+                title,
+                message,
+            )
+        }) || deliver_balloon(
             app_notify_icon_data(hwnd),
             info_flags,
             balloon_icon,
             title,
             message,
         ) || TrayIconKind::ALL.into_iter().any(|other| {
-            other.id() != kind.id()
+            Some(other) != kind
                 && deliver_balloon(
                     notify_icon_data(hwnd, other),
                     info_flags,
@@ -677,7 +698,7 @@ pub fn notify_balloon(
         if !delivered {
             diagnose::log(format!(
                 "balloon not delivered; no registered tray icon kind={}",
-                kind.diagnostic_label()
+                kind.map_or("app", TrayIconKind::diagnostic_label)
             ));
         }
     }

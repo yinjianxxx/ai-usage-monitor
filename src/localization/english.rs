@@ -46,6 +46,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "Update to",
     update_available: "Update available",
     update_prompt_now: "Version {version} is available. Do you want to update now?",
+    update_available_balloon_body: "Version {version} is available. Open {settings} in the tray menu to update.",
     exit: "Exit",
     show_widget: "Taskbar widget",
     show_floating_monitor: "Floating window",

@@ -47,6 +47,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "Aktualisieren auf",
     update_available: "Update verfügbar",
     update_prompt_now: "Version {version} ist verfügbar. Möchten Sie jetzt aktualisieren?",
+    update_available_balloon_body: "Version {version} ist verfügbar. Öffnen Sie {settings} im Infobereichsmenü, um zu aktualisieren.",
     exit: "Beenden",
     show_widget: "Taskleisten-Widget",
     show_floating_monitor: "Schwebendes Fenster",

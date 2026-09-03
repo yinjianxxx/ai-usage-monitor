@@ -44,6 +44,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "更新先",
     update_available: "更新が利用可能です",
     update_prompt_now: "バージョン {version} が利用可能です。今すぐ更新しますか？",
+    update_available_balloon_body: "バージョン {version} が利用可能です。通知領域メニューの「{settings}」から更新してください。",
     exit: "終了",
     show_widget: "タスクバー ウィジェット",
     show_floating_monitor: "フローティングウィンドウ",

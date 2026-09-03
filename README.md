@@ -237,9 +237,14 @@ credentials; if monitoring still does not recover, sign out and back in. In
 Claude Code CLI, run `claude auth login`. Credential watching resumes
 monitoring automatically after sign-in.
 
-Routine provider-detection, quota-reset, and Claude Code update notifications
-use the Gengchou app icon and are silent. Only a current credential problem
-that needs user action uses the Windows warning glyph and notification sound.
+Routine provider-detection, quota-reset, available-update, and Claude Code
+update notifications use the Gengchou app icon and are silent. Only a current
+credential problem that needs user action uses the Windows warning glyph and
+notification sound.
+
+Gengchou checks for its own updates once a day and announces a version it finds
+once. Repeating that every day would be nagging, and the version entry under
+**Settings** keeps the offer until you take it.
 
 The popup reserves badges for four conditions, in priority order:
 **Authentication failed**, **Refresh failed**, **Near limit**, and **Limit

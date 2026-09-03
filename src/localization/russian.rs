@@ -47,6 +47,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "Обновить до",
     update_available: "Доступно обновление",
     update_prompt_now: "Доступна версия {version}. Обновить сейчас?",
+    update_available_balloon_body: "Доступна версия {version}. Откройте «{settings}» в меню области уведомлений, чтобы обновить.",
     exit: "Выход",
     show_widget: "Виджет панели задач",
     show_floating_monitor: "Плавающее окно",
