@@ -82,6 +82,11 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
   A refusal that closes without a dialog is a failure. If a second account is
   not available, record that this row was skipped rather than marking it
   passed.
+- Confirm `%APPDATA%\Gengchou\instance.lock` exists while the app runs, stays
+  empty, and cannot be opened by anything else until the app exits. Kill the
+  process rather than exiting it and confirm the next launch still starts:
+  Windows releases the handle, so there is no stale lock to clear, and any
+  future change that adds one is a regression.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
 - On a fresh profile, confirm exactly one permission prompt appears, covering
@@ -290,7 +295,7 @@ release comparison crosses v2.3.2-v2.4.0, use the anchors in
 
 ## Update and release hand-off
 
-- Verify a portable update releases the old PID and single-instance mutex,
+- Verify a portable update releases the old PID and the single-instance lock,
   replaces the target, starts one new PID, and preserves the rollback backup
   until the new process reports ready.
 - Run the updater helper directly with a target that is not this install -

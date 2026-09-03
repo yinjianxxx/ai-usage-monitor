@@ -20,10 +20,10 @@
   absolute-path launch, modal-ordering and lock-scope repairs listed in
   `.github/release-notes/v2.5.2.md`. No change to the executable,
   settings-directory, cache, or update identities.
-- One internal name changed: the single-instance mutex is now
-  `Global\Gengchou-Instance-v2-<data directory hash>` with a `Local\` fallback,
-  replacing the machine-wide `Global\Gengchou`. Recorded in PROVENANCE.md.
-  Nothing outside the app reads it.
+- One internal mechanism changed: the single-instance guard is an exclusive
+  handle on `instance.lock` inside the data directory, replacing the
+  machine-wide `Global\Gengchou` mutex. Recorded in PROVENANCE.md and in both
+  READMEs' data tables. Nothing outside the app depends on either form.
 - Signing: not in scope (owner has no signing certificate)
 
 ## Automated gates
@@ -32,12 +32,11 @@ Run locally on Windows 11 Pro 26200 on 2026-09-03, all against the final tree
 at `2.5.2`.
 
 - `cargo fmt --all -- --check` - clean
-- `cargo clippy --all-targets --locked -- -D warnings` - clean. Also run with
-  `--release`, because the debug-only `GENGCHOU_TEST_MUTEX_SUFFIX` block makes
-  one `let mut` unused in a release build; that path is clean too, so CI's
-  debug-profile clippy is not hiding a release warning.
-- `cargo test --locked` - 371 passed, 0 failed (350 at v2.5.1; 361 after the
-  first four batches on this branch)
+- `cargo clippy --all-targets --locked -- -D warnings` - clean, in the debug
+  profile CI uses and again with `--release`, so a release-only warning cannot
+  hide behind CI's debug run.
+- `cargo test --locked` - 373 passed, 0 failed (350 at v2.5.1; 361 after the
+  first four batches on this branch; 371 before the independent review round)
 - `cargo build --release --locked` - clean, at `target\release\gengchou.exe`
 - PE properties of that build: ProductName `Gengchou`, ProductVersion and
   FileVersion `2.5.2`, OriginalFilename `gengchou.exe`, upstream copyright and
@@ -69,26 +68,24 @@ the debug binary for this purpose.
 
 Every test added on this branch was mutation-checked: the behaviour the test
 names was reverted in the source, `git diff --numstat` confirmed the mutation
-was actually on disk, and the test was observed to fail. Ten mutations in
+was actually on disk, and the test was observed to fail. Fourteen mutations in
 total, all caught.
 
-### Single-instance scope
+### Single-instance guard
 
-The mutex name is derived from the data directory. Verified live: the debug
-build was started with `APPDATA`/`LOCALAPPDATA` pointed at a temporary
-directory and consent pre-set to declined, and PowerShell
-`[Threading.Mutex]::OpenExisting` confirmed
-`Global\Gengchou-Instance-v2-89aeb764917b26d0` - the name computed
-independently from that directory path - existed while it ran and was released
-when it exited. The owner's real WinGet-installed v2.5.1 was running
-throughout and still held `Global\Gengchou`; under the old code those two
-processes could not have coexisted. The sandboxed run logged `poll skipped; no
-shown provider has credential access`, so no credential was read and no
-provider was contacted.
+Verified live with two sandboxed data directories: both instances ran at the
+same time, each `instance.lock` refused a second exclusive open while its
+holder was alive, and both were free immediately after the holders exited. An
+earlier run of the same shape against the hash-named mutex confirmed the
+scoping half of this - that build started while the owner's real WinGet-
+installed v2.5.1 still held `Global\Gengchou`, which the old machine-wide name
+made impossible - and both runs logged `poll skipped; no shown provider has
+credential access`, so no credential was read and no provider was contacted.
 
-Mutations caught: dropping the `to_lowercase` before hashing, collapsing the
-unresolved-directory fallback onto the unhashed one, and making a handed-off
-launch raise a dialog.
+Mutations caught: giving the lock file a permissive share mode, and - against
+the mutex the file replaced - dropping the `to_lowercase` before hashing,
+collapsing the unresolved-directory fallback, and making a handed-off launch
+raise a dialog.
 
 ### Child-process runner
 
@@ -182,6 +179,75 @@ sufficient, or that German had the same accent defect as the three languages it
 did flag. It reads lines well; that is not the same as the independent review
 still listed under *Open*.
 
+### Independent review round on PR #7
+
+A Codex agent reviewed `3c123f2..HEAD` with no shared context, told explicitly
+to treat this document and the commit messages as claims to check rather than
+facts. It reported six Medium and two Low findings. Every one was traced to the
+source before being accepted; none was invented, and all eight are fixed.
+
+Two of them were defects in this branch's own repairs:
+
+- **The update-target check ran after three paths that start the target.**
+  `apply_update` restarts the target through `relaunch_unchanged_target` on a
+  missing source, a leftover backup, and a target that cannot be hashed - and
+  the identity check sat below all three, under a comment of mine saying that
+  starting an unconfirmed path is worse than doing nothing. Verified by running
+  the helper: `--apply-update <decoy.cmd> <missing source> 4294967294 <hash>`
+  executed the decoy, which left the file it was written to write. After the
+  fix, that invocation and a live-but-unrelated parent both exit 1 with the
+  decoy byte-identical and no `.old` beside it.
+- **The `.corrupt` rescue did not cover read failures.** `read_settings_content`
+  returned the same `None` for "no file" and "file that cannot be read", so
+  invalid UTF-8, a denied ACL and a sharing violation all loaded defaults with
+  no quarantine, and the first save overwrote the original. That is the same
+  data loss the rescue was added to prevent, and it made the README's claim
+  about unreadable files overstated.
+
+The rest, in the order they were fixed:
+
+- A descendant that escaped the job object could hold the output pipe open, and
+  joining the reader on the timeout path then never returned - turning a
+  reportable timeout into a hung poll thread, which is worse than the bug the
+  drain was added to fix. The failure paths no longer join, and the success
+  path waits with a bounded grace.
+- A download with no `ProductVersion` was passed rather than refused, which
+  contradicts the invariant written for it in this same round; and
+  `unwrap_or(0)` on a version component made `2.5.2.beta` equal `2.5.2` and any
+  unparseable string equal `0` - a parse failure quietly answering "match".
+- `system_program` fell back to a bare program name when
+  `GetSystemDirectoryW` failed, which is exactly the hole that function was
+  added to close.
+- The single-instance mutex was replaced outright; see below.
+- `docs/INVARIANTS.md` claimed the update-target check *proves* the target
+  started the helper. It does not: both facts describe shape, not provenance,
+  and a caller who can start a program and run the helper can satisfy either.
+  The wording now says what the check actually delivers.
+
+### The single-instance guard is a file, not a mutex
+
+The review found two ways the hash-named mutex still allowed two writers on one
+`settings.json`, and the owner chose the redesign over documenting them:
+
+- When the `Global\` name cannot be created, the code fell back to a `Local\`
+  one. `Local\` is per session, so two sessions of the same account then
+  stopped excluding each other - the exact case that shares every file.
+- The name came from a hash of the data directory path, lowercased. That cannot
+  see that a short (8.3) name, a `.` component and a different drive-letter
+  case all name one directory.
+
+Holding `instance.lock` open with no sharing has neither problem: it is the
+same file however the path is spelled, it excludes across sessions and accounts
+because the filesystem does, and Windows releases it when the process ends
+however it ends, so there is no stale lock. The mutex naming code is removed
+rather than kept alongside, and with it the debug-only
+`GENGCHOU_TEST_MUTEX_SUFFIX` escape - overriding `%APPDATA%` is now the way to
+run a second instance, because the guard follows the data directory.
+
+Verified live: two sandboxed data directories each ran an instance
+simultaneously; each `instance.lock` refused a second exclusive open while its
+holder ran; both were free immediately after the holders exited.
+
 ## Not verified
 
 These are gaps in this document, not passed rows.
@@ -193,16 +259,15 @@ These are gaps in this document, not passed rows.
   branch touches none of that code; that reasoning is not a substitute for
   running them.
 - **Two accounts, and one account in two sessions.** Skipped at the owner's
-  instruction. This is the core scenario of the single-instance change and the
-  only part of it not backed by live evidence. What is proved: the name is
-  derived per data directory, it is created and released correctly, and the
-  branch selection between handing off, reporting "already running elsewhere",
-  reporting an unusable guard, and staying silent on the watchdog path is unit
-  tested. What is not proved: what a second signed-in account actually sees,
-  and whether a real second user token can create its own `Global\` name -
-  the `ACCESS_DENIED` branch that was one of the two original silent exits.
-  Windows 11 Pro is single-session, so this cannot be done without taking over
-  the console session.
+  instruction, permanently. Windows 11 Pro is single-session: Fast User
+  Switching and RDP to localhost both take over the console, so it cannot be
+  done in the background. What is proved: two data directories never exclude
+  each other and one always excludes itself however its path is spelled, the
+  guard is released when its holder ends, and the choice between handing off,
+  reporting "already running elsewhere", reporting an unusable guard, and
+  staying silent on the watchdog path is unit tested. What is not proved: what
+  a second signed-in account actually sees on screen. The file lock removes the
+  namespace question that a named mutex would still have left open here.
 - **The 37 compact-surface fixtures were generated but not individually
   inspected.** No rendering code changed on this branch, and the re-rendered
   README widget, floating and tray strips came back byte-identical, which is
@@ -212,6 +277,15 @@ These are gaps in this document, not passed rows.
   junction.** The unit test covers an ordinary directory and a non-directory;
   creating a reparse point in a test needs privileges this suite does not
   assume, which is why the existing tests avoid it too.
+- **The job-object escape window is narrowed, not closed.** A grandchild
+  created between `spawn` and `AssignProcessToJobObject` is outside the job,
+  because `std` offers no way to resume a suspended child. The bounded drain
+  means such an escape can no longer hang a call, but it can still outlive the
+  timeout that was meant to end it.
+- **The update-target check has no test for a live parent whose image differs
+  while the helper's bytes match.** That combination now passes deliberately -
+  it is the recycled-pid case - and the unit test asserts it, but no live run
+  reproduced a recycled pid.
 
 ## Side effects of verification
 
