@@ -10,6 +10,12 @@ identity, or release automation.
 - Keep `Gengchou` as the data-directory, updater, single-instance, and WinGet
   identity. A display-name change must not silently create a second install or
   data location.
+- The single-instance guard is scoped to the data directory, not to the
+  machine: its mutex name carries a hash of that directory, so two Windows
+  accounts never exclude each other and two sessions of one account always do.
+  A launch that cannot become the running instance either hands off to a window
+  on this desktop or says why; exiting without either is the failure this
+  scoping exists to prevent.
 - Preserve the retained upstream attribution and current publisher metadata.
 
 ## Credentials and privacy

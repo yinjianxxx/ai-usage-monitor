@@ -216,6 +216,13 @@ pub fn credential_consent_copy(language: LanguageId) -> CredentialConsentCopy {
 pub struct Strings {
     pub locale_name: &'static str,
     pub window_title: &'static str,
+    /// Shown when a launch cannot become the running instance and there is no
+    /// existing window on this desktop to bring forward - a second session of
+    /// the same account. Without it that launch simply exited.
+    pub instance_already_running: &'static str,
+    /// Shown when the single-instance guard itself could not be created. The
+    /// Win32 error is appended untranslated.
+    pub instance_lock_failed: &'static str,
     pub refresh: &'static str,
     pub refresh_now: &'static str,
     pub one_minute: &'static str,

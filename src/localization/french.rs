@@ -5,6 +5,10 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Mettre à jour avec WinGet";
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "fr-FR",
     window_title: "Gengchou",
+    instance_already_running:
+        "Gengchou est déjà en cours d'exécution dans une autre session Windows de ce PC. Un seul Gengchou à la fois peut utiliser vos paramètres.",
+    instance_lock_failed:
+        "Gengchou n'a pas pu démarrer : son verrou d'instance unique n'a pas pu être créé.",
     refresh: "Actualiser",
     refresh_now: "Actualiser maintenant",
     one_minute: "1 minute",

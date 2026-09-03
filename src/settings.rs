@@ -1058,6 +1058,16 @@ pub fn app_data_file(name: &str) -> io::Result<PathBuf> {
     Ok(app_data_dir(APP_DIR_NAME)?.join(name))
 }
 
+/// The directory this process reads settings and the usage cache from.
+///
+/// Exposed so the single-instance guard can be named after the location it
+/// protects instead of after the machine: two accounts resolve different
+/// directories and have nothing to exclude each other over, while two sessions
+/// of one account resolve the same directory and must.
+pub(crate) fn app_data_directory() -> io::Result<PathBuf> {
+    app_data_dir(APP_DIR_NAME)
+}
+
 pub(crate) fn record_persistence_warning(context: &str, error: &dyn std::fmt::Display) {
     let warning = format!("{context}: {error}");
     diagnose::log(format!("persistence warning queued: {warning}"));

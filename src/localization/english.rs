@@ -5,6 +5,10 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "en-US",
     window_title: "Gengchou",
+    instance_already_running:
+        "Gengchou is already running in another Windows session on this PC. Only one Gengchou at a time can use your settings.",
+    instance_lock_failed:
+        "Gengchou could not start: its single-instance lock could not be created.",
     refresh: "Refresh",
     refresh_now: "Refresh now",
     one_minute: "1 Minute",

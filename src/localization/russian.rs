@@ -5,6 +5,10 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Обновить через Wi
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "ru-RU",
     window_title: "Gengchou",
+    instance_already_running:
+        "Gengchou уже запущен в другом сеансе Windows на этом компьютере. Использовать ваши настройки одновременно может только один Gengchou.",
+    instance_lock_failed:
+        "Не удалось запустить Gengchou: не удалось создать блокировку единственного экземпляра.",
     refresh: "Обновить",
     refresh_now: "Обновить сейчас",
     one_minute: "1 минута",

@@ -705,7 +705,20 @@ const WIDGET_TOOLTIP_WINDOW_CLASS_NAME: &str = "GengchouWidgetTooltip";
 /// not reflected until the next poll), and be findable by class name so a
 /// second launched instance can ask us to show the detail popup.
 const BROADCAST_WINDOW_CLASS_NAME: &str = "GengchouBroadcast";
-const CURRENT_MUTEX_NAME: &str = "Global\\Gengchou";
+/// Base name of the single-instance mutex.
+///
+/// What must not run twice is not "Gengchou on this machine" but "Gengchou
+/// over one data directory". Settings and the usage cache live under
+/// `%APPDATA%`, so two Windows accounts share no file and have nothing to
+/// exclude each other over, while two sessions of one account (console plus
+/// RDP) share every file and must. The plain machine-wide name this replaces
+/// had the wrong scope: a second signed-in user's launch returned
+/// `ERROR_ALREADY_EXISTS` or `ACCESS_DENIED`, and both of those ended startup
+/// without a window, a tray icon, or a message.
+///
+/// The name still carries `Gengchou`, which is the identity constraint in
+/// docs/INVARIANTS.md; what changed is its scope, not the app's identity.
+const INSTANCE_MUTEX_BASE: &str = "Gengchou-Instance-v2";
 const DETAIL_POPUP_WIDTH: i32 = 408;
 /// Title area above the first provider group.
 const DETAIL_HEADER_H: i32 = 52;
@@ -11929,65 +11942,203 @@ impl Drop for InstanceGuard {
     }
 }
 
+/// Why a launch is not going to become the running instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstanceRefusal {
+    /// An instance is already up on this desktop and was asked to show its
+    /// detail popup. The user got an answer; there is nothing more to say.
+    HandedOff,
+    /// An instance owns this data directory from another session of the same
+    /// account. No window here can be brought forward, so this launch has to
+    /// explain itself rather than vanish.
+    RunningElsewhere,
+    /// The guard could not be created at all.
+    Unavailable(String),
+    /// A relaunch waited out the previous instance and gave up. Logged, not
+    /// shown: nobody clicked anything, and a dialog raised by the taskbar
+    /// watchdog during sign-out would appear from nowhere.
+    PreviousInstanceStuck,
+}
+
 pub(crate) fn acquire_single_instance() -> Option<InstanceGuard> {
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let handle = acquire_named_mutex(&mutex_name(), is_relaunch)?;
-    Some(InstanceGuard { handle })
+    match try_acquire_single_instance(is_relaunch) {
+        Ok(guard) => Some(guard),
+        Err(refusal) => {
+            report_instance_refusal(&refusal);
+            None
+        }
+    }
 }
 
-fn mutex_name() -> String {
+fn try_acquire_single_instance(is_relaunch: bool) -> Result<InstanceGuard, InstanceRefusal> {
+    // Two different questions, answered by two different mechanisms.
+    //
+    // "Is there already a Gengchou on this desktop?" is a window question:
+    // window stations are per session, so finding the broadcast helper proves
+    // the instance is one this user can see right now, whatever build it is.
+    // Handing off to it is what a second double-click should do, and it keeps
+    // working across the release that changes the mutex name below.
+    //
+    // "May I own this data directory?" is the mutex question, and that one has
+    // to reach across sessions.
+    //
+    // A relaunch skips the window check: the instance being replaced may still
+    // have its window while it shuts down, and deferring to it would abandon
+    // the recovery this process exists to perform.
+    if !is_relaunch && notify_existing_instance() {
+        diagnose::log("startup aborted: an instance on this desktop was asked to show details");
+        return Err(InstanceRefusal::HandedOff);
+    }
+
+    let handle = acquire_named_mutex(&mutex_names(), is_relaunch)?;
+    Ok(InstanceGuard { handle })
+}
+
+fn report_instance_refusal(refusal: &InstanceRefusal) {
+    // Settings have not been read yet - reading them here would run the
+    // corrupt-file rescue and queue its warning for a process that is about to
+    // exit - so the language override is unknown and the system language
+    // stands in.
+    let strings = localization::detect_system_language().strings();
+    if let Some(message) = instance_refusal_message(refusal, strings) {
+        show_error_message(strings.window_title, &message);
+    }
+}
+
+/// What to put in front of the user, if anything, when a launch is refused.
+fn instance_refusal_message(refusal: &InstanceRefusal, strings: Strings) -> Option<String> {
+    match refusal {
+        InstanceRefusal::HandedOff | InstanceRefusal::PreviousInstanceStuck => None,
+        InstanceRefusal::RunningElsewhere => Some(strings.instance_already_running.to_string()),
+        InstanceRefusal::Unavailable(detail) => {
+            Some(format!("{}\n\n{detail}", strings.instance_lock_failed))
+        }
+    }
+}
+
+/// The single-instance mutex names to try, in order.
+///
+/// `Global\` first so two sessions of one account still exclude each other;
+/// `Local\` as the fallback for a `Global\` name that cannot be opened, which
+/// keeps this session single-instanced rather than losing the guard
+/// altogether. The suffix is the data directory, lowercased before hashing
+/// because Windows paths compare case-insensitively.
+///
+/// Deriving it from the directory rather than from the account also follows
+/// the `%APPDATA%` -> config -> `%LOCALAPPDATA%` fallback chain for free: two
+/// processes exclude each other exactly when they would write the same files.
+fn mutex_names() -> [String; 2] {
+    #[allow(unused_mut)]
+    let mut suffix = data_directory_mutex_suffix(settings::app_data_directory());
+
     #[cfg(debug_assertions)]
-    if let Some(suffix) = std::env::var_os("GENGCHOU_TEST_MUTEX_SUFFIX") {
-        if !suffix.is_empty() {
-            let suffix = suffix.to_string_lossy();
-            return format!("{CURRENT_MUTEX_NAME}-{suffix}");
+    if let Some(test_suffix) = std::env::var_os("GENGCHOU_TEST_MUTEX_SUFFIX") {
+        if !test_suffix.is_empty() {
+            suffix = format!("{suffix}-{}", test_suffix.to_string_lossy());
         }
     }
-    CURRENT_MUTEX_NAME.to_string()
+
+    instance_mutex_names(&suffix)
 }
 
-fn acquire_named_mutex(name: &str, is_relaunch: bool) -> Option<HANDLE> {
-    let mutex_name = native_interop::wide_str(name);
-    unsafe {
-        let handle = match CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) {
-            Ok(handle) => handle,
-            Err(error) => {
-                diagnose::log_error(
-                    "startup aborted: unable to create single-instance mutex",
-                    error,
-                );
-                return None;
-            }
-        };
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            return Some(handle);
-        }
-        if !is_relaunch {
-            notify_existing_instance();
-            diagnose::log("startup aborted: another instance is already running");
-            let _ = CloseHandle(handle);
-            return None;
-        }
+fn instance_mutex_names(suffix: &str) -> [String; 2] {
+    [
+        format!("Global\\{INSTANCE_MUTEX_BASE}-{suffix}"),
+        format!("Local\\{INSTANCE_MUTEX_BASE}-{suffix}"),
+    ]
+}
 
-        diagnose::log(format!(
-            "relaunch: waiting for previous instance mutex {name}"
-        ));
-        for attempt in 1..=3 {
-            let wait_result = WaitForSingleObject(handle, 10_000);
-            if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
-                return Some(handle);
-            }
+/// Hash the data directory into the mutex name's suffix.
+///
+/// Both degraded paths return a fixed suffix, which puts every account that
+/// hits them back on one shared machine-wide guard. That is the old behavior,
+/// not a new failure, but it is never silent: it is the only way the name can
+/// stop distinguishing accounts.
+fn data_directory_mutex_suffix(directory: std::io::Result<std::path::PathBuf>) -> String {
+    let directory = match directory {
+        Ok(directory) => directory,
+        Err(error) => {
             diagnose::log(format!(
-                "relaunch: previous instance still owns {name} after wait {attempt}/3 ({wait_result:?})"
+                "unable to resolve the data directory for the single-instance name: {error}"
             ));
+            return "unresolved".to_string();
         }
-        let _ = CloseHandle(handle);
-        diagnose::log("startup aborted: previous instance never released the mutex");
-        None
+    };
+    let key = directory.to_string_lossy().to_lowercase();
+    match updater::sha256_hex(key.as_bytes()) {
+        Ok(digest) if digest.len() >= 16 => digest[..16].to_string(),
+        Ok(digest) => {
+            diagnose::log(format!(
+                "single-instance name digest was too short ({} chars)",
+                digest.len()
+            ));
+            "unhashed".to_string()
+        }
+        Err(error) => {
+            diagnose::log(format!(
+                "unable to hash the data directory for the single-instance name: {error}"
+            ));
+            "unhashed".to_string()
+        }
     }
 }
 
-fn notify_existing_instance() {
+fn acquire_named_mutex(names: &[String; 2], is_relaunch: bool) -> Result<HANDLE, InstanceRefusal> {
+    let mut last_error = String::from("no mutex name was tried");
+    for name in names {
+        let mutex_name = native_interop::wide_str(name);
+        unsafe {
+            let handle = match CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    last_error = format!("{name}: {error}");
+                    continue;
+                }
+            };
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                return Ok(handle);
+            }
+            if !is_relaunch {
+                diagnose::log(format!(
+                    "startup aborted: {name} is held by another session of this account"
+                ));
+                let _ = CloseHandle(handle);
+                return Err(InstanceRefusal::RunningElsewhere);
+            }
+
+            diagnose::log(format!(
+                "relaunch: waiting for previous instance mutex {name}"
+            ));
+            for attempt in 1..=3 {
+                let wait_result = WaitForSingleObject(handle, 10_000);
+                if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
+                    return Ok(handle);
+                }
+                diagnose::log(format!(
+                    "relaunch: previous instance still owns {name} after wait {attempt}/3 ({wait_result:?})"
+                ));
+            }
+            let _ = CloseHandle(handle);
+            diagnose::log("startup aborted: previous instance never released the mutex");
+            return Err(InstanceRefusal::PreviousInstanceStuck);
+        }
+    }
+    diagnose::log_error(
+        "startup aborted: unable to create single-instance mutex",
+        &last_error,
+    );
+    Err(InstanceRefusal::Unavailable(last_error))
+}
+
+/// Ask an instance already running on this desktop to show its detail popup,
+/// reporting whether one was found.
+///
+/// `FindWindowW` searches the calling process's window station and desktop, so
+/// a hit is by construction an instance the user can see right now - and a
+/// miss says nothing about other sessions, which is why the mutex still has to
+/// answer that separately.
+fn notify_existing_instance() -> bool {
     unsafe {
         let helper_class = native_interop::wide_str(BROADCAST_WINDOW_CLASS_NAME);
         if let Ok(existing) = FindWindowW(PCWSTR::from_raw(helper_class.as_ptr()), PCWSTR::null()) {
@@ -11999,9 +12150,11 @@ fn notify_existing_instance() {
                     LPARAM(WM_LBUTTONUP as isize),
                 );
                 diagnose::log("asked existing Gengchou instance to show details");
+                return true;
             }
         }
     }
+    false
 }
 
 pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
@@ -18627,5 +18780,71 @@ mod reset_notification_tests {
             (1_732, 980)
         );
         assert_eq!(bottom_right_default_position(work, 2_000, 1_100, 8), (8, 8));
+    }
+
+    #[test]
+    fn two_accounts_get_two_single_instance_names_and_one_account_gets_one() {
+        let alice = data_directory_mutex_suffix(Ok(PathBuf::from(
+            r"C:\Users\alice\AppData\Roaming\Gengchou",
+        )));
+        let bob = data_directory_mutex_suffix(Ok(PathBuf::from(
+            r"C:\Users\bob\AppData\Roaming\Gengchou",
+        )));
+        assert_ne!(
+            alice, bob,
+            "two accounts must not serialize on one machine-wide guard"
+        );
+
+        // Windows paths compare case-insensitively, so the same directory
+        // spelled differently in two sessions must still exclude itself.
+        let alice_shouting = data_directory_mutex_suffix(Ok(PathBuf::from(
+            r"C:\USERS\ALICE\APPDATA\ROAMING\GENGCHOU",
+        )));
+        assert_eq!(alice, alice_shouting);
+
+        let names = instance_mutex_names(&alice);
+        assert_eq!(names[0], format!("Global\\{INSTANCE_MUTEX_BASE}-{alice}"));
+        assert_eq!(names[1], format!("Local\\{INSTANCE_MUTEX_BASE}-{alice}"));
+        assert!(
+            names[0].starts_with("Global\\"),
+            "the cross-session name must be tried first"
+        );
+    }
+
+    #[test]
+    fn a_data_directory_that_cannot_be_resolved_falls_back_to_a_fixed_name() {
+        let suffix = data_directory_mutex_suffix(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no APPDATA",
+        )));
+        assert_eq!(suffix, "unresolved");
+    }
+
+    #[test]
+    fn only_a_launch_with_nowhere_to_hand_off_to_says_anything() {
+        let strings = LanguageId::English.strings();
+
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::HandedOff, strings),
+            None,
+            "the existing window is the answer; a dialog on top of it is noise"
+        );
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::PreviousInstanceStuck, strings),
+            None,
+            "nobody clicked anything on the watchdog relaunch path"
+        );
+        assert_eq!(
+            instance_refusal_message(&InstanceRefusal::RunningElsewhere, strings),
+            Some(strings.instance_already_running.to_string())
+        );
+
+        let unavailable = instance_refusal_message(
+            &InstanceRefusal::Unavailable("Global\\X: access denied".to_string()),
+            strings,
+        )
+        .expect("an unusable guard must be reported");
+        assert!(unavailable.starts_with(strings.instance_lock_failed));
+        assert!(unavailable.ends_with("Global\\X: access denied"));
     }
 }
