@@ -11967,9 +11967,14 @@ enum InstanceRefusal {
     /// An instance is already up on this desktop and was asked to show its
     /// detail popup. The user got an answer; there is nothing more to say.
     HandedOff,
-    /// An instance owns this data directory from another session of the same
-    /// account. No window here can be brought forward, so this launch has to
-    /// explain itself rather than vanish.
+    /// An instance already owns this data directory and there is no window on
+    /// this desktop to bring forward, so this launch has to explain itself
+    /// rather than vanish.
+    ///
+    /// Normally that instance is another session of the same account. It can
+    /// also be one in this session that has no findable broadcast window yet,
+    /// reached through the `Local\` fallback below - which is why the message
+    /// names the likely case rather than asserting it.
     RunningElsewhere,
     /// The guard could not be created at all.
     Unavailable(String),
@@ -12119,9 +12124,9 @@ fn acquire_named_mutex(names: &[String; 2], is_relaunch: bool) -> Result<HANDLE,
                 return Ok(handle);
             }
             if !is_relaunch {
-                diagnose::log(format!(
-                    "startup aborted: {name} is held by another session of this account"
-                ));
+                // The name carries the scope: a `Global\` one is held across
+                // sessions, a `Local\` one within this session.
+                diagnose::log(format!("startup aborted: {name} is already held"));
                 let _ = CloseHandle(handle);
                 return Err(InstanceRefusal::RunningElsewhere);
             }

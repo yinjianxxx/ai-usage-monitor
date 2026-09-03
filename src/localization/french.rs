@@ -6,11 +6,11 @@ pub(super) const STRINGS: Strings = Strings {
     locale_name: "fr-FR",
     window_title: "Gengchou",
     instance_already_running:
-        "Gengchou est déjà en cours d'exécution dans une autre session Windows de ce PC. Un seul Gengchou à la fois peut utiliser vos paramètres.",
+        "Gengchou utilise déjà vos paramètres, très probablement dans une autre session Windows de ce PC. Un seul à la fois peut les utiliser.",
     instance_lock_failed:
         "Gengchou n'a pas pu démarrer : son verrou d'instance unique n'a pas pu être créé.",
     diagnostics_unavailable:
-        "La journalisation de diagnostic est indisponible : les problemes, pannes comprises, ne laisseront aucune trace sur ce PC.",
+        "La journalisation de diagnostic est indisponible : les problèmes, pannes comprises, ne laisseront aucune trace sur ce PC.",
     refresh: "Actualiser",
     refresh_now: "Actualiser maintenant",
     one_minute: "1 minute",

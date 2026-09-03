@@ -217,8 +217,9 @@ pub struct Strings {
     pub locale_name: &'static str,
     pub window_title: &'static str,
     /// Shown when a launch cannot become the running instance and there is no
-    /// existing window on this desktop to bring forward - a second session of
-    /// the same account. Without it that launch simply exited.
+    /// existing window on this desktop to bring forward. Usually a second
+    /// session of the same account, so the wording names that as likely rather
+    /// than asserting it. Without this the launch simply exited.
     pub instance_already_running: &'static str,
     /// Shown when the single-instance guard itself could not be created. The
     /// Win32 error is appended untranslated.

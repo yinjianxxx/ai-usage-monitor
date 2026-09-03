@@ -6,7 +6,7 @@ pub(super) const STRINGS: Strings = Strings {
     locale_name: "nl-NL",
     window_title: "Gengchou",
     instance_already_running:
-        "Gengchou wordt al uitgevoerd in een andere Windows-sessie op deze pc. Er kan maar één Gengchou tegelijk je instellingen gebruiken.",
+        "Gengchou gebruikt je instellingen al, hoogstwaarschijnlijk in een andere Windows-sessie op deze pc. Er kan er maar één tegelijk gebruik van maken.",
     instance_lock_failed:
         "Gengchou kon niet worden gestart: de vergrendeling voor één exemplaar kon niet worden gemaakt.",
     diagnostics_unavailable:

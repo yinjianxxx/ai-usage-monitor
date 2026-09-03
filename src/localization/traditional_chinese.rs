@@ -5,7 +5,7 @@ pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "透過 WinGet 更新";
 pub(super) const STRINGS: Strings = Strings {
     locale_name: "zh-TW",
     window_title: "更籌",
-    instance_already_running: "本機的另一個 Windows 工作階段中已經在執行更籌。同一時間只能有一個更籌使用你的設定。",
+    instance_already_running: "更籌已經在使用你的設定執行，多半是在本機的另一個 Windows 工作階段裡。同一時間只能有一個使用它們。",
     instance_lock_failed: "更籌無法啟動：無法建立單一執行個體鎖定。",
     diagnostics_unavailable: "診斷記錄不可用，因此包括當機在內的問題不會在這台電腦上留下任何紀錄。",
     refresh: "重新整理",

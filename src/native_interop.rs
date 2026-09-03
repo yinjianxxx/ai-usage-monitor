@@ -99,20 +99,23 @@ pub fn run_with_timeout(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Ok(None) => {
-                match &job {
-                    Some(job) => job.terminate(),
-                    None => {
-                        let _ = child.kill();
-                    }
-                }
-                let _ = child.wait();
+                end_process_tree(&job, &mut child);
                 // The readers see EOF as soon as the write ends close; joining
                 // keeps them from outliving this call.
                 let _ = collect(stdout);
                 let _ = collect(stderr);
                 return Err(ProcessRunError::TimedOut);
             }
-            Err(_) => return Err(ProcessRunError::WaitFailed),
+            // A `try_wait` failure means this child can no longer be observed,
+            // which is not a reason to walk away from it: returning here used
+            // to leave the process, its tree and both reader threads running
+            // with nobody left to end them.
+            Err(_) => {
+                end_process_tree(&job, &mut child);
+                let _ = collect(stdout);
+                let _ = collect(stderr);
+                return Err(ProcessRunError::WaitFailed);
+            }
         }
     };
 
@@ -121,6 +124,17 @@ pub fn run_with_timeout(
         stdout: collect(stdout)?,
         stderr: collect(stderr)?,
     })
+}
+
+/// End the child and everything it started, then reap it.
+fn end_process_tree(job: &Option<ProcessTreeJob>, child: &mut std::process::Child) {
+    match job {
+        Some(job) => job.terminate(),
+        None => {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
 }
 
 type DrainHandle = Option<std::thread::JoinHandle<Vec<u8>>>;

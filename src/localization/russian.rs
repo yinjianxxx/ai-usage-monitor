@@ -6,7 +6,7 @@ pub(super) const STRINGS: Strings = Strings {
     locale_name: "ru-RU",
     window_title: "Gengchou",
     instance_already_running:
-        "Gengchou уже запущен в другом сеансе Windows на этом компьютере. Использовать ваши настройки одновременно может только один Gengchou.",
+        "Gengchou уже работает с вашими настройками, скорее всего в другом сеансе Windows на этом компьютере. Использовать их одновременно может только один.",
     instance_lock_failed:
         "Не удалось запустить Gengchou: не удалось создать блокировку единственного экземпляра.",
     diagnostics_unavailable:
