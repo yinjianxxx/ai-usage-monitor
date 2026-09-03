@@ -1,10 +1,10 @@
 # v2.5.2 release verification
 
 - Date: 2026-09-03
-- Candidate: `claude/v2.5.2-followups`, 16 commits ahead of `main` /
-  `3c123f2`, which is also the `v2.5.1` tag. The release-tag ancestry
-  requirement in docs/INVARIANTS.md is satisfied: `v2.5.1` is an ancestor of
-  this branch. Not tagged, not pushed, no PR opened.
+- Candidate: `claude/v2.5.2-followups`, branched from `main` / `3c123f2`,
+  which is also the `v2.5.1` tag. The release-tag ancestry requirement in
+  docs/INVARIANTS.md is satisfied: `v2.5.1` is an ancestor of this branch.
+  Open as PR #7. Not tagged, not merged.
   `Cargo.toml` and `Cargo.lock` read `2.5.2`.
 - Scope: fifteen changes. Most are a case of the app stopping without saying
   so - a background-thread panic freezing the usage for the life of the
@@ -99,12 +99,28 @@ runs and terminates a job object on timeout.
   into a 30-second timeout - the exact reported failure, an ordinary large
   answer read as an unresponsive probe.
 - Replacing the job-object kill with `Child::kill` made the tree test report
-  `grandchild 122192 outlived the timeout that killed its parent`, and left a
-  real orphaned `powershell.exe` behind, which was then cleaned up.
+  that the grandchild outlived the end of the run, and left a real orphaned
+  `powershell.exe` behind, which was then cleaned up.
 
-Cost: the tree-kill test waits out a real 5-second timeout, so `cargo test`
-went from about 0.2s to about 5.1s. Accepted deliberately - it is the only
-evidence that the job object does what its doc comment claims.
+The tree test was rewritten once, after CI caught it being flaky. The first
+version drove a real 5-second timeout and then read the process id the
+grandchild was supposed to have written; on a GitHub runner PowerShell had not
+finished starting inside that window, so the marker did not exist and the test
+failed with `NotFound`. It passed on the first CI run and failed on the second
+with no relevant change between them - a race, not a regression. It now drives
+`end_process_tree` directly, which is the function both failure paths route
+through, and waits for the grandchild to exist before ending it. The deadline
+there bounds a hang rather than timing the interpreter, so a slow machine costs
+seconds instead of a false failure. The suite is 0.7-0.9s across five
+consecutive runs, and the job-object mutation is still caught.
+
+What the rewrite gives up: a mutation at the call site - replacing
+`end_process_tree(&job, &mut child)` inside the timeout branch with a bare
+`child.kill()` - would no longer be caught, because the test no longer goes
+through a real timeout. `run_with_timeout` returning `TimedOut` is still
+covered by `command_runner_distinguishes_spawn_failure_from_timeout` in
+`poller.rs`, which does not depend on the child reaching any state and so
+cannot race.
 
 ### Update target identity
 
@@ -135,6 +151,36 @@ is exactly how `ReplaceFileW` performs the replacement. The note was rewritten
 to the measured outcome - the update succeeds and the other account keeps
 running the previous build from the renamed file until it restarts. Commit
 `0f064da`.
+
+### Automated review round on PR #7
+
+GitHub's Copilot reviewer raised five comments - three distinct findings, one
+of them repeated once per affected language file. All three were checked
+against the source, all three held, and all three are fixed in `7aa5172`.
+
+- `run_with_timeout` returned `WaitFailed` from a `try_wait` error without
+  ending the child or joining the drain threads, contradicting the cleanup its
+  own doc comment promises. Both failure paths now route through
+  `end_process_tree`. A `try_wait` failure cannot be induced in a test - it
+  calls `GetExitCodeProcess` on a handle this process owns - so this change has
+  no regression test.
+- The "another Windows session" wording was wrong on the `Local\` fallback
+  path. That fallback is reached only when the `Global\` name cannot be created
+  at all, and a `Local\` name is per session, so `ERROR_ALREADY_EXISTS` there
+  means another instance in *this* session whose broadcast window was not yet
+  findable. The message now names the likely case rather than asserting it, and
+  the log line reports only the mutex name, whose prefix already states the
+  scope.
+- French, Spanish and Brazilian Portuguese `diagnostics_unavailable` were
+  written without accents. German has the same defect (`verfuegbar`,
+  `Abstuerze`) and was not flagged; it is fixed too.
+
+Two of the three landed on code written earlier in this same session and had
+survived two passes by its author. What the reviewer did not raise is anything
+about the design - whether the two facts the update-target check relies on are
+sufficient, or that German had the same accent defect as the three languages it
+did flag. It reads lines well; that is not the same as the independent review
+still listed under *Open*.
 
 ## Not verified
 

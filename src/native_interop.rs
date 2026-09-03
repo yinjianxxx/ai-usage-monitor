@@ -702,16 +702,23 @@ mod tests {
         assert_eq!(output.stdout.len(), SIZE);
     }
 
-    /// A timed-out command must take its grandchildren with it.
+    /// Ending a run must take the child's descendants with it.
     ///
     /// The Claude CLI is normally `claude.cmd`, so the process actually doing
-    /// the work is a `node` under a `cmd.exe` shim. Killing only the direct
-    /// child left that work running past the timeout that was supposed to stop
-    /// it.
+    /// the work is a `node` under a `cmd.exe` shim. Ending only the direct
+    /// child left that work running past the deadline meant to stop it.
+    ///
+    /// This drives `end_process_tree`, which both of `run_with_timeout`'s
+    /// failure paths route through, rather than driving a real timeout. An
+    /// earlier version did the latter and was flaky: it needed the grandchild
+    /// to finish starting before the deadline expired, so a cold machine and a
+    /// genuine regression produced the same red test. Waiting for the
+    /// grandchild to exist first removes the race - a slow interpreter start
+    /// costs seconds here instead of a false failure.
     #[test]
-    fn a_timeout_ends_the_whole_process_tree() {
+    fn ending_a_run_takes_the_grandchildren_with_it() {
         // No parentheses or spaces in the name: `cmd /c` re-parses its
-        // argument, and a thread id like `ThreadId(3)` is a syntax error there.
+        // argument, and a name like `ThreadId(3)` is a syntax error there.
         let stem = std::env::temp_dir().join(format!(
             "gengchou-tree-kill-{}-{}",
             std::process::id(),
@@ -735,30 +742,50 @@ mod tests {
         )
         .expect("write the shim");
 
-        let mut command = std::process::Command::new(system_program("cmd.exe"));
-        command
+        let mut child = std::process::Command::new(system_program("cmd.exe"))
             .arg("/c")
             .arg(&shim)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the shim");
 
-        assert_eq!(
-            run_with_timeout(&mut command, std::time::Duration::from_secs(5)),
-            Err(ProcessRunError::TimedOut)
+        let job = ProcessTreeJob::containing(&child);
+        assert!(
+            job.is_some(),
+            "a freshly spawned child must be placeable in a job object"
         );
 
-        let recorded = std::fs::read_to_string(&marker)
-            .expect("the grandchild must have recorded its process id");
+        let grandchild = process_id_once_recorded(&marker, std::time::Duration::from_secs(60));
+        end_process_tree(&job, &mut child);
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_file(&shim);
-        let grandchild: u32 = recorded
-            .trim()
-            .parse()
-            .unwrap_or_else(|error| panic!("unusable process id {recorded:?}: {error}"));
+
         assert!(
             process_has_exited(grandchild),
-            "grandchild {grandchild} outlived the timeout that killed its parent"
+            "grandchild {grandchild} outlived the end of the run that started it"
         );
+    }
+
+    /// Block until the grandchild has written a usable process id, or give up.
+    ///
+    /// The deadline is generous on purpose: it bounds a hang, it does not time
+    /// the interpreter. A partially written file simply is not parseable yet.
+    fn process_id_once_recorded(marker: &std::path::Path, deadline: std::time::Duration) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                return pid;
+            }
+            assert!(
+                started.elapsed() < deadline,
+                "the grandchild recorded no process id within {deadline:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Whether a process id refers to something that is no longer running.
