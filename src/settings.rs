@@ -1086,31 +1086,62 @@ pub(crate) fn take_persistence_warning() -> Option<String> {
     })
 }
 
-fn read_settings_content() -> Option<String> {
+/// What was on disk where the settings file should be.
+///
+/// `Missing` and `Unreadable` were once the same `None`, which is what let a
+/// file that exists but cannot be read fall through to defaults with no
+/// rescue: invalid UTF-8, a denied ACL or a sharing violation all took the
+/// "there is nothing here" path, and the first save then overwrote the
+/// original. Only `Missing` is genuinely nothing.
+enum SettingsContent {
+    Missing,
+    Text(String),
+    Unreadable(String),
+}
+
+fn read_settings_content() -> SettingsContent {
     let current_path = match settings_path_for(APP_DIR_NAME) {
         Ok(path) => path,
         Err(error) => {
             record_persistence_warning("Unable to locate the settings directory", &error);
-            return None;
+            // Without a path there is no file to preserve and nowhere to put
+            // it; defaults are all that is left.
+            return SettingsContent::Missing;
         }
     };
-    match std::fs::read_to_string(&current_path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            record_persistence_warning("Unable to read settings", &error);
+    let read = std::fs::read_to_string(&current_path);
+    if let Err(error) = read.as_ref() {
+        if error.kind() != io::ErrorKind::NotFound {
             diagnose::log_error(
                 &format!("settings read failed path={}", current_path.display()),
-                &error,
+                error,
             );
-            None
         }
+    }
+    classify_settings_read(read)
+}
+
+/// Only "the file is not there" is nothing. Every other read failure means a
+/// file exists that this build cannot use, and losing it to defaults is the
+/// outcome the quarantine exists to prevent.
+fn classify_settings_read(read: io::Result<String>) -> SettingsContent {
+    match read {
+        Ok(content) => SettingsContent::Text(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SettingsContent::Missing,
+        Err(error) => SettingsContent::Unreadable(error.to_string()),
     }
 }
 
 pub(crate) fn load() -> SettingsFile {
-    let Some(content) = read_settings_content() else {
-        return SettingsFile::default();
+    let content = match read_settings_content() {
+        SettingsContent::Missing => return SettingsFile::default(),
+        SettingsContent::Text(content) => content,
+        // A file that cannot be read is preserved on the same terms as one
+        // that cannot be parsed. The reason differs; the consequence of
+        // loading defaults over it does not.
+        SettingsContent::Unreadable(error) => {
+            return defaults_after_unreadable_settings(settings_path_for(APP_DIR_NAME), &error);
+        }
     };
     let settings: SettingsFile = match serde_json::from_str(&content) {
         Ok(settings) => settings,
@@ -1166,12 +1197,12 @@ fn quarantine_unreadable_settings(path: &Path) -> io::Result<PathBuf> {
 /// and nothing reached the user.
 fn defaults_after_unreadable_settings(
     path: io::Result<PathBuf>,
-    error: &serde_json::Error,
+    error: &dyn std::fmt::Display,
 ) -> SettingsFile {
     let path = match path {
         Ok(path) => path,
         Err(path_error) => {
-            diagnose::log(format!("settings parse failed: {error}"));
+            diagnose::log(format!("settings could not be loaded: {error}"));
             record_persistence_warning("Unable to locate the settings file", &path_error);
             return SettingsFile::default();
         }
@@ -1179,7 +1210,7 @@ fn defaults_after_unreadable_settings(
     match quarantine_unreadable_settings(&path) {
         Ok(quarantined) => {
             diagnose::log(format!(
-                "settings parse failed; original kept at {} and defaults loaded: {error}",
+                "settings could not be loaded; original kept at {} and defaults loaded: {error}",
                 quarantined.display()
             ));
             record_persistence_warning(
@@ -1477,6 +1508,42 @@ mod tests {
         assert!(serde_json::from_str::<SettingsFile>("{not-json").is_err());
     }
 
+    /// A file that exists but cannot be read is not the same as no file.
+    ///
+    /// Both used to return `None`, so invalid UTF-8, a denied ACL and a
+    /// sharing violation all took the "there is nothing here" path: defaults
+    /// loaded with no quarantine, and the first save overwrote the original.
+    /// That is the same data loss the `.corrupt` rescue was added to stop, and
+    /// it left the README's claim about unreadable files overstated.
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_not_treated_as_absent() {
+        assert!(matches!(
+            classify_settings_read(Ok("{}".to_string())),
+            SettingsContent::Text(content) if content == "{}"
+        ));
+        assert!(
+            matches!(
+                classify_settings_read(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))),
+                SettingsContent::Missing
+            ),
+            "a first run has nothing to preserve"
+        );
+
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(
+                    classify_settings_read(Err(io::Error::new(kind, "unreadable"))),
+                    SettingsContent::Unreadable(_)
+                ),
+                "{kind:?} leaves a real file on disk that defaults would erase"
+            );
+        }
+    }
+
     /// An unreadable settings file must be kept, not silently replaced.
     ///
     /// Falling back to defaults is not a read-only outcome: the defaults carry
@@ -1484,10 +1551,11 @@ mod tests {
     /// first-run prompt and runs an update check, and both of those save. The
     /// user's layout, language, provider selection and consent record went
     /// away within seconds of launch, with only a diagnostic line to show for
-    /// it. Asserted on `defaults_after_unreadable_settings`, the whole
-    /// parse-failure path `load` hands off to, so dropping the rescue from it
-    /// fails here; `load` itself resolves the real `%APPDATA%` location and
-    /// cannot be called from a test.
+    /// it. Asserted on `defaults_after_unreadable_settings`, which every
+    /// failed load hands off to - a parse failure and, since this round, a
+    /// read failure - so dropping the rescue from it fails here. `load` itself
+    /// resolves the real `%APPDATA%` location and cannot be called from a
+    /// test.
     #[test]
     fn an_unreadable_settings_file_is_kept_before_defaults_replace_it() {
         let nonce = std::time::SystemTime::now()

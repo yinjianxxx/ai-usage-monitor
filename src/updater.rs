@@ -282,6 +282,23 @@ fn apply_update(
         parent.wait_for_exit(PROCESS_EXIT_TIMEOUT)?;
     }
 
+    // Identity before anything else, because "anything else" includes starting
+    // the target. Every failure path below restarts it through
+    // `relaunch_unchanged_target`, so a check placed after them left three
+    // ways to have an arbitrary path executed: a missing source, a leftover
+    // backup, or a target that could not be hashed. Confirmed by running the
+    // helper with a dead pid and a nonexistent source - the named file ran.
+    let installed_hash = file_sha256_hex(&target, "the installed app");
+    let helper_hash = std::env::current_exe()
+        .ok()
+        .and_then(|helper| file_sha256_hex(&helper, "the updater helper").ok());
+    confirm_update_target(
+        &target,
+        parent_image.as_deref(),
+        helper_hash.as_deref(),
+        installed_hash.as_deref().ok(),
+    )?;
+
     // From this point onward the previous process is known to be gone. Every
     // failure before the atomic replace must restart the unchanged target,
     // including a staged download removed while the helper was starting.
@@ -303,23 +320,12 @@ fn apply_update(
         );
     }
 
-    let original_hash = match file_sha256_hex(&target, "the installed app") {
+    // Confirmed above, so restarting the target here is restarting our own
+    // installation.
+    let original_hash = match installed_hash {
         Ok(hash) => hash,
         Err(error) => return relaunch_unchanged_target(&target, error),
     };
-
-    // A target this helper cannot tie to its own installation is not relaunched
-    // either: starting it would execute an arbitrary path chosen by whoever
-    // wrote the arguments, which is worse than doing nothing.
-    let helper_hash = std::env::current_exe()
-        .ok()
-        .and_then(|helper| file_sha256_hex(&helper, "the updater helper").ok());
-    confirm_update_target(
-        &target,
-        parent_image.as_deref(),
-        helper_hash.as_deref(),
-        &original_hash,
-    )?;
     let ready_marker = match new_ready_marker_path() {
         Ok(marker) => marker,
         Err(error) => return relaunch_unchanged_target(&target, error),
@@ -1293,42 +1299,53 @@ impl ParentProcess {
 /// Whether `--apply-update` was pointed at the installation that started it.
 ///
 /// The helper accepts a target path and a source path and replaces one with
-/// the other. Nothing in that contract said the target had to be this install,
-/// so a shortcut or scheduled task planted with different arguments turned the
-/// updater into a general file-replacement step. Two independent facts settle
-/// it, and one of them is always available:
+/// the other, and starts the target on several failure paths. Nothing in that
+/// contract said the target had to be this install, so a shortcut or scheduled
+/// task planted with different arguments turned the updater into a general
+/// file-replacement and file-execution step. Two facts narrow it:
 ///
-/// * The parent process's own image path. Exact, and the normal case, since
+/// * The parent process's own image path. The normal case, since
 ///   `begin_self_update` spawns the helper before shutting down.
-/// * Failing that - the parent can be gone before the helper opens it - the
-///   helper's own bytes. It is a copy of the executable that spawned it, so a
-///   target that does not hash the same is not that installation. This is also
-///   what catches an invocation that names a pid which was never alive.
+/// * The helper's own bytes, for when the parent is already gone. It is a copy
+///   of the executable that spawned it, so a target that does not hash the
+///   same is not that installation.
+///
+/// What this is not: proof that the target *started* this helper. Both facts
+/// describe shape, not provenance - a caller who can start a program and run
+/// the helper can satisfy either one. It does not cross a privilege boundary
+/// and is not meant to: anyone who can run the helper as this user can already
+/// write this user's files. What it removes is the helper being usable as a
+/// general "replace and run this path" step by an invocation that has no
+/// relationship to the install at all. docs/RELEASE_VERIFICATION-v2.5.2.md
+/// records that limit.
 fn confirm_update_target(
     target: &Path,
     parent_image: Option<&Path>,
     helper_hash: Option<&str>,
-    target_hash: &str,
+    target_hash: Option<&str>,
 ) -> Result<(), String> {
-    if let Some(parent_image) = parent_image {
-        return if normalize_path(parent_image) == normalize_path(target) {
-            Ok(())
-        } else {
-            Err(format!(
-                "The update target {} is not the running app at {}. Refusing to replace it.",
-                target.display(),
-                parent_image.display()
-            ))
-        };
+    // Either fact is enough, because neither is available in every honest
+    // case. The parent can already be gone before this helper opens it, and a
+    // pid recycled in that window names an unrelated program's image - which
+    // would otherwise abort a legitimate update and leave the user with no
+    // running app.
+    if parent_image.is_some_and(|image| normalize_path(image) == normalize_path(target)) {
+        return Ok(());
+    }
+    if let (Some(helper_hash), Some(target_hash)) = (helper_hash, target_hash) {
+        if helper_hash.eq_ignore_ascii_case(target_hash) {
+            return Ok(());
+        }
     }
 
-    match helper_hash {
-        Some(helper_hash) if helper_hash.eq_ignore_ascii_case(target_hash) => Ok(()),
-        _ => Err(format!(
-            "The update target {} is not the installation that started this updater. Refusing to replace it.",
-            target.display()
-        )),
-    }
+    let observed = match parent_image {
+        Some(image) => format!(" The process that asked for it is {}.", image.display()),
+        None => String::new(),
+    };
+    Err(format!(
+        "The update target {} is not the installation that started this updater.{observed} Refusing to replace or start it.",
+        target.display()
+    ))
 }
 
 /// Create the updater's working directory, refusing a redirected one.
@@ -2045,49 +2062,105 @@ mod tests {
     #[test]
     fn the_update_target_has_to_be_the_installation_that_asked_for_it() {
         let target = Path::new(r"C:\Apps\Gengchou\gengchou.exe");
-        let hash = "aa";
+        let hash = Some("aa");
 
         // The normal case: the parent is still open and is that file. Path
         // spelling is compared the way Windows compares it.
         assert!(
-            confirm_update_target(target, Some(target), Some(hash), hash).is_ok(),
+            confirm_update_target(target, Some(target), hash, hash).is_ok(),
             "the running app must be able to update itself"
         );
         assert!(
             confirm_update_target(
                 target,
                 Some(Path::new(r"c:\apps\gengchou/gengchou.exe")),
-                Some(hash),
+                hash,
                 hash
             )
             .is_ok(),
             "case and separators are not an identity difference on Windows"
         );
 
-        // A parent that is some other program does not get to nominate a
-        // target, and a matching helper hash does not rescue it.
-        let error = confirm_update_target(
-            target,
-            Some(Path::new(r"C:\Windows\System32\cmd.exe")),
-            Some(hash),
-            hash,
-        )
-        .expect_err("a foreign parent must not choose the target");
-        assert!(error.contains("cmd.exe"), "got {error}");
-
-        // The parent can be gone before the helper opens it. The helper is a
-        // copy of the app that spawned it, so its own bytes answer instead.
+        // The parent can be gone before the helper opens it, or its pid can
+        // have been recycled by an unrelated program in that window. The
+        // helper is a copy of the app that spawned it, so its own bytes answer
+        // for both - refusing there would abort a legitimate update and leave
+        // the user with nothing running.
         assert!(
-            confirm_update_target(target, None, Some(hash), hash).is_ok(),
+            confirm_update_target(target, None, hash, hash).is_ok(),
             "a parent that exited quickly must not lose the update"
         );
         assert!(
-            confirm_update_target(target, None, Some("bb"), hash).is_err(),
-            "a dead pid plus a foreign target is the shape this check exists for"
+            confirm_update_target(
+                target,
+                Some(Path::new(r"C:\Windows\System32\cmd.exe")),
+                hash,
+                hash
+            )
+            .is_ok(),
+            "a recycled pid must not cost the update when the bytes still agree"
+        );
+
+        // Neither fact holds: this is the shape the check exists for.
+        let error = confirm_update_target(
+            target,
+            Some(Path::new(r"C:\Windows\System32\cmd.exe")),
+            hash,
+            Some("bb"),
+        )
+        .expect_err("a foreign parent and foreign bytes must be refused");
+        assert!(error.contains("cmd.exe"), "got {error}");
+        assert!(
+            confirm_update_target(target, None, hash, Some("bb")).is_err(),
+            "a dead pid plus a foreign target is refused"
+        );
+        assert!(
+            confirm_update_target(target, None, hash, None).is_err(),
+            "a target that cannot even be hashed is not confirmed"
         );
         assert!(
             confirm_update_target(target, None, None, hash).is_err(),
             "with neither fact available, refuse"
+        );
+    }
+
+    /// The identity check must run before anything that starts the target.
+    ///
+    /// `apply_update` restarts the target through `relaunch_unchanged_target`
+    /// on a missing source, a leftover backup, and an unreadable target. With
+    /// the check placed after those, `--apply-update <any path> <missing> <dead
+    /// pid> <hash>` executed that path - verified by running the helper, which
+    /// ran a decoy `.cmd`. This pins the ordering that fixed it.
+    #[test]
+    fn an_unconfirmed_target_is_never_started_by_a_failure_path() {
+        let dir = TestDir::new("apply-order");
+        let victim = dir.join("someone-elses.exe");
+        std::fs::write(&victim, b"not ours").unwrap();
+
+        let error = apply_update(
+            victim.clone(),
+            dir.join("no-such-download.exe"),
+            // A pid that cannot be opened, so no parent image is available and
+            // the helper's own bytes have to answer - and they will not match
+            // a file this test just wrote.
+            u32::MAX,
+            &"a".repeat(64),
+        )
+        .expect_err("a target that is not this install must be refused");
+
+        assert!(
+            error.contains("not the installation that started this updater"),
+            "the refusal must come from the identity check, not from the \
+             missing download: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"not ours",
+            "the decoy must be untouched"
+        );
+        assert!(
+            !backup_path_for(&victim).exists(),
+            "no replacement transaction may have started"
         );
     }
 
