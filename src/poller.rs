@@ -11,10 +11,13 @@ use serde::Deserialize;
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
+// Shared with the Claude CLI helper: both need output drained while the child
+// runs and the whole process tree killed on timeout.
 use crate::models::{
     AppUsageData, ProviderStatus, UsageData, UsageWindow, FIVE_HOURS_SECONDS, ONE_DAY_SECONDS,
     ONE_WEEK_SECONDS,
 };
+use crate::native_interop::run_with_timeout;
 use crate::tray_icon::TrayIconKind;
 use crate::{claude_cli, claude_desktop};
 
@@ -1232,41 +1235,6 @@ fn clear_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>) {
     if let Some(state) = state.get() {
         if let Ok(mut rejection) = state.lock() {
             *rejection = None;
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandRunError {
-    SpawnFailed,
-    TimedOut,
-    WaitFailed,
-}
-
-/// Spawn a command and wait up to `timeout` for it to finish while preserving
-/// the distinction between an unavailable probe and a completed command.
-fn run_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> Result<std::process::Output, CommandRunError> {
-    let mut child = cmd.spawn().map_err(|_| CommandRunError::SpawnFailed)?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|_| CommandRunError::WaitFailed)
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CommandRunError::TimedOut);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => return Err(CommandRunError::WaitFailed),
         }
     }
 }
@@ -3934,6 +3902,8 @@ mod tests {
 
     #[test]
     fn command_runner_distinguishes_spawn_failure_from_timeout() {
+        use crate::native_interop::ProcessRunError;
+
         let missing_program = std::env::temp_dir().join(format!(
             "gengchou-missing-command-{}-{}",
             std::process::id(),
@@ -3942,7 +3912,7 @@ mod tests {
         let mut missing_command = Command::new(missing_program);
         assert!(matches!(
             run_with_timeout(&mut missing_command, Duration::from_millis(10)),
-            Err(CommandRunError::SpawnFailed)
+            Err(ProcessRunError::SpawnFailed)
         ));
 
         assert!(matches!(
@@ -3960,7 +3930,7 @@ mod tests {
                     .stderr(std::process::Stdio::null()),
                 Duration::from_millis(10),
             ),
-            Err(CommandRunError::TimedOut)
+            Err(ProcessRunError::TimedOut)
         ));
     }
 

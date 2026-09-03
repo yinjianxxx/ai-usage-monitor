@@ -11,7 +11,10 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
@@ -48,6 +51,132 @@ pub fn system_program(name: &str) -> PathBuf {
     match directory {
         Some(directory) => directory.join(name),
         None => PathBuf::from(name),
+    }
+}
+
+/// Why a child process did not produce a usable answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessRunError {
+    SpawnFailed,
+    TimedOut,
+    WaitFailed,
+}
+
+/// Run a command, wait up to `timeout`, and return everything it wrote.
+///
+/// Two things this does that `Child::wait_with_output` after a `try_wait` loop
+/// does not:
+///
+/// * It drains stdout and stderr while the child is still running.
+///   `wait_with_output` only reads after the process has exited, and a child
+///   that fills the pipe buffer never gets there: it blocks in `write`, the
+///   loop hits the deadline, and an ordinary answer that was merely large is
+///   reported as a probe that never responded. The credential probes read
+///   token files whose size is not ours to bound.
+/// * It kills the whole process tree on timeout. `Child::kill` ends only the
+///   process that was spawned, and the Claude CLI is normally reached through
+///   `claude.cmd`, so killing it left the `cmd.exe` shim's `node` running with
+///   the timed-out command still in flight.
+///
+/// The job object is assigned right after spawn rather than before, because
+/// `std` gives no way to resume a suspended child. A grandchild created in
+/// that window escapes the kill; everything after it does not, which is the
+/// difference between a leaked tree and one straggler.
+pub fn run_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, ProcessRunError> {
+    let mut child = command.spawn().map_err(|_| ProcessRunError::SpawnFailed)?;
+    let job = ProcessTreeJob::containing(&child);
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                match &job {
+                    Some(job) => job.terminate(),
+                    None => {
+                        let _ = child.kill();
+                    }
+                }
+                let _ = child.wait();
+                // The readers see EOF as soon as the write ends close; joining
+                // keeps them from outliving this call.
+                let _ = collect(stdout);
+                let _ = collect(stderr);
+                return Err(ProcessRunError::TimedOut);
+            }
+            Err(_) => return Err(ProcessRunError::WaitFailed),
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    })
+}
+
+type DrainHandle = Option<std::thread::JoinHandle<Vec<u8>>>;
+
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> DrainHandle {
+    pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            buffer
+        })
+    })
+}
+
+fn collect(handle: DrainHandle) -> Result<Vec<u8>, ProcessRunError> {
+    match handle {
+        // A reader that panicked has no output to report and no empty answer
+        // that would be honest, so it is a failed run rather than a silent one.
+        Some(handle) => handle.join().map_err(|_| ProcessRunError::WaitFailed),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// A job object holding one child and everything it goes on to start.
+struct ProcessTreeJob(HANDLE);
+
+impl ProcessTreeJob {
+    fn containing(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.ok()?;
+        let assigned = unsafe {
+            AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as isize as *mut _))
+        };
+        if assigned.is_err() {
+            // Nested jobs need Windows 8; without one the caller still kills
+            // the direct child, which is what it did before.
+            crate::diagnose::log("unable to place a child process in a job object");
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return None;
+        }
+        Some(Self(job))
+    }
+
+    fn terminate(&self) {
+        let _ = unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for ProcessTreeJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
     }
 }
 
@@ -530,6 +659,113 @@ mod tests {
             powershell.file_name().and_then(|name| name.to_str()),
             Some("powershell.exe")
         );
+    }
+
+    fn powershell() -> std::process::Command {
+        let mut command =
+            std::process::Command::new(system_program(r"WindowsPowerShell\v1.0\powershell.exe"));
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        command
+    }
+
+    /// A large but perfectly ordinary answer must not read as a dead probe.
+    ///
+    /// The pipe buffer is a few kilobytes. Waiting for exit before reading it
+    /// deadlocks a child that writes more than that: it blocks in `write`, the
+    /// deadline passes, and the probe is reported as one that never answered.
+    #[test]
+    fn a_child_that_outgrows_the_pipe_buffer_still_reports_its_output() {
+        const SIZE: usize = 300_000;
+        let mut command = powershell();
+        command
+            .arg(format!("[Console]::Out.Write('x' * {SIZE})"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let output = run_with_timeout(&mut command, std::time::Duration::from_secs(30))
+            .expect("a child that writes a lot is not a timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), SIZE);
+    }
+
+    /// A timed-out command must take its grandchildren with it.
+    ///
+    /// The Claude CLI is normally `claude.cmd`, so the process actually doing
+    /// the work is a `node` under a `cmd.exe` shim. Killing only the direct
+    /// child left that work running past the timeout that was supposed to stop
+    /// it.
+    #[test]
+    fn a_timeout_ends_the_whole_process_tree() {
+        // No parentheses or spaces in the name: `cmd /c` re-parses its
+        // argument, and a thread id like `ThreadId(3)` is a syntax error there.
+        let stem = std::env::temp_dir().join(format!(
+            "gengchou-tree-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let marker = stem.with_extension("pid");
+        // A `.cmd` shim around a long-running interpreter: the exact shape of
+        // `claude.cmd` around `node`.
+        let shim = stem.with_extension("cmd");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\n\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"$PID | Set-Content -LiteralPath '{}'; Start-Sleep -Seconds 120\"\r\n",
+                system_program(r"WindowsPowerShell\v1.0\powershell.exe").display(),
+                marker.display()
+            ),
+        )
+        .expect("write the shim");
+
+        let mut command = std::process::Command::new(system_program("cmd.exe"));
+        command
+            .arg("/c")
+            .arg(&shim)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        assert_eq!(
+            run_with_timeout(&mut command, std::time::Duration::from_secs(5)),
+            Err(ProcessRunError::TimedOut)
+        );
+
+        let recorded = std::fs::read_to_string(&marker)
+            .expect("the grandchild must have recorded its process id");
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&shim);
+        let grandchild: u32 = recorded
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("unusable process id {recorded:?}: {error}"));
+        assert!(
+            process_has_exited(grandchild),
+            "grandchild {grandchild} outlived the timeout that killed its parent"
+        );
+    }
+
+    /// Whether a process id refers to something that is no longer running.
+    ///
+    /// A pid that cannot be opened at all counts as gone: the only handle this
+    /// test ever had was through the job object that just terminated it.
+    fn process_has_exited(pid: u32) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+            return true;
+        };
+        // Two seconds of slack: TerminateJobObject is asynchronous.
+        let result = unsafe { WaitForSingleObject(handle, 2_000) };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result == WAIT_OBJECT_0
     }
 
     #[test]
