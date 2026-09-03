@@ -1508,6 +1508,44 @@ static DETAIL_LAST_DISMISS: Mutex<Option<Instant>> = Mutex::new(None);
 /// Native owner-drawn buttons do not consistently report ODS_HOTLIGHT on all
 /// supported Windows versions, so track the actual hovered child explicitly.
 static DETAIL_HOT_BUTTON_ID: AtomicU32 = AtomicU32::new(0);
+/// Where the footer's version line was last drawn, and whether the pointer is
+/// on it, when it names an update.
+///
+/// The line is not a child control: it is text that becomes actionable only
+/// while an update is outstanding, and its width follows the text. Painting
+/// already measures that width, so the paint records the rect and the mouse
+/// handlers read it, rather than a second measurement having to agree with the
+/// first.
+static DETAIL_UPDATE_LINK_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+static DETAIL_UPDATE_LINK_HOT: AtomicBool = AtomicBool::new(false);
+
+fn set_detail_update_link_rect(rect: Option<(i32, i32, i32, i32)>) {
+    *DETAIL_UPDATE_LINK_RECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = rect;
+    if rect.is_none() {
+        DETAIL_UPDATE_LINK_HOT.store(false, Ordering::SeqCst);
+    }
+}
+
+fn detail_update_link_hit(x: i32, y: i32) -> bool {
+    let rect = *DETAIL_UPDATE_LINK_RECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    point_in_detail_update_link(rect, x, y)
+}
+
+/// Whether a click at `(x, y)` lands on the version line.
+///
+/// Split out from the lock so the geometry can be tested: a footer line that
+/// answers clicks a few pixels away, or one that answers when no update is
+/// outstanding, would both start an update the user did not ask for.
+fn point_in_detail_update_link(rect: Option<(i32, i32, i32, i32)>, x: i32, y: i32) -> bool {
+    match rect {
+        Some((left, top, right, bottom)) => x >= left && x < right && y >= top && y < bottom,
+        None => false,
+    }
+}
 /// A native owner-drawn button receives ODS_FOCUS for both mouse and keyboard
 /// focus. Track mouse-originated focus explicitly so only keyboard navigation
 /// receives a visible focus cue.
@@ -7200,15 +7238,33 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
         }
         WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            track_detail_update_link_hover(hwnd, detail_update_link_hit(x, y));
             if drag_detail_scrollbar(hwnd, y) {
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        WM_MOUSELEAVE_MSG => {
+            track_detail_update_link_hover(hwnd, false);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SETCURSOR if DETAIL_UPDATE_LINK_HOT.load(Ordering::SeqCst) => {
+            if let Ok(cursor) = LoadCursorW(HINSTANCE::default(), IDC_HAND) {
+                SetCursor(cursor);
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             if end_detail_scrollbar_pointer() {
+                LRESULT(0)
+            } else if detail_update_link_hit(x, y) {
+                run_detail_update_link();
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -8625,6 +8681,18 @@ fn paint_detail_content(
             measure_detail_text_width(hdc, &version_label, "Segoe UI", 11, FW_NORMAL.0 as i32)
                 .max(sc(74) - margin);
         let version_left = (width - margin - version_width).max(margin);
+        let version_top = footer_top + sc(8);
+        let version_bottom = height - sc(6);
+        // Only an outstanding update makes this line answer a click; with
+        // nothing to offer it stays the inert label it has always been.
+        let link = snapshot.available_version.is_some();
+        set_detail_update_link_rect(link.then_some((
+            version_left,
+            version_top,
+            width - margin,
+            version_bottom,
+        )));
+        let hot = link && DETAIL_UPDATE_LINK_HOT.load(Ordering::SeqCst);
         draw_detail_body_text(
             hdc,
             &snapshot.status,
@@ -8644,15 +8712,29 @@ fn paint_detail_content(
             &version_label,
             RECT {
                 left: version_left,
-                top: footer_top + sc(8),
+                top: version_top,
                 right: width - margin,
-                bottom: height - sc(6),
+                bottom: version_bottom,
             },
-            &palette.muted,
+            if hot { &palette.text } else { &palette.muted },
             11,
             FW_NORMAL.0 as i32,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
+        if hot {
+            // Underline on hover, so the line reads as something to press
+            // rather than as one more muted read-out.
+            fill_rect_color(
+                hdc,
+                &RECT {
+                    left: version_left,
+                    top: version_bottom - sc(3),
+                    right: width - margin,
+                    bottom: version_bottom - sc(2),
+                },
+                &palette.text,
+            );
+        }
     }
 }
 
@@ -10036,18 +10118,6 @@ fn run_version_action(hwnd: HWND) {
     }
 }
 
-/// Answer a click on the update balloon.
-///
-/// Unlike the menu entry, whose text is the answer, a balloon body is easy to
-/// hit by accident - so this asks before it replaces the executable. Saying
-/// yes then takes exactly the route the menu entry takes. An offer that no
-/// longer matches what is known (already applied, or a check running) is sent
-/// through a fresh interactive check, which answers in the dialog it always
-/// did rather than acting on a stale claim.
-///
-/// The two guards live here so they can be tested without a window: the click
-/// must answer the version the balloon offered, and nothing else may be in
-/// flight.
 /// The version an outstanding update offers, freshly found or remembered.
 ///
 /// A remembered result reads the same as a fresh one here for the same reason
@@ -10068,11 +10138,70 @@ fn detail_version_label(current: &str, available: Option<&str>) -> String {
     }
 }
 
+/// Turn the footer's hover state on or off, repainting only when it changed.
+///
+/// `TrackMouseEvent` is re-armed on each hover so the pointer leaving the
+/// window clears the underline; without it the line stays lit after the mouse
+/// has gone somewhere else entirely.
+fn track_detail_update_link_hover(hwnd: HWND, hot: bool) {
+    if DETAIL_UPDATE_LINK_HOT.swap(hot, Ordering::SeqCst) == hot {
+        return;
+    }
+    unsafe {
+        if hot {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+        }
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+/// Answer a click on the footer's version line.
+///
+/// It offers whatever the popup is currently showing, and routes through the
+/// main window: the popup is about to lose focus to the dialog and be
+/// dismissed, so it is not the window that should own what happens next.
+fn run_detail_update_link() {
+    let Some(offered) = ({
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| outstanding_update_version(&s.update_status))
+    }) else {
+        return;
+    };
+    let main = current_main_hwnd();
+    if main == HWND::default() {
+        return;
+    }
+    diagnose::log(format!("detail popup: update link clicked for {offered}"));
+    offer_update_now(main, &offered);
+}
+
+/// Whether a click may act directly on what is already known.
+///
+/// The two guards live here so they can be tested without a window: the click
+/// must answer the version that was offered, and nothing else may be in
+/// flight.
 fn balloon_offer_is_current(known: Option<&str>, offered: &str, busy: bool) -> bool {
     !busy && known == Some(offered)
 }
 
-fn offer_update_from_balloon(hwnd: HWND, offered: &str) {
+/// Answer a click that accepted an offer - from the balloon, or from the
+/// footer line in the detail popup.
+///
+/// Unlike the menu entry, whose text is the answer, both of those are easy to
+/// hit while doing something else, so this asks before it replaces the
+/// executable. Saying yes then takes exactly the route the menu entry takes.
+/// An offer that no longer matches what is known (already applied, or a check
+/// running) is sent through a fresh interactive check, which answers in the
+/// dialog it always did rather than acting on a stale claim.
+fn offer_update_now(hwnd: HWND, offered: &str) {
     let (strings, install_channel, release) = {
         let state = lock_state();
         match state.as_ref() {
@@ -14609,7 +14738,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         tray_icon::take_balloon_click()
                     {
                         diagnose::log(format!("update balloon clicked for {version}"));
-                        offer_update_from_balloon(hwnd, &version);
+                        offer_update_now(hwnd, &version);
                     }
                 }
                 tray_icon::TrayAction::None => {}
@@ -16410,6 +16539,34 @@ mod reset_notification_tests {
             })
             .as_deref(),
             Some("9.9.9")
+        );
+    }
+
+    /// The footer line answers clicks only inside the text it drew, and only
+    /// while there is something to offer. A rect that outlives the update, or
+    /// one that is generous at the edges, would start an install from a click
+    /// meant for the status text beside it.
+    #[test]
+    fn the_footer_line_answers_only_inside_itself() {
+        let rect = Some((300, 780, 486, 805));
+        assert!(point_in_detail_update_link(rect, 400, 790));
+        assert!(
+            point_in_detail_update_link(rect, 300, 780),
+            "top-left is in"
+        );
+        assert!(
+            !point_in_detail_update_link(rect, 486, 790),
+            "right edge is exclusive"
+        );
+        assert!(
+            !point_in_detail_update_link(rect, 400, 805),
+            "bottom edge is exclusive"
+        );
+        assert!(!point_in_detail_update_link(rect, 299, 790));
+        assert!(!point_in_detail_update_link(rect, 400, 779));
+        assert!(
+            !point_in_detail_update_link(None, 400, 790),
+            "with no update outstanding the line is not a target at all"
         );
     }
 
