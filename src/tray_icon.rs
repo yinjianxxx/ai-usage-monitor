@@ -657,9 +657,10 @@ fn set_balloon_click(click: Option<BalloonClick>) {
 /// Take what the balloon the user just clicked offers, if it offers anything.
 ///
 /// Taking clears it: an offer is answered once. It is deliberately not
-/// cleared when the balloon times out, because a balloon that has left the
-/// screen can still be clicked from the Windows notification centre, and that
-/// click deserves the same answer as the one on the banner.
+/// cleared when the balloon times out: Windows may still deliver a click
+/// from notification history (on Windows 11 26200 that was Settings →
+/// System → Notifications, not the taskbar notification-centre flyout).
+/// That click deserves the same answer as the one on the banner.
 pub fn take_balloon_click() -> Option<BalloonClick> {
     BALLOON_CLICK
         .lock()

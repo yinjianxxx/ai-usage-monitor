@@ -16635,8 +16635,8 @@ mod reset_notification_tests {
         );
     }
 
-    /// A click can arrive long after the balloon was raised - from the
-    /// notification centre, or on a balloon that has since been overtaken.
+    /// A click can arrive long after the balloon was raised - from
+    /// notification history, or on a balloon that has since been overtaken.
     /// Acting on what the balloon said rather than on what is true now would
     /// replace the executable on a claim nobody rechecked.
     #[test]

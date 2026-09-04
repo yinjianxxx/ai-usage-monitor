@@ -1,19 +1,21 @@
 # v2.5.3 release verification
 
-- Date: 2026-09-03
+- Date: 2026-09-03, continued 2026-09-04
 - Candidate: `claude/v2.5.3-update-notice`, branched from `main` / `a855962`,
   which is also the `v2.5.2` tag. The release-tag ancestry requirement in
   docs/INVARIANTS.md is satisfied: `v2.5.2` is an ancestor of this branch.
-  Four commits. Not tagged, not pushed, no PR.
+  Not tagged, not pushed, no PR.
   `Cargo.toml` and `Cargo.lock` read `2.5.3`.
-- Scope: one behaviour, in three parts. The daily update check already found
-  new versions; it announced them only by rewriting one entry inside the
-  Settings submenu. It now raises a silent balloon (once per version), that
-  balloon can be clicked to reach the same confirmation the manual check
-  shows, the detail popup footer carries `v2.5.2 → 2.5.3` for as long as an
-  update is outstanding, and that footer line is itself clickable. No change to
-  how updates are downloaded, verified, staged, applied, or rolled back. No change to the executable,
-  settings-directory, cache, or update identities.
+- Scope: one behaviour. The daily update check already found new versions; it
+  announced them only by rewriting one entry inside the Settings submenu. It
+  now raises a silent balloon (once per version), that balloon can be clicked
+  to reach the same confirmation the manual check shows, the detail popup
+  footer carries `v2.5.2 → 2.5.3` for as long as an update is outstanding, and
+  that footer line is itself clickable. A remembered offer that is not newer
+  than the running build is treated as up to date; a failed automatic check
+  does not clear the last successful offer. No change to how updates are
+  downloaded, verified, staged, applied, or rolled back. No change to the
+  executable, settings-directory, cache, or update identities.
 - Signing: not in scope (owner has no signing certificate)
 
 ## Automated gates
@@ -131,7 +133,9 @@ replacement appears in the log, and the executable is byte-for-byte the one
 copied in. So "an unanswered confirmation never replaces the executable" holds
 on a real profile, not only in a sandbox.
 
-The footer link landed after this run, so it has not been exercised live.
+The footer link landed after this run, so it was not exercised in that
+dogfood session. It was exercised on 2026-09-04; see *Footer and notification
+history, 2026-09-04*.
 
 ### The footer, rendered
 
@@ -142,32 +146,51 @@ no overlap, and the arrow renders in Segoe UI. That temporary change was
 reverted; the committed dump path reports no outstanding update, because a
 README image implying an update exists would be a lie.
 
+### Footer and notification history, 2026-09-04
+
+Isolated debug build of `95018c9`, ProductVersion stamped `2.5.1` so the
+published `v2.5.2` read as newer. `APPDATA`/`LOCALAPPDATA` under
+`%TEMP%\gengchou-v253-live-rtpyfbeo`, consent declined. The owner's
+WinGet-installed instance and dogfood PID 63424 were left untouched.
+`GENGCHOU_RELAUNCH=1` so the sandbox would not hand off through the
+desktop-global `GengchouBroadcast` window.
+
+Live PID 111896 then 79876 (re-announce). Log lines, read back:
+
+```
+22:31:28  poll skipped; no shown provider has credential access
+22:31:28  update available, announced version 2.5.2
+22:37:52  detail popup: update link clicked for 2.5.2
+22:52:32  update available, announced version 2.5.2
+```
+
+No apply, staging, download, or replacement. The owner reported: the live
+footer read as an outstanding update; clicking it opened the confirmation;
+No was chosen. After the banner timed out, the taskbar notification-centre
+flyout did **not** keep the toast. Settings → System → Notifications **did**.
+The second announcement was a harness reset of `last_update_outcome`, not a
+product re-announce, so the owner could watch without clicking.
+
+The independent review (`tmp/v253-independent-review.md`, not committed)
+returned **conditional**. Finding 1 (remembered `Available` of the running
+version still shown as outstanding) and finding 2 (a failed auto-check
+cleared that offer) are fixed in `2098e0f`. Finding 3 (default the
+confirmation to No) was declined by the owner: the dialog stays default Yes.
+Findings 4–5 are notes, not acted on.
+
 ## Not verified
 
 These are gaps in this document, not passed rows.
 
-- **The footer marker was never confirmed in a live window.** What is
-  verified: the status-to-footer mapping by unit test including the remembered
-  case, and the drawing itself by a real render. What is not: the one
-  expression that feeds the live snapshot from `update_status`. The owner did
-  open the popup seconds after clicking the balloon, but what it showed was not
-  reported and is not claimed here. An earlier attempt to capture a sandboxed
-  instance's popup was abandoned after a screen-region capture picked up the
-  owner's own desktop contents; that image was deleted immediately and the
-  approach dropped rather than retried.
-- **Whether the balloon survives into the notification centre** after timing
-  out was not observed. That it is shown and can be clicked is now evidenced
-  on the owner's machine - see *On the owner's own machine* - but nobody
-  waited for one to time out and then looked for it.
-- **The footer link has never been clicked.** Its geometry is unit tested and
-  its hover appearance was rendered and looked at, but no live run has gone
-  from pointer to dialog through it.
 - **The manual Windows smoke test was run only for the rows this round
-  touches** (launch, balloon, balloon click, update path). The consent,
-  provider-detection, credential-watch and surface-interaction rows are
-  inherited from v2.5.1 and v2.5.2.
-- **The independent review has not been run.** It is the one open item; see
-  *Open*.
+  touches** (launch, balloon, balloon click, footer, update path). The
+  consent, provider-detection, credential-watch and surface-interaction rows
+  are inherited from v2.5.1 and v2.5.2.
+- **Whether a click from Settings → System → Notifications delivers
+  `NIN_BALLOONUSERCLICK`** was not tried. The owner looked and did not click.
+- **Finding 1 was not re-walked live** after `2098e0f`. The unit tests cover
+  remembered current-version and older-version `Available` mapping to
+  `UpToDate`.
 
 ## A correction
 
@@ -197,11 +220,5 @@ visual check, is what the claim actually needs.
 
 ## Open
 
-- The independent review agreed for this round has not been run. Its scope is
-  the whole update transaction - download, verification, staging, replacement,
-  rollback, restart - plus the balloon click this branch adds as a new entry
-  point into it. This carries forward the item left open at v2.5.2, where the
-  update-target identity check shipped having been written and reviewed by the
-  same author.
 - No tag, push, PR, or WinGet submission has been made. All of those need
   explicit owner approval.
