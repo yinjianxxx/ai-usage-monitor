@@ -5,7 +5,7 @@
 - Candidate: `claude/v2.5.3-update-notice`, branched from `main` / `a855962`,
   which is also the `v2.5.2` tag. The release-tag ancestry requirement in
   docs/INVARIANTS.md is satisfied: `v2.5.2` is an ancestor of this branch.
-  Not tagged, not pushed, no PR.
+  Open as PR #8. Not tagged, not merged.
   `Cargo.toml` and `Cargo.lock` read `2.5.3`.
 - Scope: one behaviour. The daily update check already found new versions; it
   announced them only by rewriting one entry inside the Settings submenu. It
@@ -280,5 +280,6 @@ visual check, is what the claim actually needs.
 
 ## Open
 
-- No tag, push, PR, or WinGet submission has been made. All of those need
-  explicit owner approval.
+- PR #8 is open. Tag, merge, and WinGet still need the rest of the release
+  sequence: CI green, merge to `main`, annotated tag `v2.5.3` on that merge
+  commit, then WinGet after the GitHub release is public.
