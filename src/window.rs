@@ -320,16 +320,46 @@ enum UpdateStatus {
 /// Without this the menu entry falls back to "check for updates" on every
 /// launch, as though the app had never looked - even though it checked
 /// yesterday and the answer has not been forgotten, only left in memory.
+/// An `Available` that is not newer than this build is treated as up to date:
+/// a successful apply never rewrites the outcome, so the new process would
+/// otherwise keep advertising the version it is already running.
 fn remembered_update_status(outcome: Option<&settings::LastUpdateOutcome>) -> UpdateStatus {
     match outcome {
         Some(settings::LastUpdateOutcome::UpToDate) => UpdateStatus::UpToDate,
-        Some(settings::LastUpdateOutcome::Available { version }) => {
+        Some(settings::LastUpdateOutcome::Available { version })
+            if updater::is_version_newer(version, env!("CARGO_PKG_VERSION")) =>
+        {
             UpdateStatus::AvailableRemembered {
                 version: version.clone(),
             }
         }
+        Some(settings::LastUpdateOutcome::Available { .. }) => UpdateStatus::UpToDate,
         None => UpdateStatus::Idle,
     }
+}
+
+/// Pair the display status with the outcome that should sit on disk after it.
+///
+/// Used at load and after a failed check so a remembered current-version
+/// `Available` is not written back out as an outstanding update.
+fn remembered_update_fields(
+    outcome: Option<settings::LastUpdateOutcome>,
+) -> (UpdateStatus, Option<settings::LastUpdateOutcome>) {
+    let status = remembered_update_status(outcome.as_ref());
+    let outcome = match &status {
+        UpdateStatus::UpToDate => Some(settings::LastUpdateOutcome::UpToDate),
+        UpdateStatus::AvailableRemembered { version } => {
+            Some(settings::LastUpdateOutcome::Available {
+                version: version.clone(),
+            })
+        }
+        UpdateStatus::Idle => None,
+        UpdateStatus::Available(_)
+        | UpdateStatus::Checking
+        | UpdateStatus::Prompting
+        | UpdateStatus::Applying => outcome,
+    };
+    (status, outcome)
 }
 
 fn update_status_is_busy(status: &UpdateStatus) -> bool {
@@ -337,6 +367,25 @@ fn update_status_is_busy(status: &UpdateStatus) -> bool {
         status,
         UpdateStatus::Checking | UpdateStatus::Prompting | UpdateStatus::Applying
     )
+}
+
+/// After a failed check, keep the last successful display and outcome, and
+/// still record that a check was attempted.
+///
+/// Used only by the error arm of `begin_update_check`. A failed fetch is not
+/// evidence the last successful Available is gone: restoring Idle and
+/// clearing the outcome would drop the footer and cause the next success to
+/// re-announce.
+fn retain_update_after_failed_check(
+    last_update_outcome: Option<settings::LastUpdateOutcome>,
+    checked_at: u64,
+) -> (
+    UpdateStatus,
+    Option<settings::LastUpdateOutcome>,
+    Option<u64>,
+) {
+    let (status, outcome) = remembered_update_fields(last_update_outcome);
+    (status, outcome, Some(checked_at))
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -1457,6 +1506,10 @@ struct DetailPopupState {
     providers: Vec<DetailProviderGroup>,
     status: String,
     version: String,
+    /// The version an update check has found, when one is outstanding. The
+    /// footer is the one surface a user opens on purpose, so this is where a
+    /// missed balloon stops costing anything.
+    available_version: Option<String>,
     refreshing: bool,
 }
 
@@ -1504,6 +1557,44 @@ static DETAIL_LAST_DISMISS: Mutex<Option<Instant>> = Mutex::new(None);
 /// Native owner-drawn buttons do not consistently report ODS_HOTLIGHT on all
 /// supported Windows versions, so track the actual hovered child explicitly.
 static DETAIL_HOT_BUTTON_ID: AtomicU32 = AtomicU32::new(0);
+/// Where the footer's version line was last drawn, and whether the pointer is
+/// on it, when it names an update.
+///
+/// The line is not a child control: it is text that becomes actionable only
+/// while an update is outstanding, and its width follows the text. Painting
+/// already measures that width, so the paint records the rect and the mouse
+/// handlers read it, rather than a second measurement having to agree with the
+/// first.
+static DETAIL_UPDATE_LINK_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+static DETAIL_UPDATE_LINK_HOT: AtomicBool = AtomicBool::new(false);
+
+fn set_detail_update_link_rect(rect: Option<(i32, i32, i32, i32)>) {
+    *DETAIL_UPDATE_LINK_RECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = rect;
+    if rect.is_none() {
+        DETAIL_UPDATE_LINK_HOT.store(false, Ordering::SeqCst);
+    }
+}
+
+fn detail_update_link_hit(x: i32, y: i32) -> bool {
+    let rect = *DETAIL_UPDATE_LINK_RECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    point_in_detail_update_link(rect, x, y)
+}
+
+/// Whether a click at `(x, y)` lands on the version line.
+///
+/// Split out from the lock so the geometry can be tested: a footer line that
+/// answers clicks a few pixels away, or one that answers when no update is
+/// outstanding, would both start an update the user did not ask for.
+fn point_in_detail_update_link(rect: Option<(i32, i32, i32, i32)>, x: i32, y: i32) -> bool {
+    match rect {
+        Some((left, top, right, bottom)) => x >= left && x < right && y >= top && y < bottom,
+        None => false,
+    }
+}
 /// A native owner-drawn button receives ODS_FOCUS for both mouse and keyboard
 /// focus. Track mouse-originated focus explicitly so only keyboard navigation
 /// receives a visible focus cue.
@@ -1584,6 +1675,7 @@ fn detail_fallback_snapshot() -> DetailPopupState {
         providers: Vec::new(),
         status: LanguageId::English.strings().detail_waiting.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: None,
         refreshing: false,
     }
 }
@@ -5300,11 +5392,13 @@ fn detail_popup_snapshot() -> DetailPopupState {
         providers.push(group);
     }
 
+    let (version, available_version) = detail_footer_versions(&s.update_status);
     DetailPopupState {
         title: strings.window_title.to_string(),
         providers,
         status: detail_status_text(s, strings),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version,
+        available_version,
         refreshing: s.manual_refresh_in_progress,
     }
 }
@@ -6540,6 +6634,7 @@ pub fn dump_detail_popup(
         providers,
         status,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: None,
         refreshing: false,
     };
 
@@ -7193,15 +7288,33 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
         }
         WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            track_detail_update_link_hover(hwnd, detail_update_link_hit(x, y));
             if drag_detail_scrollbar(hwnd, y) {
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        WM_MOUSELEAVE_MSG => {
+            track_detail_update_link_hover(hwnd, false);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SETCURSOR if DETAIL_UPDATE_LINK_HOT.load(Ordering::SeqCst) => {
+            if let Ok(cursor) = LoadCursorW(HINSTANCE::default(), IDC_HAND) {
+                SetCursor(cursor);
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             if end_detail_scrollbar_pointer() {
+                LRESULT(0)
+            } else if detail_update_link_hit(x, y) {
+                run_detail_update_link();
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -7260,6 +7373,7 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             DETAIL_MOUSE_FOCUS_BUTTON_ID.store(0, Ordering::SeqCst);
             DETAIL_REFRESHING.store(false, Ordering::SeqCst);
             DETAIL_MOVEMENT_UNLOCKED.store(DETAIL_DEFAULT_MOVEMENT_UNLOCKED, Ordering::SeqCst);
+            set_detail_update_link_rect(None);
             *lock_detail_scroll_state() = DetailScrollState::default();
             {
                 let mut state = lock_state();
@@ -8608,13 +8722,35 @@ fn paint_detail_content(
             },
             &palette.divider,
         );
+        // The version line is measured rather than given a fixed slot: it
+        // grows when an update is outstanding, and the status line gives up
+        // exactly that much instead of being drawn over. The floor keeps the
+        // ordinary case laid out as it always was.
+        let version_label =
+            detail_version_label(&snapshot.version, snapshot.available_version.as_deref());
+        let version_width =
+            measure_detail_text_width(hdc, &version_label, "Segoe UI", 11, FW_NORMAL.0 as i32)
+                .max(sc(74) - margin);
+        let version_left = (width - margin - version_width).max(margin);
+        let version_top = footer_top + sc(8);
+        let version_bottom = height - sc(6);
+        // Only an outstanding update makes this line answer a click; with
+        // nothing to offer it stays the inert label it has always been.
+        let link = snapshot.available_version.is_some();
+        set_detail_update_link_rect(link.then_some((
+            version_left,
+            version_top,
+            width - margin,
+            version_bottom,
+        )));
+        let hot = link && DETAIL_UPDATE_LINK_HOT.load(Ordering::SeqCst);
         draw_detail_body_text(
             hdc,
             &snapshot.status,
             RECT {
                 left: margin,
                 top: footer_top + sc(8),
-                right: width - sc(74),
+                right: version_left,
                 bottom: height - sc(6),
             },
             &palette.muted,
@@ -8624,18 +8760,32 @@ fn paint_detail_content(
         );
         draw_detail_text(
             hdc,
-            &format!("v{}", snapshot.version),
+            &version_label,
             RECT {
-                left: width - sc(74),
-                top: footer_top + sc(8),
+                left: version_left,
+                top: version_top,
                 right: width - margin,
-                bottom: height - sc(6),
+                bottom: version_bottom,
             },
-            &palette.muted,
+            if hot { &palette.text } else { &palette.muted },
             11,
             FW_NORMAL.0 as i32,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
+        if hot {
+            // Underline on hover, so the line reads as something to press
+            // rather than as one more muted read-out.
+            fill_rect_color(
+                hdc,
+                &RECT {
+                    left: version_left,
+                    top: version_bottom - sc(3),
+                    right: width - margin,
+                    bottom: version_bottom - sc(2),
+                },
+                &palette.text,
+            );
+        }
     }
 }
 
@@ -9947,6 +10097,262 @@ fn available_version_label(
     }
 }
 
+/// Whether an automatic check that found `latest` should raise a balloon.
+///
+/// The check repeats every 24 hours, so the balloon is tied to the version
+/// rather than to the check: re-announcing a version the user has already
+/// been told about once a day is nagging, and the menu item carries that
+/// standing offer anyway. The outcome it reads is persisted, so a restart
+/// does not re-announce either.
+fn update_balloon_due(previous: Option<&settings::LastUpdateOutcome>, latest: &str) -> bool {
+    !matches!(
+        previous,
+        Some(settings::LastUpdateOutcome::Available { version }) if version == latest
+    )
+}
+
+/// Say that an update exists. An automatic check leaves no other trace than
+/// the version item inside the settings submenu, which is not somewhere a
+/// user opens unprompted.
+fn announce_update_balloon(hwnd: HWND, strings: Strings, latest: &str) {
+    let body = strings
+        .update_available_balloon_body
+        .replace("{version}", latest)
+        .replace("{settings}", strings.settings);
+    diagnose::log(format!("update available, announced version {latest}"));
+    tray_icon::notify_app_balloon(
+        hwnd,
+        tray_icon::BalloonTone::Info,
+        strings.update_available,
+        &body,
+        Some(tray_icon::BalloonClick::Update {
+            version: latest.to_string(),
+        }),
+    );
+}
+
+/// What the version entry under Settings does when it is clicked.
+///
+/// The entry's own text is already the answer ("Update to X"), so a known
+/// release is taken straight to the install; only an unanswered or remembered
+/// state costs a fresh check first.
+fn run_version_action(hwnd: HWND) {
+    let (install_channel, release) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (
+                s.install_channel,
+                match &s.update_status {
+                    UpdateStatus::Available(release) => Some(release.clone()),
+                    _ => None,
+                },
+            ),
+            None => (InstallChannel::Portable, None),
+        }
+    };
+
+    match install_channel {
+        InstallChannel::Winget => {
+            if release.is_some() {
+                begin_winget_update(hwnd);
+            } else {
+                begin_update_check(hwnd, true);
+            }
+        }
+        InstallChannel::Portable => {
+            if let Some(release) = release {
+                begin_update_apply(hwnd, release);
+            } else {
+                begin_update_check(hwnd, true);
+            }
+        }
+    }
+}
+
+/// The version an outstanding update offers, freshly found or remembered.
+///
+/// A remembered result reads the same as a fresh one here for the same reason
+/// it does in the menu: from the user's side the situation is identical.
+fn outstanding_update_version(status: &UpdateStatus) -> Option<String> {
+    match status {
+        UpdateStatus::Available(release) => Some(release.latest_version.clone()),
+        UpdateStatus::AvailableRemembered { version } => Some(version.clone()),
+        _ => None,
+    }
+}
+
+/// The footer's version line: the running version, and where it can go.
+fn detail_version_label(current: &str, available: Option<&str>) -> String {
+    match available {
+        Some(available) => format!("v{current} → {available}"),
+        None => format!("v{current}"),
+    }
+}
+
+/// Running version and outstanding target for the live detail snapshot.
+///
+/// Dump fixtures hardcode `available_version: None` so README images cannot
+/// imply an update exists. The live popup is the only construction that
+/// must carry a remembered or freshly found offer.
+fn detail_footer_versions(status: &UpdateStatus) -> (String, Option<String>) {
+    (
+        env!("CARGO_PKG_VERSION").to_string(),
+        outstanding_update_version(status),
+    )
+}
+
+/// Turn the footer's hover state on or off, repainting only when it changed.
+///
+/// `TrackMouseEvent` is re-armed on each hover so the pointer leaving the
+/// window clears the underline; without it the line stays lit after the mouse
+/// has gone somewhere else entirely.
+fn track_detail_update_link_hover(hwnd: HWND, hot: bool) {
+    if DETAIL_UPDATE_LINK_HOT.swap(hot, Ordering::SeqCst) == hot {
+        return;
+    }
+    unsafe {
+        if hot {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+        }
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+/// Answer a click on the footer's version line.
+///
+/// It offers whatever the popup is currently showing, and routes through the
+/// main window: the popup is about to lose focus to the dialog and be
+/// dismissed, so it is not the window that should own what happens next.
+fn run_detail_update_link() {
+    let Some(offered) = ({
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| outstanding_update_version(&s.update_status))
+    }) else {
+        return;
+    };
+    let main = current_main_hwnd();
+    if main == HWND::default() {
+        return;
+    }
+    diagnose::log(format!("detail popup: update link clicked for {offered}"));
+    offer_update_now(main, &offered);
+}
+
+/// Whether a click may act directly on what is already known.
+///
+/// The two guards live here so they can be tested without a window: the click
+/// must answer the version that was offered, and nothing else may be in
+/// flight.
+fn balloon_offer_is_current(known: Option<&str>, offered: &str, busy: bool) -> bool {
+    !busy && known == Some(offered)
+}
+
+/// What a `BalloonClicked` tray action should do after the offer is taken.
+///
+/// An Update offer is answered with that version. A click with no offer is
+/// ignored: quota-reset and provider-detection balloons are news, not an
+/// update question, and after a restart or a taken offer the latch is empty.
+/// Missing the banner is recovered from the footer, not by treating every
+/// balloon click as "check for updates".
+#[derive(Debug, PartialEq, Eq)]
+enum BalloonClickFollowUp {
+    Offer { version: String },
+    Ignore,
+}
+
+fn balloon_click_follow_up(click: Option<tray_icon::BalloonClick>) -> BalloonClickFollowUp {
+    match click {
+        Some(tray_icon::BalloonClick::Update { version }) => {
+            BalloonClickFollowUp::Offer { version }
+        }
+        None => BalloonClickFollowUp::Ignore,
+    }
+}
+
+/// Ask, then take the same route the menu entry takes.
+///
+/// Occupies `Prompting` while the dialog is up so a second click cannot
+/// start another check or replace. Restores `Available` afterwards unless
+/// apply has already taken over; `begin_update_apply` refuses a busy status,
+/// so the restore has to happen before it runs.
+fn prompt_then_apply_update(
+    hwnd: HWND,
+    strings: Strings,
+    install_channel: InstallChannel,
+    release: ReleaseDescriptor,
+) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.update_status = UpdateStatus::Prompting;
+        }
+    }
+    let accepted = show_update_prompt(strings, &release);
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            if matches!(s.update_status, UpdateStatus::Prompting) {
+                s.update_status = UpdateStatus::Available(release.clone());
+            }
+        }
+    }
+    if accepted {
+        match install_channel {
+            InstallChannel::Portable => begin_update_apply(hwnd, release),
+            InstallChannel::Winget => begin_winget_update(hwnd),
+        }
+    }
+}
+
+/// Answer a click that accepted an offer - from the balloon, or from the
+/// footer line in the detail popup.
+///
+/// Unlike the menu entry, whose text is the answer, both of those are easy to
+/// hit while doing something else, so this asks before it replaces the
+/// executable. Saying yes then takes exactly the route the menu entry takes.
+/// An offer that no longer matches what is known (already applied, or a check
+/// running) is sent through a fresh interactive check, which answers in the
+/// dialog it always did rather than acting on a stale claim.
+fn offer_update_now(hwnd: HWND, offered: &str) {
+    let (strings, install_channel, release) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => {
+                let known = match &s.update_status {
+                    UpdateStatus::Available(release) => Some(release),
+                    _ => None,
+                };
+                let current = balloon_offer_is_current(
+                    known.map(|release| release.latest_version.as_str()),
+                    offered,
+                    update_status_is_busy(&s.update_status),
+                );
+                (
+                    s.language.strings(),
+                    s.install_channel,
+                    known.filter(|_| current).cloned(),
+                )
+            }
+            None => return,
+        }
+    };
+
+    let Some(release) = release else {
+        begin_update_check(hwnd, true);
+        return;
+    };
+
+    prompt_then_apply_update(hwnd, strings, install_channel, release);
+}
+
 fn begin_update_check(hwnd: HWND, interactive: bool) {
     if !updater::update_channel_configured() {
         return;
@@ -9995,39 +10401,34 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 }
             }
             Ok(UpdateCheckResult::Available(release)) => {
-                {
+                let announce = {
                     let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Available(release.clone());
-                        s.last_update_outcome = Some(settings::LastUpdateOutcome::Available {
-                            version: release.latest_version.clone(),
-                        });
-                        s.last_update_check_unix = Some(checked_at);
+                    match state.as_mut() {
+                        Some(s) => {
+                            // Read before the overwrite: the outcome carried
+                            // over from the last check is what says whether
+                            // this version has already been announced.
+                            let announce = !interactive
+                                && update_balloon_due(
+                                    s.last_update_outcome.as_ref(),
+                                    &release.latest_version,
+                                );
+                            s.update_status = UpdateStatus::Available(release.clone());
+                            s.last_update_outcome = Some(settings::LastUpdateOutcome::Available {
+                                version: release.latest_version.clone(),
+                            });
+                            s.last_update_check_unix = Some(checked_at);
+                            announce
+                        }
+                        None => false,
                     }
-                }
+                };
                 save_state_settings();
+                if announce {
+                    announce_update_balloon(hwnd, strings, &release.latest_version);
+                }
                 if interactive {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.update_status = UpdateStatus::Prompting;
-                        }
-                    }
-                    let accepted = show_update_prompt(strings, &release);
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            if matches!(s.update_status, UpdateStatus::Prompting) {
-                                s.update_status = UpdateStatus::Available(release.clone());
-                            }
-                        }
-                    }
-                    if accepted {
-                        match install_channel {
-                            InstallChannel::Portable => begin_update_apply(hwnd, release),
-                            InstallChannel::Winget => begin_winget_update(hwnd),
-                        }
-                    }
+                    prompt_then_apply_update(hwnd, strings, install_channel, release);
                 }
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
@@ -10037,12 +10438,13 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Idle;
-                        // The check failed, so the previous answer is no
-                        // longer something to stand behind - forget it rather
-                        // than keep showing a stale claim.
-                        s.last_update_outcome = None;
-                        s.last_update_check_unix = Some(checked_at);
+                        let (status, outcome, checked) = retain_update_after_failed_check(
+                            s.last_update_outcome.clone(),
+                            checked_at,
+                        );
+                        s.update_status = status;
+                        s.last_update_outcome = outcome;
+                        s.last_update_check_unix = checked;
                     }
                 }
                 save_state_settings();
@@ -12253,6 +12655,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         let is_dark = theme::is_dark_mode();
         let is_high_contrast = theme::is_high_contrast();
         let mut embedded = false;
+        let (update_status, last_update_outcome) =
+            remembered_update_fields(settings.last_update_outcome.clone());
 
         {
             let mut state = lock_state();
@@ -12325,8 +12729,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 last_success_unix: None,
                 notify_session_reset: settings.notify_session_reset,
                 notify_weekly_reset: settings.notify_weekly_reset,
-                update_status: remembered_update_status(settings.last_update_outcome.as_ref()),
-                last_update_outcome: settings.last_update_outcome.clone(),
+                update_status,
+                last_update_outcome,
                 last_update_check_unix: settings.last_update_check_unix,
                 details_hwnd: None,
                 details_monitor: None,
@@ -14100,36 +14504,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     trigger_manual_refresh(hwnd);
                 }
                 IDM_VERSION_ACTION => {
-                    let (install_channel, release) = {
-                        let state = lock_state();
-                        match state.as_ref() {
-                            Some(s) => (
-                                s.install_channel,
-                                match &s.update_status {
-                                    UpdateStatus::Available(release) => Some(release.clone()),
-                                    _ => None,
-                                },
-                            ),
-                            None => (InstallChannel::Portable, None),
-                        }
-                    };
-
-                    match install_channel {
-                        InstallChannel::Winget => {
-                            if release.is_some() {
-                                begin_winget_update(hwnd);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                        InstallChannel::Portable => {
-                            if let Some(release) = release {
-                                begin_update_apply(hwnd, release);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                    }
+                    run_version_action(hwnd);
                 }
                 2 => {
                     request_quit(hwnd);
@@ -14453,6 +14828,17 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     match kind {
                         Some(kind) => tray_icon::restore_focus(hwnd, kind),
                         None => tray_icon::restore_app_focus(hwnd),
+                    }
+                }
+                tray_icon::TrayAction::BalloonClicked => {
+                    match balloon_click_follow_up(tray_icon::take_balloon_click()) {
+                        BalloonClickFollowUp::Offer { version } => {
+                            diagnose::log(format!("update balloon clicked for {version}"));
+                            offer_update_now(hwnd, &version);
+                        }
+                        BalloonClickFollowUp::Ignore => {
+                            diagnose::log("balloon clicked with no standing offer");
+                        }
                     }
                 }
                 tray_icon::TrayAction::None => {}
@@ -15342,6 +15728,12 @@ mod reset_notification_tests {
         assert!(update_status_is_busy(&UpdateStatus::Prompting));
         assert!(update_status_is_busy(&UpdateStatus::Applying));
         assert!(!update_status_is_busy(&UpdateStatus::UpToDate));
+        assert!(!update_status_is_busy(&UpdateStatus::Available(
+            updater::ReleaseDescriptor::for_tests("9.9.9")
+        )));
+        assert!(!update_status_is_busy(&UpdateStatus::AvailableRemembered {
+            version: "9.9.9".to_string(),
+        }));
     }
 
     fn relative_luminance(color: Color) -> f64 {
@@ -16155,6 +16547,72 @@ mod reset_notification_tests {
             UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
             other => panic!("expected a remembered update, got {other:?}"),
         }
+        assert!(matches!(
+            remembered_update_status(Some(&settings::LastUpdateOutcome::Available {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })),
+            UpdateStatus::UpToDate
+        ));
+        assert!(matches!(
+            remembered_update_status(Some(&settings::LastUpdateOutcome::Available {
+                version: "0.0.1".to_string(),
+            })),
+            UpdateStatus::UpToDate
+        ));
+        let (status, outcome) =
+            remembered_update_fields(Some(settings::LastUpdateOutcome::Available {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }));
+        assert!(matches!(status, UpdateStatus::UpToDate));
+        assert!(matches!(
+            outcome,
+            Some(settings::LastUpdateOutcome::UpToDate)
+        ));
+        let kept = Some(settings::LastUpdateOutcome::Available {
+            version: "9.9.9".to_string(),
+        });
+        let (status, outcome) = remembered_update_fields(kept.clone());
+        match status {
+            UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
+            other => panic!("expected a remembered update, got {other:?}"),
+        }
+        assert_eq!(outcome, kept);
+    }
+
+    /// Reverting the failed-check arm to Idle + clearing the outcome would
+    /// drop the footer and re-announce on the next success. This is the
+    /// function that arm calls; changing it to Idle/None must fail here.
+    #[test]
+    fn a_failed_check_keeps_the_last_successful_offer() {
+        let kept = Some(settings::LastUpdateOutcome::Available {
+            version: "9.9.9".to_string(),
+        });
+        let (status, outcome, checked) =
+            retain_update_after_failed_check(kept.clone(), 1_700_000_000);
+        match status {
+            UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
+            other => panic!("expected the last successful offer, got {other:?}"),
+        }
+        assert_eq!(outcome, kept);
+        assert_eq!(checked, Some(1_700_000_000));
+
+        let (status, outcome, checked) = retain_update_after_failed_check(
+            Some(settings::LastUpdateOutcome::Available {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+            1_700_000_001,
+        );
+        assert!(matches!(status, UpdateStatus::UpToDate));
+        assert!(matches!(
+            outcome,
+            Some(settings::LastUpdateOutcome::UpToDate)
+        ));
+        assert_eq!(checked, Some(1_700_000_001));
+
+        let (status, outcome, checked) = retain_update_after_failed_check(None, 1_700_000_002);
+        assert!(matches!(status, UpdateStatus::Idle));
+        assert_eq!(outcome, None);
+        assert_eq!(checked, Some(1_700_000_002));
     }
 
     /// A remembered update must be indistinguishable from a freshly found one
@@ -16182,6 +16640,192 @@ mod reset_notification_tests {
             // Without a release channel the entry is only ever the version.
             assert_eq!(remembered, format!("v{}", env!("CARGO_PKG_VERSION")));
         }
+    }
+
+    /// The balloon is the only unprompted trace of an automatic check, so it
+    /// must fire for a version the user has not been told about - and only
+    /// once for it, because the check repeats every day.
+    #[test]
+    fn an_update_is_announced_once_per_version() {
+        assert!(update_balloon_due(None, "9.9.9"));
+        assert!(update_balloon_due(
+            Some(&settings::LastUpdateOutcome::UpToDate),
+            "9.9.9"
+        ));
+        assert!(update_balloon_due(
+            Some(&settings::LastUpdateOutcome::Available {
+                version: "9.9.8".to_string(),
+            }),
+            "9.9.9"
+        ));
+        assert!(!update_balloon_due(
+            Some(&settings::LastUpdateOutcome::Available {
+                version: "9.9.9".to_string(),
+            }),
+            "9.9.9"
+        ));
+    }
+
+    /// The balloon has to name the version and point somewhere; a body that
+    /// kept a raw placeholder would do neither.
+    #[test]
+    fn the_update_balloon_body_names_the_version_and_the_menu() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let body = strings
+                .update_available_balloon_body
+                .replace("{version}", "9.9.9")
+                .replace("{settings}", strings.settings);
+            assert!(body.contains("9.9.9"), "{} version", language.code());
+            assert!(
+                body.contains(strings.settings),
+                "{} menu path",
+                language.code()
+            );
+            assert!(!body.contains('{'), "{} leftover: {body}", language.code());
+        }
+    }
+
+    /// The footer is the surface a user opens on purpose, so it is where a
+    /// missed balloon stops mattering. Without the second half it reports the
+    /// running version and stays silent about the one that is waiting.
+    #[test]
+    fn the_footer_says_where_the_running_version_can_go() {
+        assert_eq!(detail_version_label("2.5.3", None), "v2.5.3");
+        assert_eq!(
+            detail_version_label("2.5.3", Some("2.5.4")),
+            "v2.5.3 → 2.5.4"
+        );
+    }
+
+    /// A remembered update has to reach the footer too: after a restart there
+    /// is no fresh check behind it, and that is exactly when a user who
+    /// missed the balloon goes looking. A busy status is not an offer.
+    #[test]
+    fn a_remembered_update_reaches_the_footer() {
+        assert_eq!(outstanding_update_version(&UpdateStatus::Idle), None);
+        assert_eq!(outstanding_update_version(&UpdateStatus::UpToDate), None);
+        assert_eq!(outstanding_update_version(&UpdateStatus::Checking), None);
+        assert_eq!(outstanding_update_version(&UpdateStatus::Prompting), None);
+        assert_eq!(outstanding_update_version(&UpdateStatus::Applying), None);
+        assert_eq!(
+            outstanding_update_version(&UpdateStatus::AvailableRemembered {
+                version: "9.9.9".to_string(),
+            })
+            .as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            outstanding_update_version(&UpdateStatus::Available(
+                updater::ReleaseDescriptor::for_tests("9.9.9")
+            ))
+            .as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    /// The live snapshot is the only construction that must carry an
+    /// outstanding update. Dump fixtures hardcode None so README images
+    /// cannot imply one exists.
+    #[test]
+    fn the_footer_snapshot_carries_an_outstanding_update() {
+        let current = env!("CARGO_PKG_VERSION");
+        let (version, available) = detail_footer_versions(&UpdateStatus::Idle);
+        assert_eq!(version, current);
+        assert_eq!(available, None);
+
+        let (version, available) = detail_footer_versions(&UpdateStatus::AvailableRemembered {
+            version: "9.9.9".to_string(),
+        });
+        assert_eq!(version, current);
+        assert_eq!(available.as_deref(), Some("9.9.9"));
+
+        let (_, available) = detail_footer_versions(&UpdateStatus::Available(
+            updater::ReleaseDescriptor::for_tests("2.5.4"),
+        ));
+        assert_eq!(available.as_deref(), Some("2.5.4"));
+    }
+
+    /// The footer line answers clicks only inside the text it drew, and only
+    /// while there is something to offer. A rect that outlives the update, or
+    /// one that is generous at the edges, would start an install from a click
+    /// meant for the status text beside it.
+    #[test]
+    fn the_footer_line_answers_only_inside_itself() {
+        let rect = Some((300, 780, 486, 805));
+        assert!(point_in_detail_update_link(rect, 400, 790));
+        assert!(
+            point_in_detail_update_link(rect, 300, 780),
+            "top-left is in"
+        );
+        assert!(
+            !point_in_detail_update_link(rect, 486, 790),
+            "right edge is exclusive"
+        );
+        assert!(
+            !point_in_detail_update_link(rect, 400, 805),
+            "bottom edge is exclusive"
+        );
+        assert!(!point_in_detail_update_link(rect, 299, 790));
+        assert!(!point_in_detail_update_link(rect, 400, 779));
+        assert!(
+            !point_in_detail_update_link(None, 400, 790),
+            "with no update outstanding the line is not a target at all"
+        );
+    }
+
+    /// Destroying the popup must forget the last painted target. Leaving the
+    /// rect behind would make a later click at those coordinates, or a hover
+    /// that still thinks the line is hot, act on a window that is gone.
+    #[test]
+    fn destroying_the_detail_popup_clears_the_footer_target() {
+        set_detail_update_link_rect(Some((300, 780, 486, 805)));
+        DETAIL_UPDATE_LINK_HOT.store(true, Ordering::SeqCst);
+        assert!(detail_update_link_hit(400, 790));
+        set_detail_update_link_rect(None);
+        assert!(
+            !detail_update_link_hit(400, 790),
+            "a cleared rect is not a target"
+        );
+        assert!(
+            !DETAIL_UPDATE_LINK_HOT.load(Ordering::SeqCst),
+            "hover must not outlive the rect"
+        );
+    }
+
+    /// A click can arrive long after the balloon was raised - from
+    /// notification history, or on a balloon that has since been overtaken.
+    /// Acting on what the balloon said rather than on what is true now would
+    /// replace the executable on a claim nobody rechecked.
+    #[test]
+    fn a_balloon_click_only_acts_on_the_version_it_offered() {
+        assert!(balloon_offer_is_current(Some("9.9.9"), "9.9.9", false));
+        assert!(!balloon_offer_is_current(Some("9.9.8"), "9.9.9", false));
+        assert!(!balloon_offer_is_current(None, "9.9.9", false));
+        assert!(
+            !balloon_offer_is_current(Some("9.9.9"), "9.9.9", true),
+            "a check or install already in flight must not be cut in front of"
+        );
+    }
+
+    /// Quota-reset and provider-detection balloons carry no offer, and a
+    /// history click after restart or take arrives with an empty latch.
+    /// Neither starts a check: the footer is the recovery, not every balloon.
+    #[test]
+    fn a_balloon_click_without_an_offer_does_nothing() {
+        assert_eq!(
+            balloon_click_follow_up(Some(tray_icon::BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            })),
+            BalloonClickFollowUp::Offer {
+                version: "9.9.9".to_string(),
+            }
+        );
+        assert_eq!(
+            balloon_click_follow_up(None),
+            BalloonClickFollowUp::Ignore,
+            "news balloons and an empty latch must not start a check"
+        );
     }
 
     /// Declining the one-time prompt must read nothing, no matter what the
@@ -17606,6 +18250,7 @@ mod reset_notification_tests {
             providers: vec![group.clone()],
             status: "Updated now".to_string(),
             version: "test".to_string(),
+            available_version: None,
             refreshing: false,
         };
 
@@ -17639,6 +18284,7 @@ mod reset_notification_tests {
             ],
             status: snapshot.status,
             version: snapshot.version,
+            available_version: None,
             refreshing: false,
         };
         let _dpi = DpiScope::new(120);
@@ -17679,6 +18325,7 @@ mod reset_notification_tests {
                 providers: vec![two_row_group.clone(), two_row_group.clone()],
                 status: "Every 1m".to_string(),
                 version: "test".to_string(),
+                available_version: None,
                 refreshing: false,
             },
             DetailPopupState {
@@ -17686,6 +18333,7 @@ mod reset_notification_tests {
                 providers: vec![hinted_one_row_group, one_row_group, two_row_group],
                 status: "Authentication failed".to_string(),
                 version: "test".to_string(),
+                available_version: None,
                 refreshing: false,
             },
         ];
@@ -17728,6 +18376,7 @@ mod reset_notification_tests {
             providers: vec![group.clone(), group.clone(), group],
             status: "Every 1m".to_string(),
             version: "test".to_string(),
+            available_version: None,
             refreshing: false,
         };
         let _dpi = DpiScope::new(144);

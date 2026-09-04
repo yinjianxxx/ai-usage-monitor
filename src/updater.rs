@@ -66,6 +66,17 @@ pub struct ReleaseDescriptor {
     checksums_url: Option<String>,
 }
 
+#[cfg(test)]
+impl ReleaseDescriptor {
+    pub(crate) fn for_tests(latest_version: &str) -> Self {
+        Self {
+            latest_version: latest_version.to_string(),
+            asset_url: String::new(),
+            checksums_url: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum UpdateCheckResult {
     UpToDate,
@@ -1797,7 +1808,7 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or(normalized)
 }
 
-fn is_version_newer(candidate: &str, current: &str) -> bool {
+pub(crate) fn is_version_newer(candidate: &str, current: &str) -> bool {
     parse_version(candidate) > parse_version(current)
 }
 

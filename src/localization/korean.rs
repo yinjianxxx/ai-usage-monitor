@@ -44,6 +44,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "업데이트 대상",
     update_available: "업데이트 사용 가능",
     update_prompt_now: "버전 {version}을 사용할 수 있습니다. 지금 업데이트하시겠습니까?",
+    update_available_balloon_body: "버전 {version}을(를) 사용할 수 있습니다. 이 알림을 클릭하면 업데이트되며, 트레이 메뉴의 ‘{settings}’에서도 업데이트할 수 있습니다.",
     exit: "종료",
     show_widget: "작업 표시줄 위젯",
     show_floating_monitor: "플로팅 창",

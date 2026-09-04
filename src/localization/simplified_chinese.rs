@@ -43,6 +43,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_to: "更新到",
     update_available: "有可用更新",
     update_prompt_now: "版本 {version} 已可用。是否现在更新？",
+    update_available_balloon_body: "版本 {version} 已可用。点击此通知即可更新，也可在托盘菜单的“{settings}”中更新。",
     exit: "退出",
     show_widget: "任务栏小组件",
     show_floating_monitor: "桌面浮窗",

@@ -334,10 +334,31 @@ These are gaps in this document, not passed rows.
 - Temporary sandboxes under `%TEMP%` (`gcmutex`, `gcshared`, `gc-apply-*`,
   `gcdump`, tree-kill markers and shims) were removed.
 
+## Post-release
+
+Recorded on 2026-09-03, after the fact. Everything below was read back from
+GitHub and the WinGet registry rather than from memory of the release run.
+
+- PR #7 merged as `a855962`; tag `v2.5.2` points at that commit. `v2.5.1`
+  (`3c123f2`) is an ancestor, so the ancestry gate held.
+- Release published 2026-09-03T04:44:48Z, not a draft and not a pre-release.
+  `GET /repos/ynjmxn/gengchou/releases/latest` returns `v2.5.2`, which is the
+  endpoint the in-app check reads.
+- Six assets, including the two the updater requires by name: `gengchou.exe`
+  and `SHA256SUMS`. The `gengchou.exe` digest carries two GitHub attestations.
+- WinGet: `microsoft/winget-pkgs#428603` merged;
+  `manifests/y/ynjmxn/Gengchou/2.5.2` exists in the public registry.
+- Installing the merged package on a clean Windows profile was **not** done,
+  and is now permanently out of scope. See the note at the end of
+  *Post-release WinGet hand-off* in docs/RELEASE_CHECKLIST.md for what stands
+  in for it. The row was removed from the checklist rather than left as a gate
+  that is never run.
+
 ## Open
 
-- `Cargo.toml` is at `2.5.2` and no tag, push, PR, or WinGet submission has
-  been made. All of those need explicit owner approval.
 - The update-target identity check is the one change on this branch with a
-  security character, and it was written and reviewed by the same author. A
-  second independent pass over it is worth having before publishing.
+  security character, and it was written and reviewed by the same author. It
+  shipped without a second independent pass. That pass is now folded into the
+  v2.5.3 round, with the scope widened from this one function to the whole
+  update transaction - download, verification, staging, replacement, rollback,
+  restart - plus the balloon click that v2.5.3 adds as a new entry point to it.

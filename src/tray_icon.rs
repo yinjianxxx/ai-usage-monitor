@@ -9,8 +9,9 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
     ExtractIconExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_INFO,
     NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_LARGE_ICON, NIIF_NONE, NIIF_NOSOUND, NIIF_USER,
-    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT,
-    NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4, NOTIFY_ICON_INFOTIP_FLAGS,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION,
+    NIN_BALLOONUSERCLICK, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+    NOTIFY_ICON_INFOTIP_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -67,6 +68,10 @@ pub enum TrayAction {
         kind: Option<TrayIconKind>,
         anchor_to_icon: bool,
     },
+    /// The user clicked the balloon itself. What that offers, if anything, is
+    /// `take_balloon_click`; the icon it arrived on says nothing, because a
+    /// balloon is delivered to whichever icon the tray happened to have.
+    BalloonClicked,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -632,7 +637,53 @@ unsafe fn deliver_balloon(
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
 }
 
-/// Show a Windows balloon notification from the tray icon.
+/// What clicking the balloon now on screen offers.
+///
+/// Kept here because every balloon is raised through this module, which makes
+/// it the one place that can guarantee the offer belongs to the balloon the
+/// user actually saw: raising any other balloon replaces it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BalloonClick {
+    /// Offer this version, the way the update menu entry would.
+    Update { version: String },
+}
+
+static BALLOON_CLICK: Mutex<Option<BalloonClick>> = Mutex::new(None);
+
+fn set_balloon_click(click: Option<BalloonClick>) {
+    *BALLOON_CLICK.lock().unwrap_or_else(|e| e.into_inner()) = click;
+}
+
+/// Record what the balloon that just appeared offers, or nothing if it never
+/// appeared.
+///
+/// An offer must not outlive a failed delivery: the user never saw that
+/// balloon, and a later click (including from notification history) must not
+/// answer a question that was never asked. A failed delivery also drops a
+/// previous offer; that balloon is no longer the one on screen.
+fn settle_balloon_click(click: Option<BalloonClick>, delivered: bool) {
+    set_balloon_click(if delivered { click } else { None });
+}
+
+/// Take what the balloon the user just clicked offers, if it offers anything.
+///
+/// Taking clears it: an offer is answered once. It is deliberately not
+/// cleared when the balloon times out: Windows may still deliver a click
+/// from notification history (on Windows 11 26200 that was Settings →
+/// System → Notifications, not the taskbar notification-centre flyout).
+/// That click deserves the same answer as the one on the banner.
+pub fn take_balloon_click() -> Option<BalloonClick> {
+    BALLOON_CLICK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Show a Windows balloon notification from a provider's tray icon.
+///
+/// Clicking it does not start an update; provider news is news, not an offer.
+/// Raising it still replaces any standing offer so a click cannot install the
+/// previous version.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
@@ -640,7 +691,33 @@ pub fn notify_balloon(
     title: &str,
     message: &str,
 ) {
-    unsafe {
+    notify_balloon_anchored(hwnd, Some(kind), tone, title, message, None);
+}
+
+/// Show a balloon that belongs to the app rather than to one provider.
+///
+/// An available update is nobody's provider news, so the app icon is the
+/// anchor to try first; the same fallback walk still applies, because
+/// detailed mode removes that icon.
+pub fn notify_app_balloon(
+    hwnd: HWND,
+    tone: BalloonTone,
+    title: &str,
+    message: &str,
+    click: Option<BalloonClick>,
+) {
+    notify_balloon_anchored(hwnd, None, tone, title, message, click);
+}
+
+fn notify_balloon_anchored(
+    hwnd: HWND,
+    kind: Option<TrayIconKind>,
+    tone: BalloonTone,
+    title: &str,
+    message: &str,
+    click: Option<BalloonClick>,
+) {
+    let delivered = unsafe {
         let balloon_icon = match tone {
             BalloonTone::Info => cached_balloon_icon(hwnd),
             BalloonTone::ActionRequired => HICON::default(),
@@ -652,20 +729,22 @@ pub fn notify_balloon(
         // so its icon has been removed - and detailed mode removes the app icon
         // too, leaving both of the obvious anchors gone. Fall through to any
         // icon that is actually registered rather than dropping the balloon.
-        let delivered = deliver_balloon(
-            notify_icon_data(hwnd, kind),
-            info_flags,
-            balloon_icon,
-            title,
-            message,
-        ) || deliver_balloon(
+        kind.is_some_and(|kind| {
+            deliver_balloon(
+                notify_icon_data(hwnd, kind),
+                info_flags,
+                balloon_icon,
+                title,
+                message,
+            )
+        }) || deliver_balloon(
             app_notify_icon_data(hwnd),
             info_flags,
             balloon_icon,
             title,
             message,
         ) || TrayIconKind::ALL.into_iter().any(|other| {
-            other.id() != kind.id()
+            Some(other) != kind
                 && deliver_balloon(
                     notify_icon_data(hwnd, other),
                     info_flags,
@@ -673,14 +752,18 @@ pub fn notify_balloon(
                     title,
                     message,
                 )
-        });
-        if !delivered {
-            diagnose::log(format!(
-                "balloon not delivered; no registered tray icon kind={}",
-                kind.diagnostic_label()
-            ));
-        }
+        })
+    };
+    if !delivered {
+        diagnose::log(format!(
+            "balloon not delivered; no registered tray icon kind={}",
+            kind.map_or("app", TrayIconKind::diagnostic_label)
+        ));
     }
+    // After delivery, not before: an offer exists only for a balloon the
+    // user actually saw. A click on this balloon can never answer the
+    // previous one's question, including when this one never appeared.
+    settle_balloon_click(click, delivered);
 }
 
 fn notify_icon_data_for_mode(
@@ -1225,6 +1308,84 @@ mod tests {
         }
     }
 
+    /// A balloon is delivered to whichever icon the tray happens to have, so
+    /// the click must be recognised whatever icon id it arrives on, and it
+    /// must not be mistaken for a click on the icon itself.
+    #[test]
+    fn a_balloon_click_is_recognised_on_any_icon() {
+        for id in [APP_TRAY_ICON_ID, TrayIconKind::Grok.id()] {
+            let clicked = LPARAM(((id << 16) | NIN_BALLOONUSERCLICK) as usize as isize);
+            assert_eq!(
+                handle_message(clicked),
+                TrayAction::BalloonClicked,
+                "id {id}"
+            );
+        }
+    }
+
+    /// An offer is answered once, and only by the balloon that made it: the
+    /// next balloon to appear replaces it, so a click on a quota-reset or
+    /// provider-detection balloon cannot act on the previous update version.
+    #[test]
+    fn only_the_balloon_on_screen_carries_an_offer() {
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.9".to_string(),
+        }));
+        set_balloon_click(None);
+        assert_eq!(take_balloon_click(), None, "a later balloon replaced it");
+
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.9".to_string(),
+        }));
+        assert_eq!(
+            take_balloon_click(),
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            })
+        );
+        assert_eq!(take_balloon_click(), None, "taking answers it once");
+    }
+
+    /// A balloon that `Shell_NotifyIconW` never accepted must not leave an
+    /// offer behind, including an offer from the balloon it failed to replace.
+    #[test]
+    fn a_balloon_that_never_appeared_carries_no_offer() {
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.8".to_string(),
+        }));
+        settle_balloon_click(
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            }),
+            false,
+        );
+        assert_eq!(
+            take_balloon_click(),
+            None,
+            "failed delivery leaves no offer"
+        );
+
+        settle_balloon_click(
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            }),
+            true,
+        );
+        assert_eq!(
+            take_balloon_click(),
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            })
+        );
+
+        settle_balloon_click(None, true);
+        assert_eq!(
+            take_balloon_click(),
+            None,
+            "a delivered news balloon replaces the offer"
+        );
+    }
+
     #[test]
     fn version_four_callback_decodes_icon_and_keyboard_events() {
         let select = LPARAM(((TrayIconKind::Codex.id() << 16) | NIN_KEYSELECT) as usize as isize);
@@ -1388,6 +1549,7 @@ pub fn handle_message(lparam: LPARAM) -> TrayAction {
             kind,
             anchor_to_icon: true,
         },
+        NIN_BALLOONUSERCLICK => TrayAction::BalloonClicked,
         _ => TrayAction::None,
     }
 }

@@ -114,6 +114,21 @@ identity, or release automation.
   the user. The helper's timeout is fixed, so a dialog placed ahead of that
   confirmation rolls a healthy update back while the user is still reading it.
 
+## Known limits
+
+These are accepted, not open work. They are recorded here so a release round
+stops re-listing them as gaps to close.
+
+- A grandchild created between `spawn` and `AssignProcessToJobObject` is
+  outside the job object, because `std` offers no way to start a child
+  suspended. The bounded output drain means such an escape can no longer hang
+  a call, but it can still outlive the timeout meant to end it. Closing this
+  needs a raw `CreateProcess` with `CREATE_SUSPENDED`, which is a larger change
+  than the failure justifies.
+- The update-target check does not prove the target started the helper, and is
+  not meant to. See the bullet under *Network and updates* for what it does
+  deliver.
+
 ## Release history
 
 - Never rewrite published history or move/delete a published version tag.

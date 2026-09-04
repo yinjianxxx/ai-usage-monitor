@@ -263,6 +263,7 @@ pub struct Strings {
     pub update_to: &'static str,
     pub update_available: &'static str,
     pub update_prompt_now: &'static str,
+    pub update_available_balloon_body: &'static str,
     pub exit: &'static str,
     pub show_widget: &'static str,
     pub show_floating_monitor: &'static str,
