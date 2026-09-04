@@ -95,8 +95,10 @@ and watching a test go red.
   `None` while leaving the helper still would not.
 - `a_balloon_that_never_appeared_carries_no_offer` - `settle_balloon_click`
   drops the offer when delivery failed, including a previous offer.
-- `a_balloon_click_without_an_offer_rechecks` - an empty latch is a recheck,
-  not a silent drop.
+- `a_balloon_click_without_an_offer_does_nothing` - an empty latch is a
+  no-op, not a recheck. Quota-reset and provider-detection balloons must
+  not start an update check. (An earlier follow-up treated this as a
+  recheck; that was reverted so news balloons stay news.)
 - `the_footer_snapshot_carries_an_outstanding_update` - live snapshot footer
   fields come from `detail_footer_versions`. Dump fixtures still hardcode
   `None`.
@@ -219,9 +221,9 @@ These are gaps in this document, not passed rows.
   are inherited from v2.5.1 and v2.5.2.
 - **Whether a click from Settings → System → Notifications delivers
   `NIN_BALLOONUSERCLICK`** was not tried. The owner looked and did not click.
-  Code now treats an empty latch as an interactive recheck rather than a
-  silent drop; that path is unit-tested, not live-walked. A click on a
-  quota-reset or provider-detection balloon takes the same recheck path.
+  While this process still holds the offer, that click is the same as the
+  banner. After a restart or after the offer was taken, it is a no-op; the
+  footer is the recovery. Quota-reset balloons do not start a check.
 - **Finding 1 was not re-walked live** after `2098e0f`. The unit tests cover
   remembered current-version and older-version `Available` mapping to
   `UpToDate`. The new process after a successful apply has not been watched

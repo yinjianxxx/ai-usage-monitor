@@ -10257,15 +10257,15 @@ fn balloon_offer_is_current(known: Option<&str>, offered: &str, busy: bool) -> b
 
 /// What a `BalloonClicked` tray action should do after the offer is taken.
 ///
-/// An Update offer is answered with that version. A click with no offer still
-/// means the user asked: after a restart, or a second history click, the
-/// latch is empty, so recheck rather than drop it. Provider-news balloons
-/// also land here; an interactive check that finds nothing answers "up to
-/// date" and does not install.
+/// An Update offer is answered with that version. A click with no offer is
+/// ignored: quota-reset and provider-detection balloons are news, not an
+/// update question, and after a restart or a taken offer the latch is empty.
+/// Missing the banner is recovered from the footer, not by treating every
+/// balloon click as "check for updates".
 #[derive(Debug, PartialEq, Eq)]
 enum BalloonClickFollowUp {
     Offer { version: String },
-    Recheck,
+    Ignore,
 }
 
 fn balloon_click_follow_up(click: Option<tray_icon::BalloonClick>) -> BalloonClickFollowUp {
@@ -10273,7 +10273,7 @@ fn balloon_click_follow_up(click: Option<tray_icon::BalloonClick>) -> BalloonCli
         Some(tray_icon::BalloonClick::Update { version }) => {
             BalloonClickFollowUp::Offer { version }
         }
-        None => BalloonClickFollowUp::Recheck,
+        None => BalloonClickFollowUp::Ignore,
     }
 }
 
@@ -14836,9 +14836,8 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             diagnose::log(format!("update balloon clicked for {version}"));
                             offer_update_now(hwnd, &version);
                         }
-                        BalloonClickFollowUp::Recheck => {
-                            diagnose::log("balloon clicked with no standing offer; rechecking");
-                            begin_update_check(hwnd, true);
+                        BalloonClickFollowUp::Ignore => {
+                            diagnose::log("balloon clicked with no standing offer");
                         }
                     }
                 }
@@ -16809,11 +16808,11 @@ mod reset_notification_tests {
         );
     }
 
-    /// After a restart, or after the offer was taken, a history click arrives
-    /// with an empty latch. Dropping it is safe but not a recheck; the click
-    /// still means the user asked.
+    /// Quota-reset and provider-detection balloons carry no offer, and a
+    /// history click after restart or take arrives with an empty latch.
+    /// Neither starts a check: the footer is the recovery, not every balloon.
     #[test]
-    fn a_balloon_click_without_an_offer_rechecks() {
+    fn a_balloon_click_without_an_offer_does_nothing() {
         assert_eq!(
             balloon_click_follow_up(Some(tray_icon::BalloonClick::Update {
                 version: "9.9.9".to_string(),
@@ -16824,8 +16823,8 @@ mod reset_notification_tests {
         );
         assert_eq!(
             balloon_click_follow_up(None),
-            BalloonClickFollowUp::Recheck,
-            "a history click after restart or take must not be a silent no-op"
+            BalloonClickFollowUp::Ignore,
+            "news balloons and an empty latch must not start a check"
         );
     }
 

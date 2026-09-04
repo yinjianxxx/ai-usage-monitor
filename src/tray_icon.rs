@@ -681,8 +681,9 @@ pub fn take_balloon_click() -> Option<BalloonClick> {
 
 /// Show a Windows balloon notification from a provider's tray icon.
 ///
-/// Provider news is not an update offer: raising it replaces any standing
-/// offer so a click cannot install the previous version.
+/// Clicking it does not start an update; provider news is news, not an offer.
+/// Raising it still replaces any standing offer so a click cannot install the
+/// previous version.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
