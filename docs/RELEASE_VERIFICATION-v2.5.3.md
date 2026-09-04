@@ -5,7 +5,7 @@
 - Candidate: `claude/v2.5.3-update-notice`, branched from `main` / `a855962`,
   which is also the `v2.5.2` tag. The release-tag ancestry requirement in
   docs/INVARIANTS.md is satisfied: `v2.5.2` is an ancestor of this branch.
-  Open as PR #8. Not tagged, not merged.
+  Merged as PR #8. Tagged `v2.5.3` at `f0fd239`.
   `Cargo.toml` and `Cargo.lock` read `2.5.3`.
 - Scope: one behaviour. The daily update check already found new versions; it
   announced them only by rewriting one entry inside the Settings submenu. It
@@ -278,8 +278,23 @@ consequence for future rounds is that "byte-identical" cannot be used as
 evidence of an unchanged surface; a pixel comparison with a tolerance, or a
 visual check, is what the claim actually needs.
 
+## Post-release
+
+Recorded on 2026-09-05, read back from GitHub rather than from memory of the
+release run.
+
+- PR #8 merged as `f0fd239`; annotated tag `v2.5.3` points at that commit.
+  `v2.5.2` (`a855962`) is an ancestor, so the ancestry gate held.
+- Release published 2026-09-04T16:55:29Z, not a draft and not a pre-release.
+  `GET /repos/ynjmxn/gengchou/releases/latest` returns `v2.5.3`.
+- Six assets, including the two the updater requires by name: `gengchou.exe`
+  and `SHA256SUMS`. Re-downloaded and checked against `SHA256SUMS`:
+  zip `53a0a43b8f6efd4fa8fa987a70677f6c73b07118dedd99767f3ccbf51a81112c`,
+  exe `b9d137cb45493127d35b4080e43a1bb656f7f5d97dd1a7cac4e9d4115b61a0f9`.
+  Both carry GitHub attestations (`gh attestation verify` exit 0).
+- WinGet: `microsoft/winget-pkgs#429617` opened; not yet merged. Installing
+  the merged package on a clean Windows profile remains out of scope.
+
 ## Open
 
-- PR #8 is open. Tag, merge, and WinGet still need the rest of the release
-  sequence: CI green, merge to `main`, annotated tag `v2.5.3` on that merge
-  commit, then WinGet after the GitHub release is public.
+- WinGet PR `microsoft/winget-pkgs#429617` waiting on the upstream pipeline.
