@@ -1,6 +1,6 @@
 # v2.5.3 release verification
 
-- Date: 2026-09-03, continued 2026-09-04
+- Date: 2026-09-03, continued 2026-09-04 (code follow-up later the same day)
 - Candidate: `claude/v2.5.3-update-notice`, branched from `main` / `a855962`,
   which is also the `v2.5.2` tag. The release-tag ancestry requirement in
   docs/INVARIANTS.md is satisfied: `v2.5.2` is an ancestor of this branch.
@@ -26,8 +26,12 @@ at `2.5.3`. Exit codes were read back, not inferred from output.
 - `cargo fmt --all -- --check` - clean
 - `cargo clippy --all-targets --locked -- -D warnings` - exit 0, and again with
   `--release` - exit 0
-- `cargo test --locked` - 381 passed, 0 failed (373 at v2.5.2; the eight new
-  tests are listed under *Targeted evidence*)
+- `cargo test --locked` - 381 passed, 0 failed on 2026-09-03 (373 at v2.5.2;
+  the eight new tests are listed under *Targeted evidence*). Re-run on
+  2026-09-04 after the follow-up below: 386 passed, 0 failed. `cargo fmt
+  --all -- --check` clean and `cargo clippy --all-targets --locked -- -D
+  warnings` exit 0 on that same tree. `clippy --release` and
+  `cargo build --release --locked` were not re-run for the follow-up.
 - `cargo build --release --locked` - exit 0
 - PE properties of that build: ProductName `Gengchou`, ProductVersion and
   FileVersion `2.5.3`, OriginalFilename `gengchou.exe`, upstream copyright and
@@ -78,6 +82,33 @@ mutations were reverted.
 `the_footer_says_where_the_running_version_can_go` and
 `a_remembered_update_reaches_the_footer` were not mutation-checked; both assert
 a literal mapping with no branch to invert beyond the assertion itself.
+
+### Follow-up, 2026-09-04
+
+Five tests were added after the second independent review. They pin helpers
+the call sites now use. They were not mutation-checked by reverting source
+and watching a test go red.
+
+- `a_failed_check_keeps_the_last_successful_offer` - the failed-check arm
+  restores through `retain_update_after_failed_check`. Reverting that helper
+  to Idle + `None` fails this test. Reverting only the call site to Idle +
+  `None` while leaving the helper still would not.
+- `a_balloon_that_never_appeared_carries_no_offer` - `settle_balloon_click`
+  drops the offer when delivery failed, including a previous offer.
+- `a_balloon_click_without_an_offer_rechecks` - an empty latch is a recheck,
+  not a silent drop.
+- `the_footer_snapshot_carries_an_outstanding_update` - live snapshot footer
+  fields come from `detail_footer_versions`. Dump fixtures still hardcode
+  `None`.
+- `destroying_the_detail_popup_clears_the_footer_target` -
+  `set_detail_update_link_rect(None)` forgets the painted hit rect and hover.
+  The `WM_DESTROY` arm now calls that; this test does not compile-fail if
+  only that one line is deleted.
+
+`a_remembered_update_reaches_the_footer` now also asserts `Available` (fresh)
+and the busy states. Balloon/footer confirmation occupies `Prompting` via
+`prompt_then_apply_update`, shared with the interactive check arm. That wrap
+has no extra unit test beyond `update_prompt_is_a_busy_state_until_the_modal_choice_returns`.
 
 ### The balloon, live
 
@@ -188,9 +219,13 @@ These are gaps in this document, not passed rows.
   are inherited from v2.5.1 and v2.5.2.
 - **Whether a click from Settings → System → Notifications delivers
   `NIN_BALLOONUSERCLICK`** was not tried. The owner looked and did not click.
+  Code now treats an empty latch as an interactive recheck rather than a
+  silent drop; that path is unit-tested, not live-walked. A click on a
+  quota-reset or provider-detection balloon takes the same recheck path.
 - **Finding 1 was not re-walked live** after `2098e0f`. The unit tests cover
   remembered current-version and older-version `Available` mapping to
-  `UpToDate`.
+  `UpToDate`. The new process after a successful apply has not been watched
+  for `vX → X` on a real profile.
 
 ## A correction
 

@@ -654,6 +654,17 @@ fn set_balloon_click(click: Option<BalloonClick>) {
     *BALLOON_CLICK.lock().unwrap_or_else(|e| e.into_inner()) = click;
 }
 
+/// Record what the balloon that just appeared offers, or nothing if it never
+/// appeared.
+///
+/// An offer must not outlive a failed delivery: the user never saw that
+/// balloon, and a later click (including from notification history) must not
+/// answer a question that was never asked. A failed delivery also drops a
+/// previous offer; that balloon is no longer the one on screen.
+fn settle_balloon_click(click: Option<BalloonClick>, delivered: bool) {
+    set_balloon_click(if delivered { click } else { None });
+}
+
 /// Take what the balloon the user just clicked offers, if it offers anything.
 ///
 /// Taking clears it: an offer is answered once. It is deliberately not
@@ -670,7 +681,8 @@ pub fn take_balloon_click() -> Option<BalloonClick> {
 
 /// Show a Windows balloon notification from a provider's tray icon.
 ///
-/// Clicking it does nothing; provider news is news, not an offer.
+/// Provider news is not an update offer: raising it replaces any standing
+/// offer so a click cannot install the previous version.
 pub fn notify_balloon(
     hwnd: HWND,
     kind: TrayIconKind,
@@ -704,11 +716,7 @@ fn notify_balloon_anchored(
     message: &str,
     click: Option<BalloonClick>,
 ) {
-    // Before delivery, and unconditionally: whatever the last balloon offered
-    // is gone the moment this one takes its place on screen, so a click on
-    // the new balloon can never answer the old one's question.
-    set_balloon_click(click);
-    unsafe {
+    let delivered = unsafe {
         let balloon_icon = match tone {
             BalloonTone::Info => cached_balloon_icon(hwnd),
             BalloonTone::ActionRequired => HICON::default(),
@@ -720,7 +728,7 @@ fn notify_balloon_anchored(
         // so its icon has been removed - and detailed mode removes the app icon
         // too, leaving both of the obvious anchors gone. Fall through to any
         // icon that is actually registered rather than dropping the balloon.
-        let delivered = kind.is_some_and(|kind| {
+        kind.is_some_and(|kind| {
             deliver_balloon(
                 notify_icon_data(hwnd, kind),
                 info_flags,
@@ -743,14 +751,18 @@ fn notify_balloon_anchored(
                     title,
                     message,
                 )
-        });
-        if !delivered {
-            diagnose::log(format!(
-                "balloon not delivered; no registered tray icon kind={}",
-                kind.map_or("app", TrayIconKind::diagnostic_label)
-            ));
-        }
+        })
+    };
+    if !delivered {
+        diagnose::log(format!(
+            "balloon not delivered; no registered tray icon kind={}",
+            kind.map_or("app", TrayIconKind::diagnostic_label)
+        ));
     }
+    // After delivery, not before: an offer exists only for a balloon the
+    // user actually saw. A click on this balloon can never answer the
+    // previous one's question, including when this one never appeared.
+    settle_balloon_click(click, delivered);
 }
 
 fn notify_icon_data_for_mode(
@@ -1312,7 +1324,7 @@ mod tests {
 
     /// An offer is answered once, and only by the balloon that made it: the
     /// next balloon to appear replaces it, so a click on a quota-reset or
-    /// provider-detection balloon can never start an update.
+    /// provider-detection balloon cannot act on the previous update version.
     #[test]
     fn only_the_balloon_on_screen_carries_an_offer() {
         set_balloon_click(Some(BalloonClick::Update {
@@ -1331,6 +1343,46 @@ mod tests {
             })
         );
         assert_eq!(take_balloon_click(), None, "taking answers it once");
+    }
+
+    /// A balloon that `Shell_NotifyIconW` never accepted must not leave an
+    /// offer behind, including an offer from the balloon it failed to replace.
+    #[test]
+    fn a_balloon_that_never_appeared_carries_no_offer() {
+        set_balloon_click(Some(BalloonClick::Update {
+            version: "9.9.8".to_string(),
+        }));
+        settle_balloon_click(
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            }),
+            false,
+        );
+        assert_eq!(
+            take_balloon_click(),
+            None,
+            "failed delivery leaves no offer"
+        );
+
+        settle_balloon_click(
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            }),
+            true,
+        );
+        assert_eq!(
+            take_balloon_click(),
+            Some(BalloonClick::Update {
+                version: "9.9.9".to_string(),
+            })
+        );
+
+        settle_balloon_click(None, true);
+        assert_eq!(
+            take_balloon_click(),
+            None,
+            "a delivered news balloon replaces the offer"
+        );
     }
 
     #[test]
