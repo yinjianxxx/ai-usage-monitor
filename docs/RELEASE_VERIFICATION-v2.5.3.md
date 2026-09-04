@@ -292,9 +292,12 @@ release run.
   zip `53a0a43b8f6efd4fa8fa987a70677f6c73b07118dedd99767f3ccbf51a81112c`,
   exe `b9d137cb45493127d35b4080e43a1bb656f7f5d97dd1a7cac4e9d4115b61a0f9`.
   Both carry GitHub attestations (`gh attestation verify` exit 0).
-- WinGet: `microsoft/winget-pkgs#429617` opened; not yet merged. Installing
-  the merged package on a clean Windows profile remains out of scope.
+- WinGet: `microsoft/winget-pkgs#429617` merged 2026-09-04T18:07:27Z as
+  `dfc0a02`; `manifests/y/ynjmxn/Gengchou/2.5.3` exists in the public
+  registry (four manifests). Installing the merged package on a clean
+  Windows profile remains out of scope.
 
 ## Open
 
-- WinGet PR `microsoft/winget-pkgs#429617` waiting on the upstream pipeline.
+- None for this release. `winget upgrade` may lag the registry by a few
+  hours; that is index delay, not a missing directory.
