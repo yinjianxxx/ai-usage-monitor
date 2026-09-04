@@ -1,6 +1,7 @@
 # v2.5.3 release verification
 
 - Date: 2026-09-03, continued 2026-09-04 (code follow-up later the same day)
+  and 2026-09-05 (dogfood latch walk)
 - Candidate: `claude/v2.5.3-update-notice`, branched from `main` / `a855962`,
   which is also the `v2.5.2` tag. The release-tag ancestry requirement in
   docs/INVARIANTS.md is satisfied: `v2.5.2` is an ancestor of this branch.
@@ -211,6 +212,27 @@ cleared that offer) are fixed in `2098e0f`. Finding 3 (default the
 confirmation to No) was declined by the owner: the dialog stays default Yes.
 Findings 4–5 are notes, not acted on.
 
+### Latch mapping, live, 2026-09-05
+
+Dogfood was swapped to `3ad4f82` (SHA256
+`3EDC4543DF1724F2CB6DB503341481D38473F777BBE6ECDF5ED0694F97BAECED`),
+ProductVersion `2.5.3`. The WinGet-installed executable was left untouched.
+PID 129832 logged `diagnostic logging started v2.5.3`. At swap,
+`settings.json` still had `last_update_outcome` `available 2.5.2`.
+
+The owner then walked three footer states on that build, on the real
+profile, and reported all three as expected. The screens were not seen by
+anyone else.
+
+- Disk `available 2.5.2` (older than the running build): footer `v2.5.3`,
+  not `v2.5.3 → 2.5.2`.
+- Disk `available 2.5.3` (equal to the running build): footer `v2.5.3`,
+  not `v2.5.3 → 2.5.3`.
+- Disk `available 9.9.9` (newer): footer `v2.5.3 → 9.9.9`.
+
+That is Finding 1's mapping on a live window. It is not a successful apply:
+the new process after replacing the executable has still not been watched.
+
 ## Not verified
 
 These are gaps in this document, not passed rows.
@@ -224,10 +246,11 @@ These are gaps in this document, not passed rows.
   While this process still holds the offer, that click is the same as the
   banner. After a restart or after the offer was taken, it is a no-op; the
   footer is the recovery. Quota-reset balloons do not start a check.
-- **Finding 1 was not re-walked live** after `2098e0f`. The unit tests cover
-  remembered current-version and older-version `Available` mapping to
-  `UpToDate`. The new process after a successful apply has not been watched
-  for `vX → X` on a real profile.
+- **The new process after a successful apply has not been watched** for
+  `vX → X`. Finding 1's mapping was walked live on 2026-09-05 by writing
+  `last_update_outcome` and restarting; that is the same function apply
+  relies on, not the apply itself. A 2.5.2 → 2.5.3 apply can only be
+  watched after this version is published.
 
 ## A correction
 
