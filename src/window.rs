@@ -320,16 +320,46 @@ enum UpdateStatus {
 /// Without this the menu entry falls back to "check for updates" on every
 /// launch, as though the app had never looked - even though it checked
 /// yesterday and the answer has not been forgotten, only left in memory.
+/// An `Available` that is not newer than this build is treated as up to date:
+/// a successful apply never rewrites the outcome, so the new process would
+/// otherwise keep advertising the version it is already running.
 fn remembered_update_status(outcome: Option<&settings::LastUpdateOutcome>) -> UpdateStatus {
     match outcome {
         Some(settings::LastUpdateOutcome::UpToDate) => UpdateStatus::UpToDate,
-        Some(settings::LastUpdateOutcome::Available { version }) => {
+        Some(settings::LastUpdateOutcome::Available { version })
+            if updater::is_version_newer(version, env!("CARGO_PKG_VERSION")) =>
+        {
             UpdateStatus::AvailableRemembered {
                 version: version.clone(),
             }
         }
+        Some(settings::LastUpdateOutcome::Available { .. }) => UpdateStatus::UpToDate,
         None => UpdateStatus::Idle,
     }
+}
+
+/// Pair the display status with the outcome that should sit on disk after it.
+///
+/// Used at load and after a failed check so a remembered current-version
+/// `Available` is not written back out as an outstanding update.
+fn remembered_update_fields(
+    outcome: Option<settings::LastUpdateOutcome>,
+) -> (UpdateStatus, Option<settings::LastUpdateOutcome>) {
+    let status = remembered_update_status(outcome.as_ref());
+    let outcome = match &status {
+        UpdateStatus::UpToDate => Some(settings::LastUpdateOutcome::UpToDate),
+        UpdateStatus::AvailableRemembered { version } => {
+            Some(settings::LastUpdateOutcome::Available {
+                version: version.clone(),
+            })
+        }
+        UpdateStatus::Idle => None,
+        UpdateStatus::Available(_)
+        | UpdateStatus::Checking
+        | UpdateStatus::Prompting
+        | UpdateStatus::Applying => outcome,
+    };
+    (status, outcome)
 }
 
 fn update_status_is_busy(status: &UpdateStatus) -> bool {
@@ -10344,11 +10374,14 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Idle;
-                        // The check failed, so the previous answer is no
-                        // longer something to stand behind - forget it rather
-                        // than keep showing a stale claim.
-                        s.last_update_outcome = None;
+                        // A failed fetch is not evidence the last successful
+                        // Available is gone. Restore that display (or Idle /
+                        // UpToDate) and keep the outcome, so the footer stays
+                        // and the next success does not re-announce.
+                        let (status, outcome) =
+                            remembered_update_fields(s.last_update_outcome.clone());
+                        s.update_status = status;
+                        s.last_update_outcome = outcome;
                         s.last_update_check_unix = Some(checked_at);
                     }
                 }
@@ -12560,6 +12593,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
         let is_dark = theme::is_dark_mode();
         let is_high_contrast = theme::is_high_contrast();
         let mut embedded = false;
+        let (update_status, last_update_outcome) =
+            remembered_update_fields(settings.last_update_outcome.clone());
 
         {
             let mut state = lock_state();
@@ -12632,8 +12667,8 @@ pub fn run(_instance_guard: InstanceGuard, startup_notice: Option<String>) {
                 last_success_unix: None,
                 notify_session_reset: settings.notify_session_reset,
                 notify_weekly_reset: settings.notify_weekly_reset,
-                update_status: remembered_update_status(settings.last_update_outcome.as_ref()),
-                last_update_outcome: settings.last_update_outcome.clone(),
+                update_status,
+                last_update_outcome,
                 last_update_check_unix: settings.last_update_check_unix,
                 details_hwnd: None,
                 details_monitor: None,
@@ -16441,6 +16476,36 @@ mod reset_notification_tests {
             UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
             other => panic!("expected a remembered update, got {other:?}"),
         }
+        assert!(matches!(
+            remembered_update_status(Some(&settings::LastUpdateOutcome::Available {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })),
+            UpdateStatus::UpToDate
+        ));
+        assert!(matches!(
+            remembered_update_status(Some(&settings::LastUpdateOutcome::Available {
+                version: "0.0.1".to_string(),
+            })),
+            UpdateStatus::UpToDate
+        ));
+        let (status, outcome) =
+            remembered_update_fields(Some(settings::LastUpdateOutcome::Available {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }));
+        assert!(matches!(status, UpdateStatus::UpToDate));
+        assert!(matches!(
+            outcome,
+            Some(settings::LastUpdateOutcome::UpToDate)
+        ));
+        let kept = Some(settings::LastUpdateOutcome::Available {
+            version: "9.9.9".to_string(),
+        });
+        let (status, outcome) = remembered_update_fields(kept.clone());
+        match status {
+            UpdateStatus::AvailableRemembered { version } => assert_eq!(version, "9.9.9"),
+            other => panic!("expected a remembered update, got {other:?}"),
+        }
+        assert_eq!(outcome, kept);
     }
 
     /// A remembered update must be indistinguishable from a freshly found one

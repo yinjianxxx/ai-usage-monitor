@@ -1797,7 +1797,7 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or(normalized)
 }
 
-fn is_version_newer(candidate: &str, current: &str) -> bool {
+pub(crate) fn is_version_newer(candidate: &str, current: &str) -> bool {
     parse_version(candidate) > parse_version(current)
 }
 
